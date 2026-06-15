@@ -11,21 +11,20 @@ No wallet, signing, or live trading involved.
 
 import sys
 import time
-from datetime import datetime, timezone
 
 from data_logger import append_prices_to_csv
 from hyperliquid_client import fetch_all_mids, handle_request_error
 from market_analyzer import (
     REFRESH_INTERVAL_SECONDS,
-    WINDOW_1M_SECONDS,
-    WINDOW_5M_SECONDS,
-    WATCHLIST,
     PriceHistory,
-    percent_change,
-    price_to_float,
-    record_price_history,
-    rolling_percent_change,
     update_start_prices,
+)
+from market_snapshot import (
+    build_snapshot,
+    current_prices_from_rows,
+    current_timestamp,
+    print_snapshot,
+    tradable_signals_from_rows,
 )
 from paper_trader import (
     MAX_SUCCESSFUL_TRADES_PER_SESSION,
@@ -33,114 +32,12 @@ from paper_trader import (
     MIN_EQUITY_BEFORE_PAUSE_USDC,
     MIN_SECONDS_BETWEEN_BUYS,
     PaperTrader,
-    print_paper_trading_summary,
 )
 import signals
-from signals import apply_signal_thresholds, signal_from_1m_change
+from signals import apply_signal_thresholds
 
 # Set True to use lower signal thresholds and trigger paper trades more often.
 TEST_MODE = True
-
-
-def current_timestamp() -> str:
-    """Return the current UTC time as a readable string."""
-    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-
-
-def format_price(price: float) -> str:
-    """Format a price for display (e.g. $95,000.00)."""
-    return f"${price:,.2f}"
-
-
-def format_change(change_pct: float) -> str:
-    """Format a percentage change with sign (e.g. +0.21% or -0.35%)."""
-    sign = "+" if change_pct >= 0 else ""
-    return f"{sign}{change_pct:.2f}%"
-
-
-def format_change_or_na(change_pct: float | None) -> str:
-    """Format a percentage change, or N/A when there is not enough history."""
-    if change_pct is None:
-        return "N/A"
-    return format_change(change_pct)
-
-
-def print_market_analysis(
-    mids: dict[str, str],
-    start_prices: dict[str, float],
-    price_history: PriceHistory,
-    paper_trader: PaperTrader | None = None,
-    timestamp: str | None = None,
-) -> str:
-    """Print current price, rolling changes, and signals for BTC, ETH, and SOL."""
-    if timestamp is None:
-        timestamp = current_timestamp()
-
-    now = time.time()
-
-    print(f"\n[{timestamp}]")
-    print("Hyperliquid market analysis:")
-    print("-" * 78)
-    print(
-        f"{'Coin':<6} {'Current':>14} {'Since Start':>12} "
-        f"{'1-Min':>10} {'5-Min':>10} {'Signal':>12}"
-    )
-    print("-" * 78)
-
-    current_prices: dict[str, float] = {}
-    pending_signals: list[tuple[str, str, float]] = []
-
-    for coin in WATCHLIST:
-        price_str = mids.get(coin)
-
-        if price_str is None:
-            print(f"{coin:<6} {'not available':>14}")
-            continue
-
-        try:
-            current_price = price_to_float(price_str)
-        except ValueError:
-            print(f"{coin:<6} invalid price ({price_str!r})")
-            continue
-
-        current_prices[coin] = current_price
-        record_price_history(price_history, coin, current_price, now)
-
-        start_price = start_prices.get(coin)
-        history = price_history.get(coin, [])
-
-        change_since_start = (
-            percent_change(start_price, current_price) if start_price is not None else None
-        )
-        change_1m = rolling_percent_change(history, current_price, now, WINDOW_1M_SECONDS)
-        change_5m = rolling_percent_change(history, current_price, now, WINDOW_5M_SECONDS)
-        signal = signal_from_1m_change(change_1m)
-
-        if start_price is None:
-            print(
-                f"{coin:<6} {format_price(current_price):>14} "
-                f"{'(recording)':>12} {'N/A':>10} {'N/A':>10} {'N/A':>12}"
-            )
-            continue
-
-        print(
-            f"{coin:<6} {format_price(current_price):>14} "
-            f"{format_change_or_na(change_since_start):>12} "
-            f"{format_change_or_na(change_1m):>10} "
-            f"{format_change_or_na(change_5m):>10} {signal:>12}"
-        )
-
-        pending_signals.append((coin, signal, current_price))
-
-    if paper_trader is not None:
-        paper_trader.update_session_risk(current_prices)
-
-        for coin, signal, current_price in pending_signals:
-            paper_trader.process_signal(coin, signal, current_price, timestamp, now)
-
-        print_paper_trading_summary(paper_trader, current_prices)
-
-    return timestamp
 
 
 def run_analyzer() -> None:
@@ -179,9 +76,44 @@ def run_analyzer() -> None:
         try:
             mids = fetch_all_mids()
             update_start_prices(start_prices, mids)
-            timestamp = print_market_analysis(
-                mids, start_prices, price_history, paper_trader=paper_trader
+
+            now = time.time()
+            timestamp = current_timestamp()
+
+            # Build market snapshot, then run paper trading from snapshot signals
+            snapshot = build_snapshot(
+                mids,
+                start_prices,
+                price_history,
+                TEST_MODE,
+                paper_trader=None,
+                timestamp=timestamp,
+                now=now,
             )
+
+            current_prices = current_prices_from_rows(snapshot.market_rows)
+            paper_trader.update_session_risk(current_prices)
+
+            for coin, signal, current_price in tradable_signals_from_rows(
+                snapshot.market_rows
+            ):
+                paper_trader.process_signal(
+                    coin, signal, current_price, timestamp, now
+                )
+
+            # Refresh paper trader fields on the same market rows for display
+            snapshot = build_snapshot(
+                mids,
+                start_prices,
+                price_history,
+                TEST_MODE,
+                paper_trader=paper_trader,
+                timestamp=timestamp,
+                now=now,
+                market_rows=snapshot.market_rows,
+            )
+
+            print_snapshot(snapshot)
             append_prices_to_csv(mids, timestamp)
         except Exception as exc:
             print(f"\n[{current_timestamp()}]")
