@@ -5,9 +5,11 @@ Fetches public mid prices from Hyperliquid's Info API every 10 seconds.
 No wallet, signing, or trading involved.
 """
 
+import csv
 import sys
 import time
 from datetime import datetime, timezone
+from pathlib import Path
 
 import requests
 
@@ -19,6 +21,11 @@ REFRESH_INTERVAL_SECONDS = 10
 
 # Coins we want to display from the allMids response
 WATCHLIST = ("BTC", "ETH", "SOL")
+
+# Where to save price history
+DATA_DIR = Path("data")
+PRICE_LOG_CSV = DATA_DIR / "price_log.csv"
+CSV_COLUMNS = ("timestamp", "coin", "price")
 
 
 def fetch_all_mids() -> dict[str, str]:
@@ -55,9 +62,42 @@ def current_timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
 
-def print_watchlist_prices(mids: dict[str, str]) -> None:
+def ensure_data_dir() -> None:
+    """Create the data folder if it does not exist."""
+    DATA_DIR.mkdir(exist_ok=True)
+
+
+def append_prices_to_csv(mids: dict[str, str], timestamp: str) -> None:
+    """Append watchlist mid prices to data/price_log.csv."""
+    ensure_data_dir()
+
+    write_header = not PRICE_LOG_CSV.exists()
+
+    with PRICE_LOG_CSV.open("a", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+
+        if write_header:
+            writer.writerow(CSV_COLUMNS)
+
+        for coin in WATCHLIST:
+            price_str = mids.get(coin)
+
+            if price_str is None:
+                continue
+
+            try:
+                price = price_to_float(price_str)
+                writer.writerow([timestamp, coin, price])
+            except ValueError:
+                continue
+
+
+def print_watchlist_prices(mids: dict[str, str], timestamp: str | None = None) -> str:
     """Print mid prices for BTC, ETH, and SOL with a timestamp."""
-    print(f"\n[{current_timestamp()}]")
+    if timestamp is None:
+        timestamp = current_timestamp()
+
+    print(f"\n[{timestamp}]")
     print("Hyperliquid mid prices:")
     print("-" * 28)
 
@@ -73,6 +113,8 @@ def print_watchlist_prices(mids: dict[str, str]) -> None:
             print(f"{coin}: ${price:,.2f}")
         except ValueError:
             print(f"{coin}: invalid price ({price_str!r})")
+
+    return timestamp
 
 
 def handle_request_error(exc: Exception) -> None:
@@ -101,7 +143,8 @@ def run_scanner() -> None:
     while True:
         try:
             mids = fetch_all_mids()
-            print_watchlist_prices(mids)
+            timestamp = print_watchlist_prices(mids)
+            append_prices_to_csv(mids, timestamp)
         except Exception as exc:
             print(f"\n[{current_timestamp()}]")
             handle_request_error(exc)
