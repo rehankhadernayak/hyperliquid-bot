@@ -28,7 +28,11 @@ from market_analyzer import (
     update_start_prices,
 )
 from paper_trader import PaperTrader, print_paper_trading_summary
-from signals import SIGNAL_STRONG_UP_PCT, SIGNAL_UP_PCT, signal_from_1m_change
+import signals
+from signals import apply_signal_thresholds, signal_from_1m_change
+
+# Set True to use lower signal thresholds and trigger paper trades more often.
+TEST_MODE = True
 
 
 def current_timestamp() -> str:
@@ -133,10 +137,13 @@ def run_analyzer() -> None:
 
     Runs until the user presses Ctrl+C.
     """
+    apply_signal_thresholds(TEST_MODE)
+
     print("Starting Hyperliquid market analyzer (Ctrl+C to stop)...")
+    print(f"TEST_MODE: {'ON' if TEST_MODE else 'OFF'}")
     print(
         "Signals use 1-minute rolling change "
-        f"(±{SIGNAL_UP_PCT}% / ±{SIGNAL_STRONG_UP_PCT}% thresholds)"
+        f"(±{signals.SIGNAL_UP_PCT}% / ±{signals.SIGNAL_STRONG_UP_PCT}% thresholds)"
     )
     print("Paper trading: fake $1,000 USDC balance, $100 per simulated trade")
 

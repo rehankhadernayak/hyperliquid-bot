@@ -66,9 +66,9 @@ class PaperTrader:
             return
 
         if signal in BUY_SIGNALS:
-            self._fake_buy(coin, price, timestamp)
+            self._fake_buy(coin, price, timestamp, signal)
         elif signal in SELL_SIGNALS:
-            self._fake_sell(coin, price, timestamp)
+            self._fake_sell(coin, price, timestamp, signal)
 
     def unrealized_pnl(self, current_prices: dict[str, float]) -> float:
         """Sum unrealized PnL across all open positions."""
@@ -91,7 +91,7 @@ class PaperTrader:
             self.positions[coin] = Position()
         return self.positions[coin]
 
-    def _fake_buy(self, coin: str, price: float, timestamp: str) -> None:
+    def _fake_buy(self, coin: str, price: float, timestamp: str, signal: str) -> None:
         if self.cash_balance < TRADE_SIZE_USDC:
             return
 
@@ -113,9 +113,10 @@ class PaperTrader:
             quantity=quantity,
             trade_value=TRADE_SIZE_USDC,
             trade_realized_pnl=0.0,
+            signal=signal,
         )
 
-    def _fake_sell(self, coin: str, price: float, timestamp: str) -> None:
+    def _fake_sell(self, coin: str, price: float, timestamp: str, signal: str) -> None:
         position = self._get_position(coin)
 
         if not position.is_open:
@@ -152,6 +153,7 @@ class PaperTrader:
             quantity=quantity,
             trade_value=trade_value,
             trade_realized_pnl=trade_realized_pnl,
+            signal=signal,
         )
 
     def _log_trade(
@@ -163,7 +165,17 @@ class PaperTrader:
         quantity: float,
         trade_value: float,
         trade_realized_pnl: float,
+        signal: str,
     ) -> None:
+        print_paper_trade_proposal(
+            timestamp=timestamp,
+            coin=coin,
+            action=action,
+            price=price,
+            trade_value=trade_value,
+            signal=signal,
+        )
+
         ensure_data_dir()
 
         write_header = not PAPER_TRADES_CSV.exists()
@@ -186,6 +198,26 @@ class PaperTrader:
                     f"{trade_realized_pnl:.2f}",
                 ]
             )
+
+
+def print_paper_trade_proposal(
+    timestamp: str,
+    coin: str,
+    action: str,
+    price: float,
+    trade_value: float,
+    signal: str,
+) -> None:
+    """Print a readable paper trade proposal when a simulated trade executes."""
+    print()
+    print("  >> PAPER TRADE PROPOSAL")
+    print(f"     Timestamp:   {timestamp}")
+    print(f"     Coin:        {coin}")
+    print(f"     Action:      {action}")
+    print(f"     Price:       ${price:,.2f}")
+    print(f"     Trade value: ${trade_value:,.2f}")
+    print(f"     Signal:      {signal}")
+    print()
 
 
 def ensure_data_dir() -> None:
