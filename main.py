@@ -27,7 +27,11 @@ from market_analyzer import (
     rolling_percent_change,
     update_start_prices,
 )
-from paper_trader import PaperTrader, print_paper_trading_summary
+from paper_trader import (
+    MIN_SECONDS_BETWEEN_BUYS,
+    PaperTrader,
+    print_paper_trading_summary,
+)
 import signals
 from signals import apply_signal_thresholds, signal_from_1m_change
 
@@ -123,7 +127,7 @@ def print_market_analysis(
         )
 
         if paper_trader is not None:
-            paper_trader.process_signal(coin, signal, current_price, timestamp)
+            paper_trader.process_signal(coin, signal, current_price, timestamp, now)
 
     if paper_trader is not None:
         print_paper_trading_summary(paper_trader, current_prices)
@@ -146,6 +150,10 @@ def run_analyzer() -> None:
         f"(±{signals.SIGNAL_UP_PCT}% / ±{signals.SIGNAL_STRONG_UP_PCT}% thresholds)"
     )
     print("Paper trading: fake $1,000 USDC balance, $100 per simulated trade")
+    print(
+        "Risk limits: max $300/coin, max 3 entries/coin, "
+        f"{MIN_SECONDS_BETWEEN_BUYS}s buy cooldown per coin"
+    )
 
     # First observed price for each coin during this run
     start_prices: dict[str, float] = {}

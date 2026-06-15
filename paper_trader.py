@@ -15,6 +15,11 @@ from market_analyzer import WATCHLIST
 STARTING_BALANCE_USDC = 1000.0
 TRADE_SIZE_USDC = 100.0
 
+# Risk limits for fake BUY trades (SELL signals are not blocked)
+MAX_ALLOCATION_PER_COIN_USDC = 300.0
+MAX_ENTRIES_PER_COIN = 3
+MIN_SECONDS_BETWEEN_BUYS = 60
+
 # Where to save paper trade history
 DATA_DIR = Path("data")
 PAPER_TRADES_CSV = DATA_DIR / "paper_trades.csv"
@@ -40,10 +45,17 @@ class Position:
 
     quantity: float = 0.0
     avg_entry_price: float = 0.0
+    entry_count: int = 0
+    last_buy_time: float | None = None
 
     @property
     def is_open(self) -> bool:
         return self.quantity > 0
+
+    @property
+    def allocation_usdc(self) -> float:
+        """USDC cost basis currently tied up in this position."""
+        return self.quantity * self.avg_entry_price
 
 
 @dataclass
@@ -60,13 +72,20 @@ class PaperTrader:
     realized_pnl: float = 0.0
     positions: dict[str, Position] = field(default_factory=dict)
 
-    def process_signal(self, coin: str, signal: str, price: float, timestamp: str) -> None:
+    def process_signal(
+        self,
+        coin: str,
+        signal: str,
+        price: float,
+        timestamp: str,
+        now: float,
+    ) -> None:
         """Apply one signal for a coin at the current price."""
         if coin not in WATCHLIST:
             return
 
         if signal in BUY_SIGNALS:
-            self._fake_buy(coin, price, timestamp, signal)
+            self._fake_buy(coin, price, timestamp, signal, now)
         elif signal in SELL_SIGNALS:
             self._fake_sell(coin, price, timestamp, signal)
 
@@ -91,8 +110,43 @@ class PaperTrader:
             self.positions[coin] = Position()
         return self.positions[coin]
 
-    def _fake_buy(self, coin: str, price: float, timestamp: str, signal: str) -> None:
+    def _get_buy_block_reason(self, coin: str, now: float) -> str | None:
+        """Return a skip reason if risk rules block a fake BUY, else None."""
+        position = self._get_position(coin)
+
         if self.cash_balance < TRADE_SIZE_USDC:
+            return "insufficient fake cash"
+
+        if position.allocation_usdc + TRADE_SIZE_USDC > MAX_ALLOCATION_PER_COIN_USDC:
+            return "max allocation reached"
+
+        if position.entry_count >= MAX_ENTRIES_PER_COIN:
+            return "max entries reached"
+
+        if position.last_buy_time is not None:
+            seconds_since_last_buy = now - position.last_buy_time
+            if seconds_since_last_buy < MIN_SECONDS_BETWEEN_BUYS:
+                return "cooldown active"
+
+        return None
+
+    def _fake_buy(
+        self,
+        coin: str,
+        price: float,
+        timestamp: str,
+        signal: str,
+        now: float,
+    ) -> None:
+        block_reason = self._get_buy_block_reason(coin, now)
+        if block_reason is not None:
+            print_skipped_trade_proposal(
+                timestamp=timestamp,
+                coin=coin,
+                price=price,
+                signal=signal,
+                reason=block_reason,
+            )
             return
 
         quantity = TRADE_SIZE_USDC / price
@@ -102,6 +156,8 @@ class PaperTrader:
         total_cost = (position.avg_entry_price * position.quantity) + TRADE_SIZE_USDC
         position.quantity += quantity
         position.avg_entry_price = total_cost / position.quantity
+        position.entry_count += 1
+        position.last_buy_time = now
 
         self.cash_balance -= TRADE_SIZE_USDC
 
@@ -144,6 +200,8 @@ class PaperTrader:
         if position.quantity <= 0 or position.quantity * price < 0.01:
             position.quantity = 0.0
             position.avg_entry_price = 0.0
+            position.entry_count = 0
+            position.last_buy_time = None
 
         self._log_trade(
             timestamp=timestamp,
@@ -198,6 +256,26 @@ class PaperTrader:
                     f"{trade_realized_pnl:.2f}",
                 ]
             )
+
+
+def print_skipped_trade_proposal(
+    timestamp: str,
+    coin: str,
+    price: float,
+    signal: str,
+    reason: str,
+) -> None:
+    """Print a readable skip message when risk rules block a fake BUY."""
+    print()
+    print("  >> SKIPPED PAPER TRADE PROPOSAL")
+    print(f"     Timestamp:   {timestamp}")
+    print(f"     Coin:        {coin}")
+    print(f"     Action:      BUY (skipped)")
+    print(f"     Price:       ${price:,.2f}")
+    print(f"     Trade value: ${TRADE_SIZE_USDC:,.2f}")
+    print(f"     Signal:      {signal}")
+    print(f"     Reason:      {reason}")
+    print()
 
 
 def print_paper_trade_proposal(
