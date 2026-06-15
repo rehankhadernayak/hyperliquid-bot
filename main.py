@@ -4,8 +4,9 @@ Read-only Hyperliquid market analyzer.
 Fetches public mid prices from Hyperliquid's Info API every 10 seconds,
 tracks each coin's first observed price, keeps recent price history in memory,
 and shows rolling 1-minute and 5-minute percentage changes with signals.
+Also runs a read-only paper trading simulation (no real orders).
 
-No wallet, signing, or trading involved.
+No wallet, signing, or live trading involved.
 """
 
 import sys
@@ -26,6 +27,7 @@ from market_analyzer import (
     rolling_percent_change,
     update_start_prices,
 )
+from paper_trader import PaperTrader, print_paper_trading_summary
 from signals import SIGNAL_STRONG_UP_PCT, SIGNAL_UP_PCT, signal_from_1m_change
 
 
@@ -56,6 +58,7 @@ def print_market_analysis(
     mids: dict[str, str],
     start_prices: dict[str, float],
     price_history: PriceHistory,
+    paper_trader: PaperTrader | None = None,
     timestamp: str | None = None,
 ) -> str:
     """Print current price, rolling changes, and signals for BTC, ETH, and SOL."""
@@ -73,6 +76,8 @@ def print_market_analysis(
     )
     print("-" * 78)
 
+    current_prices: dict[str, float] = {}
+
     for coin in WATCHLIST:
         price_str = mids.get(coin)
 
@@ -86,6 +91,7 @@ def print_market_analysis(
             print(f"{coin:<6} invalid price ({price_str!r})")
             continue
 
+        current_prices[coin] = current_price
         record_price_history(price_history, coin, current_price, now)
 
         start_price = start_prices.get(coin)
@@ -112,6 +118,12 @@ def print_market_analysis(
             f"{format_change_or_na(change_5m):>10} {signal:>12}"
         )
 
+        if paper_trader is not None:
+            paper_trader.process_signal(coin, signal, current_price, timestamp)
+
+    if paper_trader is not None:
+        print_paper_trading_summary(paper_trader, current_prices)
+
     return timestamp
 
 
@@ -126,17 +138,21 @@ def run_analyzer() -> None:
         "Signals use 1-minute rolling change "
         f"(±{SIGNAL_UP_PCT}% / ±{SIGNAL_STRONG_UP_PCT}% thresholds)"
     )
+    print("Paper trading: fake $1,000 USDC balance, $100 per simulated trade")
 
     # First observed price for each coin during this run
     start_prices: dict[str, float] = {}
     # Recent (timestamp, price) history for rolling window calculations
     price_history: PriceHistory = {}
+    paper_trader = PaperTrader()
 
     while True:
         try:
             mids = fetch_all_mids()
             update_start_prices(start_prices, mids)
-            timestamp = print_market_analysis(mids, start_prices, price_history)
+            timestamp = print_market_analysis(
+                mids, start_prices, price_history, paper_trader=paper_trader
+            )
             append_prices_to_csv(mids, timestamp)
         except Exception as exc:
             print(f"\n[{current_timestamp()}]")
