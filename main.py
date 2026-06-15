@@ -28,6 +28,9 @@ from market_analyzer import (
     update_start_prices,
 )
 from paper_trader import (
+    MAX_SUCCESSFUL_TRADES_PER_SESSION,
+    MAX_TOTAL_OPEN_EXPOSURE_USDC,
+    MIN_EQUITY_BEFORE_PAUSE_USDC,
     MIN_SECONDS_BETWEEN_BUYS,
     PaperTrader,
     print_paper_trading_summary,
@@ -85,6 +88,7 @@ def print_market_analysis(
     print("-" * 78)
 
     current_prices: dict[str, float] = {}
+    pending_signals: list[tuple[str, str, float]] = []
 
     for coin in WATCHLIST:
         price_str = mids.get(coin)
@@ -126,10 +130,14 @@ def print_market_analysis(
             f"{format_change_or_na(change_5m):>10} {signal:>12}"
         )
 
-        if paper_trader is not None:
-            paper_trader.process_signal(coin, signal, current_price, timestamp, now)
+        pending_signals.append((coin, signal, current_price))
 
     if paper_trader is not None:
+        paper_trader.update_session_risk(current_prices)
+
+        for coin, signal, current_price in pending_signals:
+            paper_trader.process_signal(coin, signal, current_price, timestamp, now)
+
         print_paper_trading_summary(paper_trader, current_prices)
 
     return timestamp
@@ -151,8 +159,14 @@ def run_analyzer() -> None:
     )
     print("Paper trading: fake $1,000 USDC balance, $100 per simulated trade")
     print(
-        "Risk limits: max $300/coin, max 3 entries/coin, "
+        "Per-coin limits: max $300/coin, max 3 entries/coin, "
         f"{MIN_SECONDS_BETWEEN_BUYS}s buy cooldown per coin"
+    )
+    print(
+        "Session limits: max "
+        f"${MAX_TOTAL_OPEN_EXPOSURE_USDC:,.0f} total exposure, max "
+        f"{MAX_SUCCESSFUL_TRADES_PER_SESSION} trades/session, "
+        f"pause below ${MIN_EQUITY_BEFORE_PAUSE_USDC:,.0f} equity"
     )
 
     # First observed price for each coin during this run

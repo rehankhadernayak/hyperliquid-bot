@@ -15,10 +15,15 @@ from market_analyzer import WATCHLIST
 STARTING_BALANCE_USDC = 1000.0
 TRADE_SIZE_USDC = 100.0
 
-# Risk limits for fake BUY trades (SELL signals are not blocked)
+# Per-coin risk limits for fake BUY trades (SELL signals are not blocked)
 MAX_ALLOCATION_PER_COIN_USDC = 300.0
 MAX_ENTRIES_PER_COIN = 3
 MIN_SECONDS_BETWEEN_BUYS = 60
+
+# Session-level risk limits (apply for the current run only)
+MAX_TOTAL_OPEN_EXPOSURE_USDC = 600.0
+MAX_SUCCESSFUL_TRADES_PER_SESSION = 10
+MIN_EQUITY_BEFORE_PAUSE_USDC = 980.0
 
 # Where to save paper trade history
 DATA_DIR = Path("data")
@@ -71,6 +76,51 @@ class PaperTrader:
     cash_balance: float = STARTING_BALANCE_USDC
     realized_pnl: float = 0.0
     positions: dict[str, Position] = field(default_factory=dict)
+    successful_trades_this_session: int = 0
+    is_paused: bool = False
+    _equity_pause_announced: bool = False
+
+    def total_open_exposure(self) -> float:
+        """Sum of cost basis across all open positions (USDC tied up)."""
+        return sum(
+            position.allocation_usdc
+            for position in self.positions.values()
+            if position.is_open
+        )
+
+    def total_equity(self, current_prices: dict[str, float]) -> float:
+        """Cash balance plus current market value of all open positions."""
+        positions_value = 0.0
+
+        for coin, position in self.positions.items():
+            if not position.is_open:
+                continue
+
+            current_price = current_prices.get(coin)
+            if current_price is None:
+                continue
+
+            positions_value += position.quantity * current_price
+
+        return self.cash_balance + positions_value
+
+    def update_session_risk(self, current_prices: dict[str, float]) -> None:
+        """Check equity and pause paper trading if it falls below the session floor."""
+        if self.is_paused:
+            return
+
+        equity = self.total_equity(current_prices)
+        if equity < MIN_EQUITY_BEFORE_PAUSE_USDC:
+            self.is_paused = True
+
+            if not self._equity_pause_announced:
+                print()
+                print("  >> PAPER TRADING PAUSED")
+                print("     Reason:      equity protection triggered")
+                print(f"     Total equity: ${equity:,.2f}")
+                print(f"     Minimum:      ${MIN_EQUITY_BEFORE_PAUSE_USDC:,.2f}")
+                print()
+                self._equity_pause_announced = True
 
     def process_signal(
         self,
@@ -82,6 +132,9 @@ class PaperTrader:
     ) -> None:
         """Apply one signal for a coin at the current price."""
         if coin not in WATCHLIST:
+            return
+
+        if self.is_paused:
             return
 
         if signal in BUY_SIGNALS:
@@ -128,7 +181,20 @@ class PaperTrader:
             if seconds_since_last_buy < MIN_SECONDS_BETWEEN_BUYS:
                 return "cooldown active"
 
+        if self.total_open_exposure() + TRADE_SIZE_USDC > MAX_TOTAL_OPEN_EXPOSURE_USDC:
+            return "total exposure limit reached"
+
         return None
+
+    def _get_session_trade_block_reason(self, coin: str, action: str) -> str | None:
+        """Return a skip reason if session limits block a fake trade, else None."""
+        if self.successful_trades_this_session < MAX_SUCCESSFUL_TRADES_PER_SESSION:
+            return None
+
+        if action == "SELL" and not self._get_position(coin).is_open:
+            return None
+
+        return "max session trades reached"
 
     def _fake_buy(
         self,
@@ -138,11 +204,24 @@ class PaperTrader:
         signal: str,
         now: float,
     ) -> None:
+        session_block_reason = self._get_session_trade_block_reason(coin, "BUY")
+        if session_block_reason is not None:
+            print_skipped_trade_proposal(
+                timestamp=timestamp,
+                coin=coin,
+                action="BUY",
+                price=price,
+                signal=signal,
+                reason=session_block_reason,
+            )
+            return
+
         block_reason = self._get_buy_block_reason(coin, now)
         if block_reason is not None:
             print_skipped_trade_proposal(
                 timestamp=timestamp,
                 coin=coin,
+                action="BUY",
                 price=price,
                 signal=signal,
                 reason=block_reason,
@@ -176,6 +255,18 @@ class PaperTrader:
         position = self._get_position(coin)
 
         if not position.is_open:
+            return
+
+        session_block_reason = self._get_session_trade_block_reason(coin, "SELL")
+        if session_block_reason is not None:
+            print_skipped_trade_proposal(
+                timestamp=timestamp,
+                coin=coin,
+                action="SELL",
+                price=price,
+                signal=signal,
+                reason=session_block_reason,
+            )
             return
 
         position_value = position.quantity * price
@@ -234,6 +325,8 @@ class PaperTrader:
             signal=signal,
         )
 
+        self.successful_trades_this_session += 1
+
         ensure_data_dir()
 
         write_header = not PAPER_TRADES_CSV.exists()
@@ -261,16 +354,17 @@ class PaperTrader:
 def print_skipped_trade_proposal(
     timestamp: str,
     coin: str,
+    action: str,
     price: float,
     signal: str,
     reason: str,
 ) -> None:
-    """Print a readable skip message when risk rules block a fake BUY."""
+    """Print a readable skip message when risk rules block a fake trade."""
     print()
     print("  >> SKIPPED PAPER TRADE PROPOSAL")
     print(f"     Timestamp:   {timestamp}")
     print(f"     Coin:        {coin}")
-    print(f"     Action:      BUY (skipped)")
+    print(f"     Action:      {action} (skipped)")
     print(f"     Price:       ${price:,.2f}")
     print(f"     Trade value: ${TRADE_SIZE_USDC:,.2f}")
     print(f"     Signal:      {signal}")
@@ -322,19 +416,23 @@ def print_paper_trading_summary(
 ) -> None:
     """Print cash, PnL, and open positions below the market analysis table."""
     unrealized = paper_trader.unrealized_pnl(current_prices)
-    total_equity = paper_trader.cash_balance + sum(
-        paper_trader.positions[coin].quantity * current_prices[coin]
-        for coin in WATCHLIST
-        if coin in current_prices and paper_trader.positions.get(coin, Position()).is_open
-    )
+    total_equity = paper_trader.total_equity(current_prices)
+    open_exposure = paper_trader.total_open_exposure()
+    paused_label = "YES (equity protection)" if paper_trader.is_paused else "NO"
 
     print()
     print("Paper trading summary:")
     print("-" * 78)
+    print(f"  Status:          Paused: {paused_label}")
     print(f"  Cash balance:    ${paper_trader.cash_balance:,.2f}")
     print(f"  Realized PnL:    {format_usdc(paper_trader.realized_pnl)}")
     print(f"  Unrealized PnL:  {format_usdc(unrealized)}")
     print(f"  Total equity:    ${total_equity:,.2f}")
+    print(f"  Open exposure:   ${open_exposure:,.2f}")
+    print(
+        f"  Session trades:  {paper_trader.successful_trades_this_session}"
+        f" / {MAX_SUCCESSFUL_TRADES_PER_SESSION}"
+    )
     print()
     print(
         f"  {'Coin':<6} {'Quantity':>14} {'Avg Entry':>14} "
