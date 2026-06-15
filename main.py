@@ -1,16 +1,21 @@
 """
 Read-only Hyperliquid market scanner.
 
-Fetches public mid prices from Hyperliquid's Info API.
+Fetches public mid prices from Hyperliquid's Info API every 10 seconds.
 No wallet, signing, or trading involved.
 """
 
 import sys
+import time
+from datetime import datetime, timezone
 
 import requests
 
 # Hyperliquid's public read-only Info API (mainnet)
 INFO_API_URL = "https://api.hyperliquid.xyz/info"
+
+# How often to refresh prices (seconds)
+REFRESH_INTERVAL_SECONDS = 10
 
 # Coins we want to display from the allMids response
 WATCHLIST = ("BTC", "ETH", "SOL")
@@ -40,36 +45,77 @@ def fetch_all_mids() -> dict[str, str]:
     return data
 
 
+def price_to_float(price_str: str) -> float:
+    """Convert a price string from the API (e.g. '43250.5') into a float."""
+    return float(price_str)
+
+
+def current_timestamp() -> str:
+    """Return the current UTC time as a readable string."""
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
+
+
 def print_watchlist_prices(mids: dict[str, str]) -> None:
-    """Print mid prices for BTC, ETH, and SOL when they are present."""
+    """Print mid prices for BTC, ETH, and SOL with a timestamp."""
+    print(f"\n[{current_timestamp()}]")
     print("Hyperliquid mid prices:")
     print("-" * 28)
 
     for coin in WATCHLIST:
-        price = mids.get(coin)
+        price_str = mids.get(coin)
 
-        if price is None:
+        if price_str is None:
             print(f"{coin}: not available")
-        else:
-            print(f"{coin}: ${price}")
+            continue
+
+        try:
+            price = price_to_float(price_str)
+            print(f"{coin}: ${price:,.2f}")
+        except ValueError:
+            print(f"{coin}: invalid price ({price_str!r})")
+
+
+def handle_request_error(exc: Exception) -> None:
+    """Print a friendly error message for a failed API request."""
+    if isinstance(exc, requests.exceptions.Timeout):
+        print("Error: request timed out. Will retry on the next interval.")
+    elif isinstance(exc, requests.exceptions.HTTPError):
+        status = exc.response.status_code if exc.response is not None else "unknown"
+        print(f"Error: HTTP {status} from Hyperliquid API. Will retry on the next interval.")
+    elif isinstance(exc, requests.exceptions.RequestException):
+        print(f"Error: network request failed ({exc}). Will retry on the next interval.")
+    elif isinstance(exc, ValueError):
+        print(f"Error: {exc}. Will retry on the next interval.")
+    else:
+        print(f"Error: {exc}. Will retry on the next interval.")
+
+
+def run_scanner() -> None:
+    """
+    Fetch and print watchlist prices in a loop.
+
+    Runs until the user presses Ctrl+C.
+    """
+    print("Starting Hyperliquid market scanner (Ctrl+C to stop)...")
+
+    while True:
+        try:
+            mids = fetch_all_mids()
+            print_watchlist_prices(mids)
+        except Exception as exc:
+            print(f"\n[{current_timestamp()}]")
+            handle_request_error(exc)
+
+        # Wait before the next update (Ctrl+C can interrupt this sleep)
+        time.sleep(REFRESH_INTERVAL_SECONDS)
 
 
 def main() -> None:
     try:
-        mids = fetch_all_mids()
-        print_watchlist_prices(mids)
-    except requests.exceptions.Timeout:
-        print("Error: request timed out. Check your internet connection and try again.")
-        sys.exit(1)
-    except requests.exceptions.HTTPError as exc:
-        print(f"Error: HTTP {exc.response.status_code} from Hyperliquid API.")
-        sys.exit(1)
-    except requests.exceptions.RequestException as exc:
-        print(f"Error: network request failed ({exc}).")
-        sys.exit(1)
-    except ValueError as exc:
-        print(f"Error: {exc}")
-        sys.exit(1)
+        run_scanner()
+    except KeyboardInterrupt:
+        print("\nScanner stopped.")
+        sys.exit(0)
 
 
 if __name__ == "__main__":
