@@ -23,3 +23,22 @@ Stage 1: Market scanner
 - No real trading
 - No API secrets
 - Read-only public market data only
+
+## Dashboard
+
+View logged prices and paper trade results in a simple read-only dashboard.
+
+1. Install dependencies (if you have not already):
+
+   ```bash
+   pip install -r requirements.txt
+   ```
+
+2. Run the dashboard:
+
+   ```bash
+   streamlit run dashboard.py
+   ```
+
+The dashboard reads `data/price_log.csv` and `data/paper_trades.csv` (if it exists).
+No wallet, signing, or real orders are used.
