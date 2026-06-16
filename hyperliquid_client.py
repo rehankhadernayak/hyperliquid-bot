@@ -6,8 +6,7 @@ Fetches public market data only — no wallet, signing, or trading.
 
 import requests
 
-# Hyperliquid's public read-only Info API (mainnet)
-INFO_API_URL = "https://api.hyperliquid.xyz/info"
+from config import MARKET
 
 
 def fetch_all_mids() -> dict[str, str]:
@@ -20,9 +19,9 @@ def fetch_all_mids() -> dict[str, str]:
 
     # POST JSON to the public info endpoint (read-only, no auth needed)
     response = requests.post(
-        INFO_API_URL,
+        MARKET.api_url,
         json=payload,
-        timeout=10,
+        timeout=MARKET.request_timeout_seconds,
     )
     response.raise_for_status()
 

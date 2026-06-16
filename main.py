@@ -12,13 +12,10 @@ No wallet, signing, or live trading involved.
 import sys
 import time
 
+from config import MARKET, PAPER_TRADING, TEST_MODE
 from data_logger import append_prices_to_csv
 from hyperliquid_client import fetch_all_mids, handle_request_error
-from market_analyzer import (
-    REFRESH_INTERVAL_SECONDS,
-    PriceHistory,
-    update_start_prices,
-)
+from market_analyzer import PriceHistory, update_start_prices
 from market_snapshot import (
     build_snapshot,
     current_prices_from_rows,
@@ -26,18 +23,9 @@ from market_snapshot import (
     print_snapshot,
     tradable_signals_from_rows,
 )
-from paper_trader import (
-    MAX_SUCCESSFUL_TRADES_PER_SESSION,
-    MAX_TOTAL_OPEN_EXPOSURE_USDC,
-    MIN_EQUITY_BEFORE_PAUSE_USDC,
-    MIN_SECONDS_BETWEEN_BUYS,
-    PaperTrader,
-)
+from paper_trader import PaperTrader
 import signals
 from signals import apply_signal_thresholds
-
-# Set True to use lower signal thresholds and trigger paper trades more often.
-TEST_MODE = True
 
 
 def run_analyzer() -> None:
@@ -57,13 +45,13 @@ def run_analyzer() -> None:
     print("Paper trading: fake $1,000 USDC balance, $100 per simulated trade")
     print(
         "Per-coin limits: max $300/coin, max 3 entries/coin, "
-        f"{MIN_SECONDS_BETWEEN_BUYS}s buy cooldown per coin"
+        f"{PAPER_TRADING.min_seconds_between_buys}s buy cooldown per coin"
     )
     print(
         "Session limits: max "
-        f"${MAX_TOTAL_OPEN_EXPOSURE_USDC:,.0f} total exposure, max "
-        f"{MAX_SUCCESSFUL_TRADES_PER_SESSION} trades/session, "
-        f"pause below ${MIN_EQUITY_BEFORE_PAUSE_USDC:,.0f} equity"
+        f"${PAPER_TRADING.max_total_open_exposure_usdc:,.0f} total exposure, max "
+        f"{PAPER_TRADING.max_successful_trades_per_session} trades/session, "
+        f"pause below ${PAPER_TRADING.min_equity_before_pause_usdc:,.0f} equity"
     )
 
     # First observed price for each coin during this run
@@ -120,7 +108,7 @@ def run_analyzer() -> None:
             handle_request_error(exc)
 
         # Wait before the next update (Ctrl+C can interrupt this sleep)
-        time.sleep(REFRESH_INTERVAL_SECONDS)
+        time.sleep(MARKET.polling_interval_seconds)
 
 
 def main() -> None:

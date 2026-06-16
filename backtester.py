@@ -17,36 +17,18 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 
-from market_analyzer import PriceHistory, WATCHLIST, update_start_prices
-from market_snapshot import build_market_rows, tradable_signals_from_rows
-from paper_trader import (
-    MIN_EQUITY_BEFORE_PAUSE_USDC,
-    PaperTrader,
-    STARTING_BALANCE_USDC,
+from config import (
+    BacktestConfig,
+    DATA,
+    DEFAULT_BACKTEST,
+    MARKET,
+    PAPER_TRADING,
 )
+from market_analyzer import PriceHistory, update_start_prices
+from market_snapshot import build_market_rows, tradable_signals_from_rows
+from paper_trader import PaperTrader
 import paper_trader as paper_trader_module
 from signals import apply_signal_thresholds
-
-PRICE_LOG_CSV = Path("data") / "price_log.csv"
-RESULTS_JSON = Path("data") / "backtest_results.json"
-
-# Backtest-only defaults (live PaperTrader limits are unchanged).
-DEFAULT_BACKTEST_MAX_SESSION_TRADES = 1000
-
-# Small, realistic simulation costs applied to every BUY and SELL fill.
-# 0.05% taker fee and 0.02% slippage per side are typical for liquid perps.
-DEFAULT_TRADING_FEE_PCT = 0.05
-DEFAULT_SLIPPAGE_PCT = 0.02
-
-
-@dataclass
-class BacktestConfig:
-    """Settings used only during backtests — does not affect live paper trading."""
-
-    max_session_trades: int = DEFAULT_BACKTEST_MAX_SESSION_TRADES
-    trading_fee_pct: float = DEFAULT_TRADING_FEE_PCT
-    slippage_pct: float = DEFAULT_SLIPPAGE_PCT
-    close_positions_at_end: bool = True
 
 
 @dataclass
@@ -87,7 +69,7 @@ class BacktestPaperTrader(PaperTrader):
             return
 
         equity = self.total_equity(current_prices)
-        if equity < MIN_EQUITY_BEFORE_PAUSE_USDC:
+        if equity < PAPER_TRADING.min_equity_before_pause_usdc:
             self.is_paused = True
 
     def _log_trade(
@@ -119,7 +101,7 @@ class BacktestPaperTrader(PaperTrader):
         self, current_prices: dict[str, float], timestamp: str
     ) -> None:
         """Close every open position at the final available prices."""
-        for coin in WATCHLIST:
+        for coin in MARKET.watchlist:
             position = self._get_position(coin)
             if not position.is_open:
                 continue
@@ -237,7 +219,7 @@ def summarize_by_coin(trade_log: list[dict]) -> dict[str, dict]:
     """Build per-coin trade stats from the backtest trade log."""
     by_coin: dict[str, dict] = {}
 
-    for coin in WATCHLIST:
+    for coin in MARKET.watchlist:
         coin_trades = [trade for trade in trade_log if trade["coin"] == coin]
         coin_sells = [trade for trade in coin_trades if trade["action"] == "SELL"]
         coin_buys = [trade for trade in coin_trades if trade["action"] == "BUY"]
@@ -292,7 +274,8 @@ def build_mode_results(
     ending_equity = paper_trader.total_equity(current_prices)
     total_pnl = paper_trader.realized_pnl + unrealized
     total_return_pct = (
-        ((ending_equity - STARTING_BALANCE_USDC) / STARTING_BALANCE_USDC) * 100
+        ((ending_equity - PAPER_TRADING.starting_balance_usdc) / PAPER_TRADING.starting_balance_usdc)
+        * 100
     )
 
     avg_win = sum(trade["realized_pnl"] for trade in winning) / len(winning) if winning else 0.0
@@ -301,7 +284,7 @@ def build_mode_results(
 
     return {
         "label": label,
-        "starting_equity": STARTING_BALANCE_USDC,
+        "starting_equity": PAPER_TRADING.starting_balance_usdc,
         "ending_equity": round(ending_equity, 2),
         "realized_pnl": round(paper_trader.realized_pnl, 2),
         "unrealized_pnl": round(unrealized, 2),
@@ -337,7 +320,7 @@ def _replay(
     """Run the replay loop and return equity curve, final prices, last timestamp."""
     start_prices: dict[str, float] = {}
     price_history: PriceHistory = {}
-    equity_curve: list[float] = [STARTING_BALANCE_USDC]
+    equity_curve: list[float] = [PAPER_TRADING.starting_balance_usdc]
     current_prices: dict[str, float] = {}
     last_timestamp = timestamps[-1]
 
@@ -366,7 +349,7 @@ def _replay(
 
 
 def run_backtest(
-    csv_path: Path = PRICE_LOG_CSV,
+    csv_path: Path = DATA.price_log_csv,
     test_mode: bool = True,
     config: BacktestConfig | None = None,
 ) -> dict:
@@ -422,7 +405,7 @@ def run_backtest(
 
 
 def run_comparison(
-    csv_path: Path = PRICE_LOG_CSV,
+    csv_path: Path = DATA.price_log_csv,
     config: BacktestConfig | None = None,
 ) -> dict:
     """Run both TEST_MODE and production thresholds and return a full comparison."""
@@ -454,7 +437,7 @@ def run_comparison(
     }
 
 
-def save_results(results: dict, output_path: Path = RESULTS_JSON) -> None:
+def save_results(results: dict, output_path: Path = DATA.backtest_results_json) -> None:
     """Write backtest results to a JSON file."""
     output_path.parent.mkdir(exist_ok=True)
 
@@ -541,9 +524,9 @@ def print_results(results: dict) -> None:
 def main() -> None:
     """Run both strategy modes, save results, and print a summary."""
     print("Starting read-only backtest comparison...")
-    print(f"  Price log: {PRICE_LOG_CSV}")
+    print(f"  Price log: {DATA.price_log_csv}")
     print(f"  Modes:     TEST_MODE + Production")
-    print(f"  Max trades per session: {DEFAULT_BACKTEST_MAX_SESSION_TRADES:,}")
+    print(f"  Max trades per session: {DEFAULT_BACKTEST.max_session_trades:,}")
 
     try:
         results = run_comparison()
@@ -553,7 +536,7 @@ def main() -> None:
 
     save_results(results)
     print_results(results)
-    print(f"Full results saved to {RESULTS_JSON}")
+    print(f"Full results saved to {DATA.backtest_results_json}")
 
 
 if __name__ == "__main__":

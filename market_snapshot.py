@@ -9,21 +9,17 @@ from dataclasses import asdict, dataclass
 import time
 from datetime import datetime, timezone
 
+from config import DATA, MARKET, PAPER_TRADING
 from market_analyzer import (
     WINDOW_1M_SECONDS,
     WINDOW_5M_SECONDS,
-    WATCHLIST,
     PriceHistory,
     percent_change,
     price_to_float,
     record_price_history,
     rolling_percent_change,
 )
-from paper_trader import (
-    MAX_SUCCESSFUL_TRADES_PER_SESSION,
-    PaperTrader,
-    Position,
-)
+from paper_trader import PaperTrader, Position
 from signals import signal_from_1m_change
 
 
@@ -102,7 +98,7 @@ def build_market_rows(
     rows: list[MarketRow] = []
     current_prices: dict[str, float] = {}
 
-    for coin in WATCHLIST:
+    for coin in MARKET.watchlist:
         price_str = mids.get(coin)
 
         if price_str is None:
@@ -178,7 +174,7 @@ def build_paper_trader_summary(
         paused=paper_trader.is_paused,
         pause_reason=pause_reason,
         session_trades=paper_trader.successful_trades_this_session,
-        max_session_trades=MAX_SUCCESSFUL_TRADES_PER_SESSION,
+        max_session_trades=PAPER_TRADING.max_successful_trades_per_session,
     )
 
 
@@ -189,7 +185,7 @@ def build_open_positions(
     """Build open position rows for each coin with an active position."""
     positions: list[OpenPositionRow] = []
 
-    for coin in WATCHLIST:
+    for coin in MARKET.watchlist:
         position = paper_trader.positions.get(coin, Position())
         current_price = current_prices.get(coin)
 

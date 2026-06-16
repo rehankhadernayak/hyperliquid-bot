@@ -2,15 +2,11 @@
 Price history tracking and percentage change calculations.
 """
 
+from config import MARKET
+
 # Rolling window lengths for short-term change calculations
 WINDOW_1M_SECONDS = 60
 WINDOW_5M_SECONDS = 300
-
-# How often the main loop refreshes prices (used when trimming history)
-REFRESH_INTERVAL_SECONDS = 10
-
-# Coins we want to track from the allMids response
-WATCHLIST = ("BTC", "ETH", "SOL")
 
 # Each coin's in-memory history is a list of (unix_time, price) tuples
 PriceHistory = dict[str, list[tuple[float, float]]]
@@ -34,7 +30,7 @@ def update_start_prices(start_prices: dict[str, float], mids: dict[str, str]) ->
 
     Once a start price is stored for a coin, it is not overwritten.
     """
-    for coin in WATCHLIST:
+    for coin in MARKET.watchlist:
         if coin in start_prices:
             continue
 
@@ -61,7 +57,7 @@ def record_price_history(
     price_history[coin].append((now, price))
 
     # Keep a little extra beyond 5 minutes so lookups stay accurate
-    cutoff = now - WINDOW_5M_SECONDS - REFRESH_INTERVAL_SECONDS
+    cutoff = now - WINDOW_5M_SECONDS - MARKET.polling_interval_seconds
     price_history[coin] = [(t, p) for t, p in price_history[coin] if t >= cutoff]
 
 

@@ -7,27 +7,8 @@ No wallet, signing, or real exchange orders — read-only simulation only.
 
 import csv
 from dataclasses import dataclass, field
-from pathlib import Path
 
-from market_analyzer import WATCHLIST
-
-# Starting fake account settings
-STARTING_BALANCE_USDC = 1000.0
-TRADE_SIZE_USDC = 100.0
-
-# Per-coin risk limits for fake BUY trades (SELL signals are not blocked)
-MAX_ALLOCATION_PER_COIN_USDC = 300.0
-MAX_ENTRIES_PER_COIN = 3
-MIN_SECONDS_BETWEEN_BUYS = 60
-
-# Session-level risk limits (apply for the current run only)
-MAX_TOTAL_OPEN_EXPOSURE_USDC = 600.0
-MAX_SUCCESSFUL_TRADES_PER_SESSION = 10
-MIN_EQUITY_BEFORE_PAUSE_USDC = 980.0
-
-# Where to save paper trade history
-DATA_DIR = Path("data")
-PAPER_TRADES_CSV = DATA_DIR / "paper_trades.csv"
+from config import DATA, MARKET, PAPER_TRADING
 CSV_COLUMNS = (
     "timestamp",
     "coin",
@@ -70,10 +51,10 @@ class PaperTrader:
 
     BUY on DOWN / STRONG_DOWN signals (contrarian: buy when price is falling).
     SELL on UP / STRONG_UP signals when a position is already open.
-    Each trade uses TRADE_SIZE_USDC worth of notional.
+    Each trade uses PAPER_TRADING.trade_size_usdc worth of notional.
     """
 
-    cash_balance: float = STARTING_BALANCE_USDC
+    cash_balance: float = PAPER_TRADING.starting_balance_usdc
     realized_pnl: float = 0.0
     positions: dict[str, Position] = field(default_factory=dict)
     successful_trades_this_session: int = 0
@@ -110,7 +91,7 @@ class PaperTrader:
             return
 
         equity = self.total_equity(current_prices)
-        if equity < MIN_EQUITY_BEFORE_PAUSE_USDC:
+        if equity < PAPER_TRADING.min_equity_before_pause_usdc:
             self.is_paused = True
 
             if not self._equity_pause_announced:
@@ -118,7 +99,7 @@ class PaperTrader:
                 print("  >> PAPER TRADING PAUSED")
                 print("     Reason:      equity protection triggered")
                 print(f"     Total equity: ${equity:,.2f}")
-                print(f"     Minimum:      ${MIN_EQUITY_BEFORE_PAUSE_USDC:,.2f}")
+                print(f"     Minimum:      ${PAPER_TRADING.min_equity_before_pause_usdc:,.2f}")
                 print()
                 self._equity_pause_announced = True
 
@@ -131,7 +112,7 @@ class PaperTrader:
         now: float,
     ) -> None:
         """Apply one signal for a coin at the current price."""
-        if coin not in WATCHLIST:
+        if coin not in MARKET.watchlist:
             return
 
         if self.is_paused:
@@ -167,28 +148,34 @@ class PaperTrader:
         """Return a skip reason if risk rules block a fake BUY, else None."""
         position = self._get_position(coin)
 
-        if self.cash_balance < TRADE_SIZE_USDC:
+        if self.cash_balance < PAPER_TRADING.trade_size_usdc:
             return "insufficient fake cash"
 
-        if position.allocation_usdc + TRADE_SIZE_USDC > MAX_ALLOCATION_PER_COIN_USDC:
+        if (
+            position.allocation_usdc + PAPER_TRADING.trade_size_usdc
+            > PAPER_TRADING.max_allocation_per_coin_usdc
+        ):
             return "max allocation reached"
 
-        if position.entry_count >= MAX_ENTRIES_PER_COIN:
+        if position.entry_count >= PAPER_TRADING.max_entries_per_coin:
             return "max entries reached"
 
         if position.last_buy_time is not None:
             seconds_since_last_buy = now - position.last_buy_time
-            if seconds_since_last_buy < MIN_SECONDS_BETWEEN_BUYS:
+            if seconds_since_last_buy < PAPER_TRADING.min_seconds_between_buys:
                 return "cooldown active"
 
-        if self.total_open_exposure() + TRADE_SIZE_USDC > MAX_TOTAL_OPEN_EXPOSURE_USDC:
+        if (
+            self.total_open_exposure() + PAPER_TRADING.trade_size_usdc
+            > PAPER_TRADING.max_total_open_exposure_usdc
+        ):
             return "total exposure limit reached"
 
         return None
 
     def session_trade_limit(self) -> int:
         """Maximum successful trades allowed this session (subclasses may override)."""
-        return MAX_SUCCESSFUL_TRADES_PER_SESSION
+        return PAPER_TRADING.max_successful_trades_per_session
 
     def execution_price(self, action: str, mid_price: float) -> float:
         """Price used for fills; subclasses may add slippage."""
@@ -245,18 +232,20 @@ class PaperTrader:
             return
 
         execution_price = self.execution_price("BUY", price)
-        quantity = TRADE_SIZE_USDC / execution_price
+        quantity = PAPER_TRADING.trade_size_usdc / execution_price
         position = self._get_position(coin)
 
         # Weighted average entry when adding to an existing position
-        total_cost = (position.avg_entry_price * position.quantity) + TRADE_SIZE_USDC
+        total_cost = (
+            (position.avg_entry_price * position.quantity) + PAPER_TRADING.trade_size_usdc
+        )
         position.quantity += quantity
         position.avg_entry_price = total_cost / position.quantity
         position.entry_count += 1
         position.last_buy_time = now
 
-        buy_fee = self.buy_fee(TRADE_SIZE_USDC)
-        self.cash_balance -= TRADE_SIZE_USDC + buy_fee
+        buy_fee = self.buy_fee(PAPER_TRADING.trade_size_usdc)
+        self.cash_balance -= PAPER_TRADING.trade_size_usdc + buy_fee
 
         self._log_trade(
             timestamp=timestamp,
@@ -264,7 +253,7 @@ class PaperTrader:
             action="BUY",
             price=execution_price,
             quantity=quantity,
-            trade_value=TRADE_SIZE_USDC,
+            trade_value=PAPER_TRADING.trade_size_usdc,
             trade_realized_pnl=0.0,
             signal=signal,
         )
@@ -290,15 +279,15 @@ class PaperTrader:
         execution_price = self.execution_price("SELL", price)
         position_value = position.quantity * execution_price
 
-        if position_value <= TRADE_SIZE_USDC:
+        if position_value <= PAPER_TRADING.trade_size_usdc:
             quantity = position.quantity
             trade_value = position_value
         else:
-            trade_value = TRADE_SIZE_USDC
+            trade_value = PAPER_TRADING.trade_size_usdc
             quantity = trade_value / execution_price
 
             remaining_value = (position.quantity - quantity) * execution_price
-            if remaining_value < TRADE_SIZE_USDC:
+            if remaining_value < PAPER_TRADING.trade_size_usdc:
                 quantity = position.quantity
                 trade_value = position_value
 
@@ -349,9 +338,9 @@ class PaperTrader:
 
         ensure_data_dir()
 
-        write_header = not PAPER_TRADES_CSV.exists()
+        write_header = not DATA.paper_trades_csv.exists()
 
-        with PAPER_TRADES_CSV.open("a", newline="") as csv_file:
+        with DATA.paper_trades_csv.open("a", newline="") as csv_file:
             writer = csv.writer(csv_file)
 
             if write_header:
@@ -386,7 +375,7 @@ def print_skipped_trade_proposal(
     print(f"     Coin:        {coin}")
     print(f"     Action:      {action} (skipped)")
     print(f"     Price:       ${price:,.2f}")
-    print(f"     Trade value: ${TRADE_SIZE_USDC:,.2f}")
+    print(f"     Trade value: ${PAPER_TRADING.trade_size_usdc:,.2f}")
     print(f"     Signal:      {signal}")
     print(f"     Reason:      {reason}")
     print()
@@ -414,7 +403,7 @@ def print_paper_trade_proposal(
 
 def ensure_data_dir() -> None:
     """Create the data folder if it does not exist."""
-    DATA_DIR.mkdir(exist_ok=True)
+    DATA.data_dir.mkdir(exist_ok=True)
 
 
 def format_usdc(amount: float) -> str:
@@ -451,7 +440,7 @@ def print_paper_trading_summary(
     print(f"  Open exposure:   ${open_exposure:,.2f}")
     print(
         f"  Session trades:  {paper_trader.successful_trades_this_session}"
-        f" / {MAX_SUCCESSFUL_TRADES_PER_SESSION}"
+        f" / {PAPER_TRADING.max_successful_trades_per_session}"
     )
     print()
     print(
@@ -462,7 +451,7 @@ def print_paper_trading_summary(
 
     open_positions = False
 
-    for coin in WATCHLIST:
+    for coin in MARKET.watchlist:
         position = paper_trader.positions.get(coin, Position())
         current_price = current_prices.get(coin)
 

@@ -1,0 +1,248 @@
+{
+  "source_file": "data/price_log.csv",
+  "timestamps_replayed": 392,
+  "simulation": {
+    "max_session_trades": 1000,
+    "trading_fee_pct": 0.05,
+    "slippage_pct": 0.02,
+    "close_positions_at_end": true
+  },
+  "test_mode": {
+    "test_mode": true,
+    "with_open_positions": {
+      "label": "test_mode",
+      "starting_equity": 1000.0,
+      "ending_equity": 999.88,
+      "realized_pnl": 4.24,
+      "unrealized_pnl": -0.01,
+      "total_pnl": 4.23,
+      "total_return_pct": -0.01,
+      "total_buys": 44,
+      "total_sells": 35,
+      "completed_trades": 35,
+      "winning_closed_trades": 24,
+      "losing_closed_trades": 11,
+      "win_rate_pct": 68.57,
+      "average_win": 0.21,
+      "average_loss": -0.07,
+      "profit_factor": 6.61,
+      "maximum_drawdown_pct": 0.26,
+      "final_cash": 899.89,
+      "final_open_exposure": 100.0,
+      "total_fees_paid": 4.35,
+      "paused_during_backtest": false,
+      "results_by_coin": {
+        "BTC": {
+          "total_buys": 13,
+          "total_sells": 10,
+          "completed_trades": 10,
+          "realized_pnl": 0.47,
+          "winning_closed_trades": 7,
+          "losing_closed_trades": 3,
+          "win_rate_pct": 70.0,
+          "average_win": 0.08,
+          "average_loss": -0.03
+        },
+        "ETH": {
+          "total_buys": 13,
+          "total_sells": 10,
+          "completed_trades": 10,
+          "realized_pnl": 0.26,
+          "winning_closed_trades": 6,
+          "losing_closed_trades": 4,
+          "win_rate_pct": 60.0,
+          "average_win": 0.07,
+          "average_loss": -0.04
+        },
+        "SOL": {
+          "total_buys": 18,
+          "total_sells": 15,
+          "completed_trades": 15,
+          "realized_pnl": 3.51,
+          "winning_closed_trades": 11,
+          "losing_closed_trades": 4,
+          "win_rate_pct": 73.33,
+          "average_win": 0.37,
+          "average_loss": -0.13
+        }
+      }
+    },
+    "after_forced_close": {
+      "label": "test_mode",
+      "starting_equity": 1000.0,
+      "ending_equity": 999.81,
+      "realized_pnl": 4.21,
+      "unrealized_pnl": 0.0,
+      "total_pnl": 4.21,
+      "total_return_pct": -0.02,
+      "total_buys": 44,
+      "total_sells": 36,
+      "completed_trades": 36,
+      "winning_closed_trades": 24,
+      "losing_closed_trades": 12,
+      "win_rate_pct": 66.67,
+      "average_win": 0.21,
+      "average_loss": -0.07,
+      "profit_factor": 6.32,
+      "maximum_drawdown_pct": 0.26,
+      "final_cash": 999.81,
+      "final_open_exposure": 0,
+      "total_fees_paid": 4.4,
+      "paused_during_backtest": false,
+      "results_by_coin": {
+        "BTC": {
+          "total_buys": 13,
+          "total_sells": 10,
+          "completed_trades": 10,
+          "realized_pnl": 0.47,
+          "winning_closed_trades": 7,
+          "losing_closed_trades": 3,
+          "win_rate_pct": 70.0,
+          "average_win": 0.08,
+          "average_loss": -0.03
+        },
+        "ETH": {
+          "total_buys": 13,
+          "total_sells": 11,
+          "completed_trades": 11,
+          "realized_pnl": 0.23,
+          "winning_closed_trades": 6,
+          "losing_closed_trades": 5,
+          "win_rate_pct": 54.55,
+          "average_win": 0.07,
+          "average_loss": -0.04
+        },
+        "SOL": {
+          "total_buys": 18,
+          "total_sells": 15,
+          "completed_trades": 15,
+          "realized_pnl": 3.51,
+          "winning_closed_trades": 11,
+          "losing_closed_trades": 4,
+          "win_rate_pct": 73.33,
+          "average_win": 0.37,
+          "average_loss": -0.13
+        }
+      }
+    }
+  },
+  "production_mode": {
+    "test_mode": false,
+    "with_open_positions": {
+      "label": "production",
+      "starting_equity": 1000.0,
+      "ending_equity": 1000.0,
+      "realized_pnl": 0.0,
+      "unrealized_pnl": 0.0,
+      "total_pnl": 0.0,
+      "total_return_pct": 0.0,
+      "total_buys": 0,
+      "total_sells": 0,
+      "completed_trades": 0,
+      "winning_closed_trades": 0,
+      "losing_closed_trades": 0,
+      "win_rate_pct": 0.0,
+      "average_win": 0.0,
+      "average_loss": 0.0,
+      "profit_factor": null,
+      "maximum_drawdown_pct": 0.0,
+      "final_cash": 1000.0,
+      "final_open_exposure": 0,
+      "total_fees_paid": 0.0,
+      "paused_during_backtest": false,
+      "results_by_coin": {
+        "BTC": {
+          "total_buys": 0,
+          "total_sells": 0,
+          "completed_trades": 0,
+          "realized_pnl": 0,
+          "winning_closed_trades": 0,
+          "losing_closed_trades": 0,
+          "win_rate_pct": 0.0,
+          "average_win": 0.0,
+          "average_loss": 0.0
+        },
+        "ETH": {
+          "total_buys": 0,
+          "total_sells": 0,
+          "completed_trades": 0,
+          "realized_pnl": 0,
+          "winning_closed_trades": 0,
+          "losing_closed_trades": 0,
+          "win_rate_pct": 0.0,
+          "average_win": 0.0,
+          "average_loss": 0.0
+        },
+        "SOL": {
+          "total_buys": 0,
+          "total_sells": 0,
+          "completed_trades": 0,
+          "realized_pnl": 0,
+          "winning_closed_trades": 0,
+          "losing_closed_trades": 0,
+          "win_rate_pct": 0.0,
+          "average_win": 0.0,
+          "average_loss": 0.0
+        }
+      }
+    },
+    "after_forced_close": {
+      "label": "production",
+      "starting_equity": 1000.0,
+      "ending_equity": 1000.0,
+      "realized_pnl": 0.0,
+      "unrealized_pnl": 0.0,
+      "total_pnl": 0.0,
+      "total_return_pct": 0.0,
+      "total_buys": 0,
+      "total_sells": 0,
+      "completed_trades": 0,
+      "winning_closed_trades": 0,
+      "losing_closed_trades": 0,
+      "win_rate_pct": 0.0,
+      "average_win": 0.0,
+      "average_loss": 0.0,
+      "profit_factor": null,
+      "maximum_drawdown_pct": 0.0,
+      "final_cash": 1000.0,
+      "final_open_exposure": 0,
+      "total_fees_paid": 0.0,
+      "paused_during_backtest": false,
+      "results_by_coin": {
+        "BTC": {
+          "total_buys": 0,
+          "total_sells": 0,
+          "completed_trades": 0,
+          "realized_pnl": 0,
+          "winning_closed_trades": 0,
+          "losing_closed_trades": 0,
+          "win_rate_pct": 0.0,
+          "average_win": 0.0,
+          "average_loss": 0.0
+        },
+        "ETH": {
+          "total_buys": 0,
+          "total_sells": 0,
+          "completed_trades": 0,
+          "realized_pnl": 0,
+          "winning_closed_trades": 0,
+          "losing_closed_trades": 0,
+          "win_rate_pct": 0.0,
+          "average_win": 0.0,
+          "average_loss": 0.0
+        },
+        "SOL": {
+          "total_buys": 0,
+          "total_sells": 0,
+          "completed_trades": 0,
+          "realized_pnl": 0,
+          "winning_closed_trades": 0,
+          "losing_closed_trades": 0,
+          "win_rate_pct": 0.0,
+          "average_win": 0.0,
+          "average_loss": 0.0
+        }
+      }
+    }
+  }
+}
