@@ -186,9 +186,25 @@ class PaperTrader:
 
         return None
 
+    def session_trade_limit(self) -> int:
+        """Maximum successful trades allowed this session (subclasses may override)."""
+        return MAX_SUCCESSFUL_TRADES_PER_SESSION
+
+    def execution_price(self, action: str, mid_price: float) -> float:
+        """Price used for fills; subclasses may add slippage."""
+        return mid_price
+
+    def buy_fee(self, trade_value: float) -> float:
+        """Fee charged on a BUY notional (subclasses may override)."""
+        return 0.0
+
+    def sell_fee(self, trade_value: float) -> float:
+        """Fee charged on SELL proceeds (subclasses may override)."""
+        return 0.0
+
     def _get_session_trade_block_reason(self, coin: str, action: str) -> str | None:
         """Return a skip reason if session limits block a fake trade, else None."""
-        if self.successful_trades_this_session < MAX_SUCCESSFUL_TRADES_PER_SESSION:
+        if self.successful_trades_this_session < self.session_trade_limit():
             return None
 
         if action == "SELL" and not self._get_position(coin).is_open:
@@ -228,7 +244,8 @@ class PaperTrader:
             )
             return
 
-        quantity = TRADE_SIZE_USDC / price
+        execution_price = self.execution_price("BUY", price)
+        quantity = TRADE_SIZE_USDC / execution_price
         position = self._get_position(coin)
 
         # Weighted average entry when adding to an existing position
@@ -238,13 +255,14 @@ class PaperTrader:
         position.entry_count += 1
         position.last_buy_time = now
 
-        self.cash_balance -= TRADE_SIZE_USDC
+        buy_fee = self.buy_fee(TRADE_SIZE_USDC)
+        self.cash_balance -= TRADE_SIZE_USDC + buy_fee
 
         self._log_trade(
             timestamp=timestamp,
             coin=coin,
             action="BUY",
-            price=price,
+            price=execution_price,
             quantity=quantity,
             trade_value=TRADE_SIZE_USDC,
             trade_realized_pnl=0.0,
@@ -269,26 +287,28 @@ class PaperTrader:
             )
             return
 
-        position_value = position.quantity * price
+        execution_price = self.execution_price("SELL", price)
+        position_value = position.quantity * execution_price
 
         if position_value <= TRADE_SIZE_USDC:
             quantity = position.quantity
             trade_value = position_value
         else:
             trade_value = TRADE_SIZE_USDC
-            quantity = trade_value / price
+            quantity = trade_value / execution_price
 
-            remaining_value = (position.quantity - quantity) * price
+            remaining_value = (position.quantity - quantity) * execution_price
             if remaining_value < TRADE_SIZE_USDC:
                 quantity = position.quantity
                 trade_value = position_value
 
-        trade_realized_pnl = (price - position.avg_entry_price) * quantity
+        trade_realized_pnl = (execution_price - position.avg_entry_price) * quantity
+        sell_fee = self.sell_fee(trade_value)
         self.realized_pnl += trade_realized_pnl
-        self.cash_balance += trade_value
+        self.cash_balance += trade_value - sell_fee
 
         position.quantity -= quantity
-        if position.quantity <= 0 or position.quantity * price < 0.01:
+        if position.quantity <= 0 or position.quantity * execution_price < 0.01:
             position.quantity = 0.0
             position.avg_entry_price = 0.0
             position.entry_count = 0
@@ -298,7 +318,7 @@ class PaperTrader:
             timestamp=timestamp,
             coin=coin,
             action="SELL",
-            price=price,
+            price=execution_price,
             quantity=quantity,
             trade_value=trade_value,
             trade_realized_pnl=trade_realized_pnl,
