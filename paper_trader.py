@@ -9,6 +9,7 @@ import csv
 from dataclasses import dataclass, field
 
 from config import DATA, MARKET, PAPER_TRADING
+from risk_rules import buy_block_reason, sell_block_reason
 CSV_COLUMNS = (
     "timestamp",
     "coin",
@@ -144,35 +145,6 @@ class PaperTrader:
             self.positions[coin] = Position()
         return self.positions[coin]
 
-    def _get_buy_block_reason(self, coin: str, now: float) -> str | None:
-        """Return a skip reason if risk rules block a fake BUY, else None."""
-        position = self._get_position(coin)
-
-        if self.cash_balance < PAPER_TRADING.trade_size_usdc:
-            return "insufficient fake cash"
-
-        if (
-            position.allocation_usdc + PAPER_TRADING.trade_size_usdc
-            > PAPER_TRADING.max_allocation_per_coin_usdc
-        ):
-            return "max allocation reached"
-
-        if position.entry_count >= PAPER_TRADING.max_entries_per_coin:
-            return "max entries reached"
-
-        if position.last_buy_time is not None:
-            seconds_since_last_buy = now - position.last_buy_time
-            if seconds_since_last_buy < PAPER_TRADING.min_seconds_between_buys:
-                return "cooldown active"
-
-        if (
-            self.total_open_exposure() + PAPER_TRADING.trade_size_usdc
-            > PAPER_TRADING.max_total_open_exposure_usdc
-        ):
-            return "total exposure limit reached"
-
-        return None
-
     def session_trade_limit(self) -> int:
         """Maximum successful trades allowed this session (subclasses may override)."""
         return PAPER_TRADING.max_successful_trades_per_session
@@ -189,16 +161,6 @@ class PaperTrader:
         """Fee charged on SELL proceeds (subclasses may override)."""
         return 0.0
 
-    def _get_session_trade_block_reason(self, coin: str, action: str) -> str | None:
-        """Return a skip reason if session limits block a fake trade, else None."""
-        if self.successful_trades_this_session < self.session_trade_limit():
-            return None
-
-        if action == "SELL" and not self._get_position(coin).is_open:
-            return None
-
-        return "max session trades reached"
-
     def _fake_buy(
         self,
         coin: str,
@@ -207,19 +169,7 @@ class PaperTrader:
         signal: str,
         now: float,
     ) -> None:
-        session_block_reason = self._get_session_trade_block_reason(coin, "BUY")
-        if session_block_reason is not None:
-            print_skipped_trade_proposal(
-                timestamp=timestamp,
-                coin=coin,
-                action="BUY",
-                price=price,
-                signal=signal,
-                reason=session_block_reason,
-            )
-            return
-
-        block_reason = self._get_buy_block_reason(coin, now)
+        block_reason = buy_block_reason(self, coin, now)
         if block_reason is not None:
             print_skipped_trade_proposal(
                 timestamp=timestamp,
@@ -264,15 +214,15 @@ class PaperTrader:
         if not position.is_open:
             return
 
-        session_block_reason = self._get_session_trade_block_reason(coin, "SELL")
-        if session_block_reason is not None:
+        block_reason = sell_block_reason(self, coin)
+        if block_reason is not None:
             print_skipped_trade_proposal(
                 timestamp=timestamp,
                 coin=coin,
                 action="SELL",
                 price=price,
                 signal=signal,
-                reason=session_block_reason,
+                reason=block_reason,
             )
             return
 
