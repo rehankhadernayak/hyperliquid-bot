@@ -6,10 +6,16 @@ Does not fetch prices, sign transactions, or place real orders.
 """
 
 from dataclasses import asdict, dataclass
+import json
 import time
 from datetime import datetime, timezone
 
 from config import DATA, MARKET, PAPER_TRADING
+from decision_engine import (
+    CoinDecision,
+    DecisionSessionSummary,
+    build_decisions,
+)
 from market_analyzer import (
     WINDOW_1M_SECONDS,
     WINDOW_5M_SECONDS,
@@ -70,6 +76,8 @@ class MarketSnapshot:
     market_rows: list[MarketRow]
     paper_trader: PaperTraderSummary | None
     open_positions: list[OpenPositionRow]
+    decisions: list[CoinDecision]
+    decision_summary: DecisionSessionSummary | None
 
     def to_dict(self) -> dict:
         """Return the snapshot as a plain dictionary."""
@@ -238,6 +246,18 @@ def build_snapshot(
 
     paper_summary = None
     open_positions: list[OpenPositionRow] = []
+    decisions: list[CoinDecision] = []
+    decision_summary: DecisionSessionSummary | None = None
+
+    trader_for_decisions = paper_trader if paper_trader is not None else PaperTrader()
+
+    if market_rows:
+        decisions, decision_summary = build_decisions(
+            market_rows,
+            trader_for_decisions,
+            current_prices,
+            now if now is not None else time.time(),
+        )
 
     if paper_trader is not None:
         paper_summary = build_paper_trader_summary(paper_trader, current_prices)
@@ -249,6 +269,8 @@ def build_snapshot(
         market_rows=market_rows,
         paper_trader=paper_summary,
         open_positions=open_positions,
+        decisions=decisions,
+        decision_summary=decision_summary,
     )
 
 
@@ -316,6 +338,9 @@ def print_snapshot(snapshot: MarketSnapshot) -> None:
     if snapshot.paper_trader is not None:
         _print_paper_trader_section(snapshot.paper_trader, snapshot.open_positions)
 
+    if snapshot.decisions:
+        _print_decisions_section(snapshot.decisions, snapshot.decision_summary)
+
 
 def _print_paper_trader_section(
     summary: PaperTraderSummary,
@@ -361,6 +386,59 @@ def _print_paper_trader_section(
             )
 
     print("-" * 78)
+
+
+def _print_decisions_section(
+    decisions: list[CoinDecision],
+    summary: DecisionSessionSummary | None,
+) -> None:
+    """Print read-only recommendations and a short session summary."""
+    print()
+    print("Current recommendations (read-only, no orders placed):")
+    print("-" * 78)
+    print(
+        f"{'Coin':<6} {'Recommendation':<12} {'Signal':>12} {'Strength':>10} "
+        f"{'Risk':<28} {'Confidence':>10}"
+    )
+    print("-" * 78)
+
+    for decision in decisions:
+        risk_short = decision.risk_status
+        if len(risk_short) > 28:
+            risk_short = risk_short[:25] + "..."
+
+        print(
+            f"{decision.coin:<6} {decision.recommendation:<12} "
+            f"{decision.signal:>12} {decision.signal_strength:>10} "
+            f"{risk_short:<28} {decision.confidence:>10}"
+        )
+        print(f"         Reason: {decision.primary_reason}")
+
+    if summary is not None:
+        print()
+        print("Recommendation session summary:")
+        print(
+            f"  Active: {summary.active_recommendations}  "
+            f"Blocked: {summary.blocked_recommendations}  "
+            f"Open positions: {summary.open_positions}  "
+            f"Session trades: {summary.session_trades}"
+        )
+        if summary.total_equity is not None:
+            print(f"  Total equity: ${summary.total_equity:,.2f}")
+        if summary.current_drawdown_pct is not None:
+            print(f"  Current drawdown: {summary.current_drawdown_pct:.2f}%")
+
+    print("-" * 78)
+
+
+def save_recommendations_json(snapshot: MarketSnapshot) -> None:
+    """Write the latest recommendations snapshot for the dashboard."""
+    DATA.data_dir.mkdir(exist_ok=True)
+
+    payload = snapshot.to_dict()
+
+    with DATA.recommendations_json.open("w", encoding="utf-8") as handle:
+        json.dump(payload, handle, indent=2)
 
 
 def current_prices_from_rows(market_rows: list[MarketRow]) -> dict[str, float]:

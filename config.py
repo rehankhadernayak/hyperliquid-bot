@@ -76,6 +76,7 @@ class DataPaths:
     price_log_csv: Path
     paper_trades_csv: Path
     backtest_results_json: Path
+    recommendations_json: Path
 
 
 # --- Market ---
@@ -134,6 +135,7 @@ DATA = DataPaths(
     price_log_csv=_DATA_DIR / "price_log.csv",
     paper_trades_csv=_DATA_DIR / "paper_trades.csv",
     backtest_results_json=_DATA_DIR / "backtest_results.json",
+    recommendations_json=_DATA_DIR / "recommendations.json",
 )
 
 

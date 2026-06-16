@@ -49,6 +49,7 @@ def temp_data_paths(tmp_path, monkeypatch):
         price_log_csv=data_dir / "price_log.csv",
         paper_trades_csv=data_dir / "paper_trades.csv",
         backtest_results_json=data_dir / "backtest_results.json",
+        recommendations_json=data_dir / "recommendations.json",
     )
     monkeypatch.setattr(paper_trader, "DATA", paths)
     return paths

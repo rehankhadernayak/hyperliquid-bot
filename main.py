@@ -21,6 +21,7 @@ from market_snapshot import (
     current_prices_from_rows,
     current_timestamp,
     print_snapshot,
+    save_recommendations_json,
     tradable_signals_from_rows,
 )
 from paper_trader import PaperTrader
@@ -102,6 +103,7 @@ def run_analyzer() -> None:
             )
 
             print_snapshot(snapshot)
+            save_recommendations_json(snapshot)
             append_prices_to_csv(mids, timestamp)
         except Exception as exc:
             print(f"\n[{current_timestamp()}]")
