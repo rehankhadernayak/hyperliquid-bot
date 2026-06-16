@@ -1,28 +1,25 @@
 """
 Read-only Streamlit dashboard for the paper trading bot.
 
-Displays price history and paper trade results from local CSV files.
-No wallet, signing, or real exchange access.
+Displays price history, paper trade results, and backtest summaries from
+local CSV/JSON files. No wallet, signing, or real exchange access.
 """
 
-from pathlib import Path
+import json
 
 import pandas as pd
 import streamlit as st
 
-DATA_DIR = Path("data")
-PRICE_LOG_CSV = DATA_DIR / "price_log.csv"
-PAPER_TRADES_CSV = DATA_DIR / "paper_trades.csv"
-COINS = ("BTC", "ETH", "SOL")
+from config import DATA, MARKET
 
 
 @st.cache_data(ttl=30)
 def load_price_log() -> pd.DataFrame:
     """Load price history from CSV."""
-    if not PRICE_LOG_CSV.exists():
+    if not DATA.price_log_csv.exists():
         return pd.DataFrame(columns=["timestamp", "coin", "price"])
 
-    df = pd.read_csv(PRICE_LOG_CSV)
+    df = pd.read_csv(DATA.price_log_csv)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     df["price"] = pd.to_numeric(df["price"], errors="coerce")
     return df.dropna(subset=["price"])
@@ -31,14 +28,125 @@ def load_price_log() -> pd.DataFrame:
 @st.cache_data(ttl=30)
 def load_paper_trades() -> pd.DataFrame | None:
     """Load paper trades from CSV, or None if the file does not exist."""
-    if not PAPER_TRADES_CSV.exists():
+    if not DATA.paper_trades_csv.exists():
         return None
 
-    df = pd.read_csv(PAPER_TRADES_CSV)
+    df = pd.read_csv(DATA.paper_trades_csv)
     df["timestamp"] = pd.to_datetime(df["timestamp"], utc=True)
     for col in ("price", "quantity", "trade_value", "cash_balance", "realized_pnl"):
         df[col] = pd.to_numeric(df[col], errors="coerce")
     return df
+
+
+@st.cache_data(ttl=30)
+def load_backtest_results() -> dict | None:
+    """Load backtest summary JSON, or None if the file does not exist."""
+    if not DATA.backtest_results_json.exists():
+        return None
+
+    with DATA.backtest_results_json.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def _format_money(value: float) -> str:
+    return f"${value:,.2f}"
+
+
+def _format_pct(value: float) -> str:
+    return f"{value:.2f}%"
+
+
+def _format_profit_factor(value: float | None) -> str:
+    if value is None:
+        return "—"
+    return f"{value:.2f}"
+
+
+def _mode_summary_rows(block: dict) -> list[tuple[str, str]]:
+    """Turn one backtest mode block into labeled rows for display."""
+    total_trades = block["total_buys"] + block["total_sells"]
+    return [
+        ("Ending equity (after forced close)", _format_money(block["ending_equity"])),
+        ("Total return", _format_pct(block["total_return_pct"])),
+        ("Realized PnL", _format_money(block["realized_pnl"])),
+        ("Unrealized PnL", _format_money(block["unrealized_pnl"])),
+        ("Total PnL", _format_money(block["total_pnl"])),
+        ("Total trades", str(total_trades)),
+        ("Buys", str(block["total_buys"])),
+        ("Sells", str(block["total_sells"])),
+        ("Completed trades", str(block["completed_trades"])),
+        ("Win rate", _format_pct(block["win_rate_pct"])),
+        ("Average win", _format_money(block["average_win"])),
+        ("Average loss", _format_money(block["average_loss"])),
+        ("Profit factor", _format_profit_factor(block["profit_factor"])),
+        ("Maximum drawdown", _format_pct(block["maximum_drawdown_pct"])),
+        ("Fees paid", _format_money(block["total_fees_paid"])),
+        ("Final cash", _format_money(block["final_cash"])),
+        ("Final open exposure", _format_money(block["final_open_exposure"])),
+    ]
+
+
+def _coin_results_table(mode_label: str, block: dict) -> pd.DataFrame:
+    """Build a per-coin table for one backtest mode."""
+    rows = []
+    for coin, stats in block["results_by_coin"].items():
+        rows.append(
+            {
+                "Mode": mode_label,
+                "Coin": coin,
+                "Buys": stats["total_buys"],
+                "Sells": stats["total_sells"],
+                "Completed trades": stats["completed_trades"],
+                "Realized PnL": stats["realized_pnl"],
+                "Win rate (%)": stats["win_rate_pct"],
+                "Average win": stats["average_win"],
+                "Average loss": stats["average_loss"],
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _render_backtest_results() -> None:
+    st.subheader("Backtest Results")
+    st.caption(
+        "Backtest results are simulated and do not guarantee future performance."
+    )
+
+    results = load_backtest_results()
+    if results is None:
+        st.info("Run python3 backtester.py to generate backtest results.")
+        return
+
+    test_block = results["test_mode"]["after_forced_close"]
+    production_block = results["production_mode"]["after_forced_close"]
+
+    test_rows = _mode_summary_rows(test_block)
+    production_rows = _mode_summary_rows(production_block)
+
+    comparison_rows = [
+        {
+            "Metric": label,
+            "TEST_MODE": test_value,
+            "Production": production_value,
+        }
+        for (label, test_value), (_, production_value) in zip(test_rows, production_rows)
+    ]
+
+    st.dataframe(
+        pd.DataFrame(comparison_rows),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.markdown("**Per-coin results**")
+    coin_tables = pd.concat(
+        [
+            _coin_results_table("TEST_MODE", test_block),
+            _coin_results_table("Production", production_block),
+        ],
+        ignore_index=True,
+    )
+    st.dataframe(coin_tables, width="stretch", hide_index=True)
 
 
 def main() -> None:
@@ -62,8 +170,8 @@ def main() -> None:
         )
 
         st.subheader("Latest Prices")
-        cols = st.columns(len(COINS))
-        for col, coin in zip(cols, COINS):
+        cols = st.columns(len(MARKET.watchlist))
+        for col, coin in zip(cols, MARKET.watchlist):
             with col:
                 if coin in latest.index:
                     price = latest.loc[coin, "price"]
@@ -74,11 +182,11 @@ def main() -> None:
 
         st.subheader("Recent Price History")
         recent = prices.sort_values("timestamp", ascending=False).head(30)
-        st.dataframe(recent, use_container_width=True, hide_index=True)
+        st.dataframe(recent, width="stretch", hide_index=True)
 
         st.subheader("Price Charts")
-        chart_cols = st.columns(len(COINS))
-        for col, coin in zip(chart_cols, COINS):
+        chart_cols = st.columns(len(MARKET.watchlist))
+        for col, coin in zip(chart_cols, MARKET.watchlist):
             coin_prices = prices[prices["coin"] == coin].sort_values("timestamp")
             with col:
                 st.markdown(f"**{coin}**")
@@ -86,7 +194,7 @@ def main() -> None:
                     st.info(f"No {coin} data yet.")
                 else:
                     chart_data = coin_prices.set_index("timestamp")[["price"]]
-                    st.line_chart(chart_data, use_container_width=True)
+                    st.line_chart(chart_data, width="stretch")
 
     st.divider()
     st.subheader("Paper Trades")
@@ -107,9 +215,12 @@ def main() -> None:
 
         st.dataframe(
             trades.sort_values("timestamp", ascending=False),
-            use_container_width=True,
+            width="stretch",
             hide_index=True,
         )
+
+    st.divider()
+    _render_backtest_results()
 
 
 if __name__ == "__main__":
