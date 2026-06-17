@@ -57,6 +57,7 @@ def temp_data_paths(tmp_path, monkeypatch):
         equity_log_csv=data_dir / "equity_log.csv",
         session_configs_dir=data_dir / "session_configs",
         session_reports_dir=data_dir / "session_reports",
+        experiments_dir=data_dir / "experiments",
     )
     monkeypatch.setattr(paper_trader, "DATA", paths)
     monkeypatch.setattr(equity_logger, "DATA", paths)

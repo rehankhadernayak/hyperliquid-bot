@@ -2,7 +2,7 @@
 Signal logic based on rolling 1-minute price changes.
 """
 
-from config import SIGNAL
+from config import SIGNAL, SignalThresholds
 
 # Active thresholds (updated by apply_signal_thresholds)
 SIGNAL_STRONG_UP_PCT = SIGNAL.production.strong_up_pct
@@ -22,6 +22,30 @@ def apply_signal_thresholds(test_mode: bool) -> None:
     SIGNAL_DOWN_PCT = thresholds.down_pct
 
 
+def signal_from_change(
+    change_1m: float | None,
+    thresholds: SignalThresholds,
+) -> str:
+    """
+    Return a signal based on approximate 1-minute percentage change.
+
+    Uses explicit thresholds so strategies and experiments do not depend on
+    module-level global state.
+    """
+    if change_1m is None:
+        return "N/A"
+
+    if change_1m > thresholds.strong_up_pct:
+        return "STRONG_UP"
+    if change_1m > thresholds.up_pct:
+        return "UP"
+    if change_1m < thresholds.strong_down_pct:
+        return "STRONG_DOWN"
+    if change_1m < thresholds.down_pct:
+        return "DOWN"
+    return "FLAT"
+
+
 def signal_from_1m_change(change_1m: float | None) -> str:
     """
     Return a signal based on approximate 1-minute percentage change.
@@ -33,15 +57,10 @@ def signal_from_1m_change(change_1m: float | None) -> str:
     FLAT        otherwise
     N/A         when there is not enough history yet
     """
-    if change_1m is None:
-        return "N/A"
-
-    if change_1m > SIGNAL_STRONG_UP_PCT:
-        return "STRONG_UP"
-    if change_1m > SIGNAL_UP_PCT:
-        return "UP"
-    if change_1m < SIGNAL_STRONG_DOWN_PCT:
-        return "STRONG_DOWN"
-    if change_1m < SIGNAL_DOWN_PCT:
-        return "DOWN"
-    return "FLAT"
+    active = SignalThresholds(
+        strong_up_pct=SIGNAL_STRONG_UP_PCT,
+        up_pct=SIGNAL_UP_PCT,
+        strong_down_pct=SIGNAL_STRONG_DOWN_PCT,
+        down_pct=SIGNAL_DOWN_PCT,
+    )
+    return signal_from_change(change_1m, active)

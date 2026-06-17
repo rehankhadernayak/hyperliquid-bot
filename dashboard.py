@@ -36,6 +36,16 @@ def load_backtest_results() -> dict | None:
 
 
 @st.cache_data(ttl=30)
+def list_experiments() -> list[str]:
+    return dashboard_data.list_experiments()
+
+
+@st.cache_data(ttl=30)
+def load_experiment(experiment_id: str) -> dict | None:
+    return dashboard_data.load_experiment(experiment_id)
+
+
+@st.cache_data(ttl=30)
 def load_recommendations() -> dict | None:
     return dashboard_data.load_recommendations()
 
@@ -451,6 +461,156 @@ def _coin_results_table(mode_label: str, block: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _render_experiment_analysis() -> None:
+    st.subheader("Experiment Analysis")
+    st.caption(
+        "Historical and paper results do not guarantee future performance."
+    )
+
+    experiment_ids = list_experiments()
+    if not experiment_ids:
+        st.info(
+            "No experiments yet. Run "
+            "`python3 experiment_runner.py --profiles contrarian_v1_test "
+            "contrarian_v1_production hold_baseline` "
+            "to generate results under `data/experiments/`."
+        )
+        return
+
+    selected_id = st.selectbox(
+        "Experiment",
+        experiment_ids,
+        index=len(experiment_ids) - 1,
+    )
+    experiment = load_experiment(selected_id)
+    if experiment is None:
+        st.warning("Selected experiment file could not be loaded.")
+        return
+
+    st.caption(
+        f"Experiment `{selected_id}` | Created: {experiment.get('created_at', 'unknown')} | "
+        f"Timestamps: {experiment.get('timestamp_count', '—')} | "
+        f"Hash: `{str(experiment.get('input_data_hash', ''))[:12]}…`"
+    )
+
+    split = experiment.get("split", {})
+    dev_pct = experiment.get("configuration", {}).get("development_pct", 0.7)
+    st.markdown(
+        f"**Split:** development {split.get('development_timestamps', '—')} timestamps "
+        f"({dev_pct * 100:.0f}%) | "
+        f"out-of-sample {split.get('out_of_sample_timestamps', '—')} timestamps"
+    )
+
+    profile_results = experiment.get("profile_results", {})
+    comparison_rows = []
+    for profile_id, payload in profile_results.items():
+        dev = payload.get("development", {})
+        oos = payload.get("out_of_sample", {})
+        comparison_rows.append(
+            {
+                "Profile": profile_id,
+                "Evidence": payload.get("evidence_assessment", "—"),
+                "Dev return (%)": dev.get("net_return_pct"),
+                "OOS return (%)": oos.get("net_return_pct"),
+                "Combined return (%)": payload.get("combined", {}).get("net_return_pct"),
+                "OOS completed trades": oos.get("completed_trades"),
+                "OOS max drawdown (%)": oos.get("maximum_drawdown_pct"),
+                "OOS profit factor": oos.get("profit_factor"),
+                "OOS fees": oos.get("fees_paid"),
+                "OOS slippage": oos.get("slippage_cost"),
+            }
+        )
+
+    st.markdown("**Profile comparison**")
+    st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
+
+    selected_profile = st.selectbox(
+        "Profile detail",
+        list(profile_results.keys()),
+    )
+    detail = profile_results.get(selected_profile, {})
+
+    warn_cols = st.columns(2)
+    with warn_cols[0]:
+        st.markdown("**Evidence assessment**")
+        st.info(detail.get("evidence_assessment", "—"))
+    with warn_cols[1]:
+        warnings = detail.get("overfitting_warnings") or []
+        st.markdown("**Overfitting warnings**")
+        if warnings:
+            for warning in warnings:
+                st.warning(warning)
+        else:
+            st.success("No overfitting warnings recorded.")
+
+    period_tabs = st.tabs(["Development", "Out-of-sample", "Combined"])
+    for tab, key in zip(
+        period_tabs,
+        ("development", "out_of_sample", "combined"),
+    ):
+        with tab:
+            metrics = detail.get(key, {})
+            metric_cols = st.columns(6)
+            metric_cols[0].metric("Net return", _format_pct(metrics.get("net_return_pct")))
+            metric_cols[1].metric("Realized PnL", _format_money(metrics.get("realized_pnl")))
+            metric_cols[2].metric("Fees", _format_money(metrics.get("fees_paid")))
+            metric_cols[3].metric("Slippage", _format_money(metrics.get("slippage_cost")))
+            metric_cols[4].metric("Completed trades", str(metrics.get("completed_trades", 0)))
+            metric_cols[5].metric("Win rate", _format_pct(metrics.get("win_rate_pct")))
+
+            detail_cols = st.columns(4)
+            detail_cols[0].metric("Max drawdown", _format_pct(metrics.get("maximum_drawdown_pct")))
+            detail_cols[1].metric(
+                "Profit factor",
+                _format_profit_factor(metrics.get("profit_factor")),
+            )
+            detail_cols[2].metric(
+                "Exposure time",
+                _format_pct(metrics.get("exposure_time_pct")),
+            )
+            detail_cols[3].metric(
+                "Return / trade",
+                _format_money(metrics.get("return_per_completed_trade")),
+            )
+
+            equity_curve = metrics.get("equity_curve") or []
+            if equity_curve:
+                st.markdown("**Equity curve**")
+                st.line_chart(pd.Series(equity_curve, name="equity"))
+
+                peak = pd.Series(equity_curve).cummax()
+                drawdown = ((peak - pd.Series(equity_curve)) / peak.replace(0, pd.NA)) * 100
+                drawdown = drawdown.fillna(0.0)
+                st.markdown("**Drawdown curve**")
+                st.line_chart(drawdown.rename("drawdown_pct"))
+
+            by_coin = metrics.get("results_by_coin") or {}
+            if by_coin:
+                coin_rows = [
+                    {
+                        "Coin": coin,
+                        "Realized PnL": stats.get("realized_pnl"),
+                        "Completed trades": stats.get("completed_trades"),
+                        "Win rate (%)": stats.get("win_rate_pct"),
+                        "Fees": stats.get("fees_paid"),
+                        "Slippage": stats.get("slippage_cost"),
+                    }
+                    for coin, stats in by_coin.items()
+                ]
+                st.markdown("**Per-coin results**")
+                st.dataframe(pd.DataFrame(coin_rows), width="stretch", hide_index=True)
+
+    with st.expander("Full profile configuration"):
+        st.json(detail.get("profile", {}))
+
+    with st.expander("Trade-level results (combined period)"):
+        trades = detail.get("combined", {}).get("trade_log") or []
+        if trades:
+            st.dataframe(pd.DataFrame(trades), width="stretch", hide_index=True)
+        else:
+            st.info("No trades in the combined period.")
+
+
 def _render_backtest_results() -> None:
     st.subheader("Backtest Results")
     st.caption(
@@ -572,6 +732,9 @@ def main() -> None:
     st.divider()
     prices = load_price_log()
     _render_price_section(prices)
+
+    st.divider()
+    _render_experiment_analysis()
 
     st.divider()
     _render_backtest_results()

@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented here.
 
+## [8.2.0-paper] — 2026-06-17
+
+Evidence-analysis and strategy-experiment framework. Still read-only market data and simulated trades only — no wallets, signing, or live order execution.
+
+### Added
+
+- **Strategy interface** (`strategy_types.py`, `strategies/`) — reusable protocol with structured `StrategySignalResult`; `contrarian_v1` preserves existing percentage-change behavior exactly.
+- **Strategy profiles** (`strategy_profiles.py`) — immutable named profiles: `contrarian_v1_test`, `contrarian_v1_production`, `hold_baseline`; full profile saved with every experiment result.
+- **Experiment runner** (`experiment_runner.py`) — replays historical prices for multiple profiles on identical timestamps; isolated traders; chronological 70/30 development/out-of-sample split; optional walk-forward; results under `data/experiments/`.
+- **Experiment metrics** (`experiment_metrics.py`) — net return, fees, slippage, drawdown, exposure time, holding time, per-coin breakdown, and safe zero-trade handling.
+- **Evidence assessment** (`experiment_evidence.py`, `config.EVIDENCE`) — descriptive labels (`INSUFFICIENT_DATA`, `WEAK`, `PROMISING`, `UNSTABLE`, `REJECT`); rules documented in README and config.
+- **Overfitting warnings** (`experiment_overfitting.py`) — trade count, dev/OOS gap, single-trade/coin dominance, fee drag, and data-leakage checks.
+- **Dashboard Experiment Analysis** — experiment selector, profile comparison, dev/OOS metrics, equity and drawdown curves, evidence labels, warnings, and full profile config.
+- **Tests** — comprehensive offline coverage in `tests/test_experiments.py` (99 tests total).
+
+### Changed
+
+- **Version** — `VERSION = "8.2.0-paper"`.
+- **`signals.py`** — extracted `signal_from_change()` for profile-aware strategies; `signal_from_1m_change()` behavior unchanged.
+
+### Safety
+
+- No wallet, signing, exchange execution, deposits, withdrawals, or leverage added.
+- Experiments never write to live `data/paper_trades.csv`, `data/price_log.csv`, or `data/equity_log.csv`.
+- v8.1 session analytics and existing data formats preserved.
+
 ## [8.1.0-paper] — 2026-06-17
 
 Forward-testing analytics release. Still read-only market data and simulated trades only — no wallets, signing, or live order execution.

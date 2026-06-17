@@ -96,6 +96,30 @@ def load_backtest_results() -> dict | None:
         return json.load(handle)
 
 
+def list_experiments() -> list[str]:
+    """Return sorted experiment ids from data/experiments/."""
+    if not DATA.experiments_dir.exists():
+        return []
+
+    return sorted(
+        path.stem
+        for path in DATA.experiments_dir.glob("*.json")
+        if path.is_file()
+    )
+
+
+def load_experiment(experiment_id: str) -> dict | None:
+    """Load one experiment JSON by id, or None if missing."""
+    path = DATA.experiments_dir / f"{experiment_id}.json"
+    if not path.exists():
+        return None
+
+    import json
+
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def load_recommendations() -> dict | None:
     """Load the latest recommendations snapshot, if available."""
     if not DATA.recommendations_json.exists():

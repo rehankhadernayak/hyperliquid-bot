@@ -4,7 +4,7 @@ from config import DATA, DEFAULT_BACKTEST, PAPER_TRADING, VERSION
 
 
 def test_version_is_paper_release():
-    assert VERSION == "8.1.0-paper"
+    assert VERSION == "8.2.0-paper"
 
 
 def test_live_session_trade_limit_defaults_to_10():

@@ -59,7 +59,7 @@ def check_config_loads() -> None:
         VERSION,
     )
 
-    if VERSION != "8.1.0-paper":
+    if VERSION != "8.2.0-paper":
         raise RuntimeError(f"Unexpected VERSION: {VERSION!r}")
 
     _ = (DATA, DEFAULT_BACKTEST, MARKET, PAPER_TRADING, SIGNAL, TEST_MODE)
@@ -71,6 +71,11 @@ def check_dashboard_imports() -> None:
 
 def check_backtester_imports() -> None:
     import backtester  # noqa: F401
+
+
+def check_experiment_imports() -> None:
+    import experiment_runner  # noqa: F401
+    import strategy_profiles  # noqa: F401
 
 
 def check_no_execution_modules() -> None:
@@ -133,6 +138,7 @@ def main() -> int:
         ("Configuration", check_config_loads),
         ("Dashboard import", check_dashboard_imports),
         ("Backtester import", check_backtester_imports),
+        ("Experiment framework import", check_experiment_imports),
         ("No wallet/execution modules", check_no_execution_modules),
         ("Test suite", check_tests_pass),
     ]
