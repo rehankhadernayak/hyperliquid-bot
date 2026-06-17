@@ -43,15 +43,21 @@ class TestPaperTraderBasics:
     ):
         trader = PaperTrader()
         price = 200.0
+        execution_price = trader.execution_price("BUY", price)
+        buy_fee = PAPER_TRADING.trade_size_usdc * (PAPER_TRADING.trading_fee_pct / 100.0)
 
         _buy(trader, price=price)
 
         position = trader.positions["BTC"]
-        expected_quantity = PAPER_TRADING.trade_size_usdc / price
+        expected_quantity = PAPER_TRADING.trade_size_usdc / execution_price
 
-        assert trader.cash_balance == PAPER_TRADING.starting_balance_usdc - PAPER_TRADING.trade_size_usdc
+        assert trader.cash_balance == pytest.approx(
+            PAPER_TRADING.starting_balance_usdc
+            - PAPER_TRADING.trade_size_usdc
+            - buy_fee
+        )
         assert position.quantity == pytest.approx(expected_quantity)
-        assert position.avg_entry_price == pytest.approx(price)
+        assert position.avg_entry_price == pytest.approx(execution_price)
 
     def test_multiple_buys_calculate_weighted_average_entry(
         self, temp_data_paths, silent_trade_output
@@ -62,10 +68,12 @@ class TestPaperTraderBasics:
         _buy(trader, price=200.0, now=1_100.0)
 
         position = trader.positions["BTC"]
-        first_quantity = PAPER_TRADING.trade_size_usdc / 100.0
-        second_quantity = PAPER_TRADING.trade_size_usdc / 200.0
+        first_execution = trader.execution_price("BUY", 100.0)
+        second_execution = trader.execution_price("BUY", 200.0)
+        first_quantity = PAPER_TRADING.trade_size_usdc / first_execution
+        second_quantity = PAPER_TRADING.trade_size_usdc / second_execution
         expected_avg = (
-            (100.0 * first_quantity) + PAPER_TRADING.trade_size_usdc
+            (first_execution * first_quantity) + PAPER_TRADING.trade_size_usdc
         ) / (first_quantity + second_quantity)
 
         assert position.quantity == pytest.approx(first_quantity + second_quantity)
@@ -78,16 +86,26 @@ class TestPaperTraderBasics:
         trader = PaperTrader()
 
         _buy(trader, price=100.0)
-        quantity_before_sell = trader.positions["BTC"].quantity
+        position = trader.positions["BTC"]
+        quantity_before_sell = position.quantity
+        avg_entry_before_sell = position.avg_entry_price
+        sell_execution_price = trader.execution_price("SELL", 110.0)
         _sell(trader, price=110.0)
 
-        expected_realized_pnl = (110.0 - 100.0) * quantity_before_sell
+        expected_realized_pnl = (
+            (sell_execution_price - avg_entry_before_sell) * quantity_before_sell
+        )
+        buy_fee = PAPER_TRADING.trade_size_usdc * (PAPER_TRADING.trading_fee_pct / 100.0)
+        trade_value = sell_execution_price * quantity_before_sell
+        sell_fee = trade_value * (PAPER_TRADING.trading_fee_pct / 100.0)
 
         assert trader.realized_pnl == pytest.approx(expected_realized_pnl)
         assert trader.cash_balance == pytest.approx(
             PAPER_TRADING.starting_balance_usdc
             - PAPER_TRADING.trade_size_usdc
-            + 110.0 * quantity_before_sell
+            - buy_fee
+            + trade_value
+            - sell_fee
         )
         assert not trader.positions["BTC"].is_open
 

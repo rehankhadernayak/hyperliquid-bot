@@ -10,7 +10,7 @@ No wallets, signing, or real orders — paper trading only.
 from dataclasses import dataclass
 from pathlib import Path
 
-VERSION = "8.0.0-paper"
+VERSION = "8.1.0-paper"
 
 
 @dataclass(frozen=True)
@@ -53,6 +53,8 @@ class PaperTradingConfig:
     max_total_open_exposure_usdc: float
     max_successful_trades_per_session: int
     min_equity_before_pause_usdc: float
+    trading_fee_pct: float
+    slippage_pct: float
 
 
 @dataclass
@@ -79,6 +81,9 @@ class DataPaths:
     paper_trades_csv: Path
     backtest_results_json: Path
     recommendations_json: Path
+    equity_log_csv: Path
+    session_configs_dir: Path
+    session_reports_dir: Path
 
 
 # --- Market ---
@@ -120,6 +125,8 @@ PAPER_TRADING = PaperTradingConfig(
     max_total_open_exposure_usdc=600.0,
     max_successful_trades_per_session=10,
     min_equity_before_pause_usdc=980.0,
+    trading_fee_pct=0.05,
+    slippage_pct=0.02,
 )
 
 
@@ -138,6 +145,9 @@ DATA = DataPaths(
     paper_trades_csv=_DATA_DIR / "paper_trades.csv",
     backtest_results_json=_DATA_DIR / "backtest_results.json",
     recommendations_json=_DATA_DIR / "recommendations.json",
+    equity_log_csv=_DATA_DIR / "equity_log.csv",
+    session_configs_dir=_DATA_DIR / "session_configs",
+    session_reports_dir=_DATA_DIR / "session_reports",
 )
 
 

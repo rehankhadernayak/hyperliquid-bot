@@ -1,6 +1,6 @@
 # Hyperliquid Paper Trading Bot
 
-**Version:** `8.0.0-paper` (see `config.VERSION`)
+**Version:** `8.1.0-paper` (see `config.VERSION`)
 
 A read-only Hyperliquid market analyzer with simulated paper trading, backtesting, and a local dashboard. This release fetches **public mid prices only** — no wallets, private keys, signing, or real orders.
 
@@ -27,9 +27,12 @@ Use this project to **observe**, **paper trade**, and **backtest** — not to ex
 - **Decision engine** — PAPER BUY / PAPER SELL / HOLD / BLOCKED recommendations with reasons and confidence labels.
 - **Paper trader** — simulated buys on DOWN signals, sells on UP signals when a position is open.
 - **Snapshot layer** — structured terminal output plus `data/recommendations.json`.
-- **CSV/JSON logging** — `data/price_log.csv`, `data/paper_trades.csv`, `data/backtest_results.json`.
+- **CSV/JSON logging** — `data/price_log.csv`, `data/paper_trades.csv`, `data/equity_log.csv`, `data/backtest_results.json`.
+- **Session tracking** — unique `session_id`, mode label, and configuration snapshot per analyzer run.
+- **Forward-testing costs** — live paper trades apply the same fee and slippage rules as the backtester.
+- **Session reports** — `session_report.py` writes per-session analytics to `data/session_reports/`.
 - **Backtester** — replays historical prices under TEST_MODE and production thresholds side by side.
-- **Streamlit dashboard** — read-only visualization of prices, trades, recommendations, and backtest summaries.
+- **Streamlit dashboard** — read-only visualization with session/date filters, equity curve, drawdown, and PnL analytics.
 - **Health check** — `python3 health_check.py` verifies setup, imports, tests, and safety constraints.
 
 ---
@@ -62,7 +65,11 @@ Hyperliquid Info API
    terminal            dashboard (Streamlit)
         │
         ▼
-  CSV / JSON logs          (price_log, paper_trades, backtest_results)
+  CSV / JSON logs          (price_log, paper_trades, equity_log, backtest_results)
+        │
+        ├──────────────────┐
+        ▼                  ▼
+   session reports     dashboard (Streamlit)
         │
         ▼
     backtester             (replay price_log.csv offline)
@@ -78,6 +85,10 @@ Hyperliquid Info API
 | `paper_trader.py` | Simulated account and trade log |
 | `market_snapshot.py` | Snapshot assembly and display |
 | `data_logger.py` | Append-only price CSV logging |
+| `dashboard_data.py` | Dashboard data loading and analytics helpers |
+| `session.py` | Session ID and configuration snapshots |
+| `equity_logger.py` | Append-only equity CSV logging |
+| `session_report.py` | Per-session forward-testing reports |
 | `main.py` | Live analyzer loop |
 | `backtester.py` | Historical replay and comparison |
 | `dashboard.py` | Streamlit read-only UI |
@@ -115,7 +126,7 @@ Hyperliquid Info API
 
 ### Live analyzer
 
-Polls Hyperliquid public prices, prints snapshots, runs paper trading, and appends to `data/price_log.csv` and `data/paper_trades.csv`.
+Polls Hyperliquid public prices, prints snapshots, runs paper trading, and appends to `data/price_log.csv`, `data/paper_trades.csv`, and `data/equity_log.csv`. Each run gets a unique session ID; configuration is saved under `data/session_configs/`.
 
 ```bash
 python3 main.py
@@ -131,7 +142,17 @@ Read-only Streamlit UI for logged data:
 streamlit run dashboard.py
 ```
 
-Open the URL shown in the terminal (typically `http://localhost:8501`).
+Open the URL shown in the terminal (typically `http://localhost:8501`). Use session and date filters to compare the current session against all-time filtered results, including equity curve, drawdown, cumulative realized PnL, and PnL by coin.
+
+### Session report
+
+Generate a read-only JSON report for one session (from logged trades and equity):
+
+```bash
+python3 session_report.py <session_id>
+```
+
+Reports are saved to `data/session_reports/<session_id>.json`. The analyzer also writes a report on graceful shutdown (`Ctrl+C`).
 
 ### Backtester
 
@@ -167,10 +188,10 @@ All settings live in **`config.py`**. Edit that file before running the analyzer
 
 | Setting | Variable | Description |
 |---------|----------|-------------|
-| Release version | `VERSION` | Current release tag (`8.0.0-paper`) |
+| Release version | `VERSION` | Current release tag (`8.1.0-paper`) |
 | Watchlist, API URL, poll interval | `MARKET` | Public market data settings |
 | Signal thresholds | `SIGNAL` | Separate test vs production percentage thresholds |
-| Live paper limits | `PAPER_TRADING` | Starting balance, trade size, exposure caps, session limits |
+| Live paper limits | `PAPER_TRADING` | Starting balance, trade size, exposure caps, session limits, fees, slippage |
 | Backtest-only settings | `DEFAULT_BACKTEST` | Max session trades (1,000), fees, slippage, forced close |
 | File paths | `DATA` | CSV and JSON locations under `data/` |
 | Live analyzer mode | `TEST_MODE` | `True` = test thresholds; `False` = production thresholds |
@@ -192,7 +213,7 @@ Live paper trading defaults to **10** successful trades per session. Backtests d
 
 ## Safety Guarantees
 
-This v8.0 paper release is designed to stay read-only and simulation-only:
+This v8.1 paper release is designed to stay read-only and simulation-only:
 
 - **No wallet integration** — no private keys, mnemonics, or signing libraries.
 - **No exchange execution** — no order placement, cancellation, or authenticated trading endpoints.
@@ -209,9 +230,9 @@ If you add wallet or live-trading code, the health check is expected to fail unt
 
 - **Single signal input** — 1-minute rolling change only; no order book depth, funding rates, or multi-timeframe fusion.
 - **Fixed watchlist** — BTC, ETH, SOL by default (configurable in `MARKET.watchlist`).
-- **Simplified fills** — paper trades use mid price; backtests apply configurable slippage and fees but not full market microstructure.
+- **Simplified fills** — live paper trading and backtests apply configurable slippage and fees using the same rules; neither models full market microstructure.
 - **Local data dependency** — backtests and dashboard need prior price logging (run the live analyzer or supply `data/price_log.csv`).
-- **No persistence of in-memory state** — restarting the analyzer resets start prices and paper session state (CSV logs remain).
+- **Session-scoped in-memory state** — restarting the analyzer resets start prices and in-memory paper state; CSV/JSON logs and session reports persist across runs.
 
 ---
 
@@ -219,7 +240,7 @@ If you add wallet or live-trading code, the health check is expected to fail unt
 
 **Backtest and paper-trading results do not guarantee future performance.**
 
-Historical replay uses past mid prices with simplified fees and slippage. Live paper trading uses real-time public mids but still does not model latency, partial fills, liquidation, or changing market conditions. Past simulated P&amp;L is for research and tooling validation only — not investment advice.
+Historical replay and live paper trading use public mids with simplified fees and slippage. Neither models latency, partial fills, liquidation, or changing market conditions. Past simulated P&amp;L is for research and tooling validation only — not investment advice.
 
 ---
 
@@ -228,6 +249,10 @@ Historical replay uses past mid prices with simplified fees and slippage. Live p
 ```text
 config.py              # VERSION and all settings
 main.py                # Live analyzer entry point
+session.py             # Session ID and config snapshots
+equity_logger.py       # Equity CSV appends
+session_report.py      # Per-session analytics reports
+dashboard_data.py      # Dashboard loading and analytics helpers
 backtester.py          # Offline replay and comparison
 dashboard.py           # Streamlit dashboard
 health_check.py        # Release verification script
@@ -244,4 +269,4 @@ tests/                 # Offline pytest suite
 CHANGELOG.md           # Release notes
 ```
 
-See [CHANGELOG.md](CHANGELOG.md) for the v8.0.0-paper release summary.
+See [CHANGELOG.md](CHANGELOG.md) for the v8.1.0-paper release summary.

@@ -6,13 +6,17 @@ from pathlib import Path
 
 import pytest
 
+import dashboard_data
+import equity_logger
 import paper_trader
+import session_report
 from config import DATA, DataPaths
 from signals import apply_signal_thresholds
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 LIVE_PAPER_TRADES = REPO_ROOT / "data" / "paper_trades.csv"
 LIVE_PRICE_LOG = REPO_ROOT / "data" / "price_log.csv"
+LIVE_EQUITY_LOG = REPO_ROOT / "data" / "equity_log.csv"
 
 
 @pytest.fixture(autouse=True)
@@ -24,10 +28,10 @@ def reset_signal_thresholds_after_test():
 
 @pytest.fixture(autouse=True)
 def protect_live_data_files():
-    """Fail if tests modify the live paper trades or price log CSV files."""
+    """Fail if tests modify live CSV data files."""
     snapshots: dict[Path, bytes] = {}
 
-    for path in (LIVE_PAPER_TRADES, LIVE_PRICE_LOG):
+    for path in (LIVE_PAPER_TRADES, LIVE_PRICE_LOG, LIVE_EQUITY_LOG):
         if path.exists():
             snapshots[path] = path.read_bytes()
 
@@ -42,7 +46,7 @@ def protect_live_data_files():
 
 @pytest.fixture
 def temp_data_paths(tmp_path, monkeypatch):
-    """Redirect paper trader CSV output to a temporary directory."""
+    """Redirect paper trader and equity CSV output to a temporary directory."""
     data_dir = tmp_path / "data"
     paths = DataPaths(
         data_dir=data_dir,
@@ -50,8 +54,14 @@ def temp_data_paths(tmp_path, monkeypatch):
         paper_trades_csv=data_dir / "paper_trades.csv",
         backtest_results_json=data_dir / "backtest_results.json",
         recommendations_json=data_dir / "recommendations.json",
+        equity_log_csv=data_dir / "equity_log.csv",
+        session_configs_dir=data_dir / "session_configs",
+        session_reports_dir=data_dir / "session_reports",
     )
     monkeypatch.setattr(paper_trader, "DATA", paths)
+    monkeypatch.setattr(equity_logger, "DATA", paths)
+    monkeypatch.setattr(dashboard_data, "DATA", paths)
+    monkeypatch.setattr(session_report, "DATA", paths)
     return paths
 
 

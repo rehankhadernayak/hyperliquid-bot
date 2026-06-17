@@ -77,11 +77,15 @@ class BacktestPaperTrader(PaperTrader):
         timestamp: str,
         coin: str,
         action: str,
+        mid_price: float,
         price: float,
         quantity: float,
         trade_value: float,
         trade_realized_pnl: float,
         signal: str,
+        entry_count: int,
+        fee: float,
+        slippage: float,
     ) -> None:
         self.trade_log.append(
             {
@@ -138,11 +142,15 @@ class BacktestPaperTrader(PaperTrader):
             timestamp=timestamp,
             coin=coin,
             action="SELL",
+            mid_price=price,
             price=execution_price,
             quantity=quantity,
             trade_value=trade_value,
             trade_realized_pnl=trade_realized_pnl,
             signal="FORCED_CLOSE",
+            entry_count=0,
+            fee=sell_fee,
+            slippage=0.0,
         )
 
 

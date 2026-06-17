@@ -54,6 +54,9 @@ class PaperTraderSummary:
     pause_reason: str | None
     session_trades: int
     max_session_trades: int
+    fees_paid: float
+    session_id: str
+    mode: str
 
 
 @dataclass
@@ -73,6 +76,7 @@ class MarketSnapshot:
 
     timestamp: str
     test_mode: bool
+    session_id: str
     market_rows: list[MarketRow]
     paper_trader: PaperTraderSummary | None
     open_positions: list[OpenPositionRow]
@@ -183,6 +187,9 @@ def build_paper_trader_summary(
         pause_reason=pause_reason,
         session_trades=paper_trader.successful_trades_this_session,
         max_session_trades=PAPER_TRADING.max_successful_trades_per_session,
+        fees_paid=paper_trader.total_fees_paid,
+        session_id=paper_trader.session_id,
+        mode=paper_trader.mode,
     )
 
 
@@ -224,6 +231,7 @@ def build_snapshot(
     timestamp: str | None = None,
     now: float | None = None,
     market_rows: list[MarketRow] | None = None,
+    session_id: str = "",
 ) -> MarketSnapshot:
     """
     Build a full market snapshot dictionary for one loop iteration.
@@ -266,6 +274,7 @@ def build_snapshot(
     return MarketSnapshot(
         timestamp=timestamp,
         test_mode=test_mode,
+        session_id=session_id,
         market_rows=market_rows,
         paper_trader=paper_summary,
         open_positions=open_positions,
@@ -357,10 +366,15 @@ def _print_paper_trader_section(
     print()
     print("Paper trading summary:")
     print("-" * 78)
+    if summary.session_id:
+        print(f"  Session ID:      {summary.session_id}")
+    if summary.mode:
+        print(f"  Mode:            {summary.mode}")
     print(f"  Status:          Paused: {paused_label}")
     print(f"  Cash balance:    ${summary.cash_balance:,.2f}")
     print(f"  Realized PnL:    {format_usdc(summary.realized_pnl)}")
     print(f"  Unrealized PnL:  {format_usdc(summary.unrealized_pnl)}")
+    print(f"  Fees paid:       ${summary.fees_paid:,.2f}")
     print(f"  Total equity:    ${summary.total_equity:,.2f}")
     print(f"  Open exposure:   ${summary.open_exposure:,.2f}")
     print(

@@ -10,13 +10,33 @@ from dataclasses import dataclass, field
 
 from config import DATA, MARKET, PAPER_TRADING
 from risk_rules import buy_block_reason, sell_block_reason
-CSV_COLUMNS = (
+
+LEGACY_CSV_COLUMNS = (
     "timestamp",
     "coin",
     "action",
     "price",
     "quantity",
     "trade_value",
+    "cash_balance",
+    "realized_pnl",
+)
+
+CSV_COLUMNS = (
+    "timestamp",
+    "session_id",
+    "mode",
+    "coin",
+    "action",
+    "signal",
+    "price",
+    "quantity",
+    "trade_value",
+    "entry_count",
+    "fee",
+    "slippage",
+    "trade_pnl",
+    "cumulative_realized_pnl",
     "cash_balance",
     "realized_pnl",
 )
@@ -61,6 +81,9 @@ class PaperTrader:
     successful_trades_this_session: int = 0
     is_paused: bool = False
     _equity_pause_announced: bool = False
+    session_id: str = ""
+    mode: str = ""
+    total_fees_paid: float = 0.0
 
     def total_open_exposure(self) -> float:
         """Sum of cost basis across all open positions (USDC tied up)."""
@@ -150,16 +173,30 @@ class PaperTrader:
         return PAPER_TRADING.max_successful_trades_per_session
 
     def execution_price(self, action: str, mid_price: float) -> float:
-        """Price used for fills; subclasses may add slippage."""
-        return mid_price
+        """Price used for fills; applies configured slippage like the backtester."""
+        slip = PAPER_TRADING.slippage_pct / 100.0
+        if action == "BUY":
+            return mid_price * (1 + slip)
+        return mid_price * (1 - slip)
 
     def buy_fee(self, trade_value: float) -> float:
-        """Fee charged on a BUY notional (subclasses may override)."""
-        return 0.0
+        """Fee charged on a BUY notional."""
+        fee = trade_value * (PAPER_TRADING.trading_fee_pct / 100.0)
+        self.total_fees_paid += fee
+        return fee
 
     def sell_fee(self, trade_value: float) -> float:
-        """Fee charged on SELL proceeds (subclasses may override)."""
-        return 0.0
+        """Fee charged on SELL proceeds."""
+        fee = trade_value * (PAPER_TRADING.trading_fee_pct / 100.0)
+        self.total_fees_paid += fee
+        return fee
+
+    def slippage_cost(self, action: str, mid_price: float, quantity: float) -> float:
+        """Return the USDC cost of slippage relative to the mid price."""
+        execution_price = self.execution_price(action, mid_price)
+        if action == "BUY":
+            return max((execution_price - mid_price) * quantity, 0.0)
+        return max((mid_price - execution_price) * quantity, 0.0)
 
     def _fake_buy(
         self,
@@ -195,17 +232,22 @@ class PaperTrader:
         position.last_buy_time = now
 
         buy_fee = self.buy_fee(PAPER_TRADING.trade_size_usdc)
+        slippage = self.slippage_cost("BUY", price, quantity)
         self.cash_balance -= PAPER_TRADING.trade_size_usdc + buy_fee
 
         self._log_trade(
             timestamp=timestamp,
             coin=coin,
             action="BUY",
+            mid_price=price,
             price=execution_price,
             quantity=quantity,
             trade_value=PAPER_TRADING.trade_size_usdc,
             trade_realized_pnl=0.0,
             signal=signal,
+            entry_count=position.entry_count,
+            fee=buy_fee,
+            slippage=slippage,
         )
 
     def _fake_sell(self, coin: str, price: float, timestamp: str, signal: str) -> None:
@@ -232,17 +274,21 @@ class PaperTrader:
         if position_value <= PAPER_TRADING.trade_size_usdc:
             quantity = position.quantity
             trade_value = position_value
+            entry_count = position.entry_count
         else:
             trade_value = PAPER_TRADING.trade_size_usdc
             quantity = trade_value / execution_price
+            entry_count = position.entry_count
 
             remaining_value = (position.quantity - quantity) * execution_price
             if remaining_value < PAPER_TRADING.trade_size_usdc:
                 quantity = position.quantity
                 trade_value = position_value
+                entry_count = position.entry_count
 
         trade_realized_pnl = (execution_price - position.avg_entry_price) * quantity
         sell_fee = self.sell_fee(trade_value)
+        slippage = self.slippage_cost("SELL", price, quantity)
         self.realized_pnl += trade_realized_pnl
         self.cash_balance += trade_value - sell_fee
 
@@ -257,11 +303,15 @@ class PaperTrader:
             timestamp=timestamp,
             coin=coin,
             action="SELL",
+            mid_price=price,
             price=execution_price,
             quantity=quantity,
             trade_value=trade_value,
             trade_realized_pnl=trade_realized_pnl,
             signal=signal,
+            entry_count=entry_count,
+            fee=sell_fee,
+            slippage=slippage,
         )
 
     def _log_trade(
@@ -269,11 +319,15 @@ class PaperTrader:
         timestamp: str,
         coin: str,
         action: str,
+        mid_price: float,
         price: float,
         quantity: float,
         trade_value: float,
         trade_realized_pnl: float,
         signal: str,
+        entry_count: int,
+        fee: float,
+        slippage: float,
     ) -> None:
         print_paper_trade_proposal(
             timestamp=timestamp,
@@ -282,6 +336,8 @@ class PaperTrader:
             price=price,
             trade_value=trade_value,
             signal=signal,
+            fee=fee,
+            slippage=slippage,
         )
 
         self.successful_trades_this_session += 1
@@ -289,25 +345,104 @@ class PaperTrader:
         ensure_data_dir()
 
         write_header = not DATA.paper_trades_csv.exists()
+        existing_header = _read_csv_header(DATA.paper_trades_csv)
 
         with DATA.paper_trades_csv.open("a", newline="") as csv_file:
             writer = csv.writer(csv_file)
 
             if write_header:
                 writer.writerow(CSV_COLUMNS)
+            elif existing_header == LEGACY_CSV_COLUMNS:
+                _migrate_legacy_paper_trades_csv()
 
             writer.writerow(
                 [
                     timestamp,
+                    self.session_id,
+                    self.mode,
                     coin,
                     action,
+                    signal,
                     f"{price:.8f}",
                     f"{quantity:.8f}",
                     f"{trade_value:.2f}",
+                    str(entry_count),
+                    f"{fee:.4f}",
+                    f"{slippage:.4f}",
+                    f"{trade_realized_pnl:.2f}",
+                    f"{self.realized_pnl:.2f}",
                     f"{self.cash_balance:.2f}",
                     f"{trade_realized_pnl:.2f}",
                 ]
             )
+
+
+def _read_csv_header(path) -> tuple[str, ...] | None:
+    if not path.exists():
+        return None
+
+    with path.open(newline="") as csv_file:
+        first_line = csv_file.readline().strip()
+        if not first_line:
+            return None
+        return tuple(first_line.split(","))
+
+
+def _migrate_legacy_paper_trades_csv() -> None:
+    """Upgrade an older paper_trades.csv header in place without losing rows."""
+    if not DATA.paper_trades_csv.exists():
+        return
+
+    with DATA.paper_trades_csv.open(newline="") as csv_file:
+        reader = csv.reader(csv_file)
+        rows = list(reader)
+
+    if not rows:
+        return
+
+    header = tuple(rows[0])
+    if header == CSV_COLUMNS:
+        return
+
+    migrated_rows = [CSV_COLUMNS]
+    for row in rows[1:]:
+        if len(row) == len(LEGACY_CSV_COLUMNS):
+            (
+                timestamp,
+                coin,
+                action,
+                price,
+                quantity,
+                trade_value,
+                cash_balance,
+                realized_pnl,
+            ) = row
+            migrated_rows.append(
+                [
+                    timestamp,
+                    "",
+                    "",
+                    coin,
+                    action,
+                    "",
+                    price,
+                    quantity,
+                    trade_value,
+                    "",
+                    "0.0000",
+                    "0.0000",
+                    realized_pnl,
+                    realized_pnl,
+                    cash_balance,
+                    realized_pnl,
+                ]
+            )
+        elif len(row) == len(CSV_COLUMNS):
+            migrated_rows.append(row)
+
+    with DATA.paper_trades_csv.open("w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerows(migrated_rows)
 
 
 def print_skipped_trade_proposal(
@@ -338,6 +473,8 @@ def print_paper_trade_proposal(
     price: float,
     trade_value: float,
     signal: str,
+    fee: float = 0.0,
+    slippage: float = 0.0,
 ) -> None:
     """Print a readable paper trade proposal when a simulated trade executes."""
     print()
@@ -348,6 +485,8 @@ def print_paper_trade_proposal(
     print(f"     Price:       ${price:,.2f}")
     print(f"     Trade value: ${trade_value:,.2f}")
     print(f"     Signal:      {signal}")
+    print(f"     Fee:         ${fee:,.4f}")
+    print(f"     Slippage:    ${slippage:,.4f}")
     print()
 
 
@@ -382,10 +521,15 @@ def print_paper_trading_summary(
     print()
     print("Paper trading summary:")
     print("-" * 78)
+    if paper_trader.session_id:
+        print(f"  Session ID:      {paper_trader.session_id}")
+    if paper_trader.mode:
+        print(f"  Mode:            {paper_trader.mode}")
     print(f"  Status:          Paused: {paused_label}")
     print(f"  Cash balance:    ${paper_trader.cash_balance:,.2f}")
     print(f"  Realized PnL:    {format_usdc(paper_trader.realized_pnl)}")
     print(f"  Unrealized PnL:  {format_usdc(unrealized)}")
+    print(f"  Fees paid:       ${paper_trader.total_fees_paid:,.2f}")
     print(f"  Total equity:    ${total_equity:,.2f}")
     print(f"  Open exposure:   ${open_exposure:,.2f}")
     print(

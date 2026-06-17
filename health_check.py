@@ -59,7 +59,7 @@ def check_config_loads() -> None:
         VERSION,
     )
 
-    if VERSION != "8.0.0-paper":
+    if VERSION != "8.1.0-paper":
         raise RuntimeError(f"Unexpected VERSION: {VERSION!r}")
 
     _ = (DATA, DEFAULT_BACKTEST, MARKET, PAPER_TRADING, SIGNAL, TEST_MODE)

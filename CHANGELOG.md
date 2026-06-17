@@ -2,6 +2,32 @@
 
 All notable changes to this project are documented here.
 
+## [8.1.0-paper] — 2026-06-17
+
+Forward-testing analytics release. Still read-only market data and simulated trades only — no wallets, signing, or live order execution.
+
+### Added
+
+- **Session tracking** — unique `session_id` per analyzer run, recorded in paper trades and equity snapshots; mode label (`TEST_MODE` / `production`); configuration snapshots in `data/session_configs/`.
+- **Live paper-trading costs** — `PAPER_TRADING.trading_fee_pct` and `slippage_pct` applied to live paper fills using the same rules as `BacktestPaperTrader`.
+- **Equity logging** — append-only `data/equity_log.csv` with one row per analyzer cycle.
+- **Extended paper trades CSV** — `session_id`, `mode`, `signal`, `entry_count`, `fee`, `slippage`, `trade_pnl`, `cumulative_realized_pnl`; legacy CSV rows are normalized on read and migrated on next write.
+- **Session reports** (`session_report.py`) — per-session metrics saved to `data/session_reports/<session_id>.json`; auto-generated on analyzer shutdown.
+- **Dashboard analytics** — session/date filters, current-session vs all-time views, equity curve, drawdown, cumulative realized PnL, PnL by coin, fees, win rate, and profit factor.
+- **`dashboard_data.py`** — shared read-only loading and analytics helpers for the dashboard and session reports.
+- **Tests** — coverage for session IDs, fees/slippage, equity logging, session reports, legacy CSV compatibility, and dashboard helpers.
+
+### Changed
+
+- **Version** — `VERSION = "8.1.0-paper"`.
+- **Paper trading summary** — terminal and snapshot output now show session ID, mode, and fees paid.
+- **`recommendations.json`** — includes `session_id` and expanded paper-trader fields (`fees_paid`, `mode`).
+
+### Safety
+
+- No wallet, signing, exchange execution, deposits, withdrawals, or leverage added.
+- Tests fail if live `data/paper_trades.csv`, `data/price_log.csv`, or `data/equity_log.csv` are modified during the run.
+
 ## [8.0.0-paper] — 2026-06-16
 
 Paper-trading release. Read-only market data and simulated trades only — no wallets, signing, or live order execution.
