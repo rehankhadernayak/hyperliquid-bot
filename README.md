@@ -1,8 +1,10 @@
 # Hyperliquid Paper Trading Bot
 
-**Version:** `8.2.0-paper` (see `config.VERSION`)
+**Version:** `9.0.0-review` (see `config.VERSION`)
 
-A read-only Hyperliquid market analyzer with simulated paper trading, backtesting, strategy experiments, and a local dashboard. This release fetches **public mid prices only** — no wallets, private keys, signing, or real orders.
+A read-only Hyperliquid market analyzer with simulated paper trading, backtesting, strategy experiments, adviser review packaging, and a local dashboard. This release fetches **public mid prices only** — no wallets, private keys, signing, or real orders.
+
+**This release cannot place real trades and is intended only for supervised technical and risk review.**
 
 ---
 
@@ -33,7 +35,10 @@ Use this project to **observe**, **paper trade**, and **backtest** — not to ex
 - **Session reports** — `session_report.py` writes per-session analytics to `data/session_reports/`.
 - **Backtester** — replays historical prices under TEST_MODE and production thresholds side by side.
 - **Strategy experiments** — compare immutable strategy profiles on identical historical data with development/out-of-sample splits, evidence labels, and overfitting warnings (`experiment_runner.py`).
-- **Streamlit dashboard** — read-only visualization with session/date filters, equity curve, drawdown, PnL analytics, and experiment analysis.
+- **Streamlit dashboard** — read-only visualization with session/date filters, equity curve, drawdown, PnL analytics, experiment analysis, and **Review Mode** for adviser meetings.
+- **Review package generator** — `python3 review_package.py` creates a timestamped adviser review bundle under `review_packages/`.
+- **Capital readiness assessment** — conservative descriptive assessment via `python3 capital_readiness.py` (never authorizes real trading).
+- **Release review check** — `python3 review_check.py` verifies version, safety, tests, package generation, and checksums.
 - **Health check** — `python3 health_check.py` verifies setup, imports, tests, and safety constraints.
 
 ---
@@ -143,13 +148,41 @@ Stop with `Ctrl+C`. Requires network access to `https://api.hyperliquid.xyz/info
 
 ### Dashboard
 
-Read-only Streamlit UI for logged data:
+Read-only Streamlit UI for logged data. Includes a **Review Mode** tab for adviser meetings (no export or execution from the UI):
 
 ```bash
 streamlit run dashboard.py
 ```
 
 Open the URL shown in the terminal (typically `http://localhost:8501`). Use session and date filters to compare the current session against all-time filtered results, including equity curve, drawdown, cumulative realized PnL, and PnL by coin.
+
+### Review package (adviser meeting)
+
+Generate a timestamped review bundle for supervised technical and risk review:
+
+```bash
+python3 review_package.py
+```
+
+Creates `review_packages/<package_id>/` with executive summary, architecture docs, strategy documentation, evidence CSVs, manifest, and checksums. Export is CLI-only — not available from the dashboard.
+
+### Capital readiness assessment
+
+Conservative descriptive assessment (never authorizes real trading):
+
+```bash
+python3 capital_readiness.py
+```
+
+Optional JSON output: `python3 capital_readiness.py --json`
+
+### Release review check
+
+Full v9 release verification:
+
+```bash
+python3 review_check.py
+```
 
 ### Session report
 
@@ -213,7 +246,7 @@ All settings live in **`config.py`**. Edit that file before running the analyzer
 
 | Setting | Variable | Description |
 |---------|----------|-------------|
-| Release version | `VERSION` | Current release tag (`8.2.0-paper`) |
+| Release version | `VERSION` | Current release tag (`9.0.0-review`) |
 | Watchlist, API URL, poll interval | `MARKET` | Public market data settings |
 | Signal thresholds | `SIGNAL` | Separate test vs production percentage thresholds |
 | Live paper limits | `PAPER_TRADING` | Starting balance, trade size, exposure caps, session limits, fees, slippage |
@@ -268,14 +301,15 @@ Live paper trading defaults to **10** successful trades per session. Backtests d
 
 ## Safety Guarantees
 
-This v8.2 paper release is designed to stay read-only and simulation-only:
+This v9.0.0-review release is designed to stay read-only and simulation-only:
 
 - **No wallet integration** — no private keys, mnemonics, or signing libraries.
 - **No exchange execution** — no order placement, cancellation, or authenticated trading endpoints.
 - **Info API only** — single public POST to `allMids`; no API secrets required.
 - **Isolated backtests and experiments** — `BacktestPaperTrader` and `ExperimentPaperTrader` do not append to live CSV files.
 - **Test guards** — pytest fixtures assert live CSV files are unchanged after the test run.
-- **Health check** — scans for forbidden module names and execution-related patterns.
+- **Review package CLI-only** — dashboard Review Mode is read-only; no export or execution actions.
+- **Capital readiness is descriptive** — highest assessment tier means "present to adviser," not "approved to trade."
 
 If you add wallet or live-trading code, the health check is expected to fail until those modules are removed or the check is intentionally updated for a future release.
 
@@ -288,7 +322,8 @@ If you add wallet or live-trading code, the health check is expected to fail unt
 - **Simplified fills** — live paper trading and backtests apply configurable slippage and fees using the same rules; neither models full market microstructure.
 - **Local data dependency** — backtests, experiments, and dashboard need prior price logging (run the live analyzer or supply `data/price_log.csv`).
 - **Experiment scope** — one contrarian strategy family plus a hold baseline; no hyperparameter search or autonomous execution.
-- **Session-scoped in-memory state** — restarting the analyzer resets start prices and in-memory paper state; CSV/JSON logs and session reports persist across runs.
+- **Review package scope** — excludes raw trading history by default; evidence summaries only.
+- **Capital readiness thresholds** — conservative rules block progression on insufficient evidence, unexplained trades, or risk violations.
 
 ---
 
@@ -313,6 +348,12 @@ backtester.py          # Offline replay and comparison
 experiment_runner.py   # Multi-profile strategy experiments
 strategy_profiles.py   # Immutable strategy profiles
 strategies/            # Strategy implementations
+review_package.py      # Adviser review package generator
+capital_readiness.py   # Descriptive capital-readiness assessment
+review_check.py        # v9 release verification script
+review_data.py         # Review data loading and sanitization
+review_documents.py  # Review markdown generators
+dashboard_review.py    # Dashboard Review Mode helpers
 dashboard.py           # Streamlit dashboard
 health_check.py        # Release verification script
 hyperliquid_client.py  # Read-only Info API
@@ -328,4 +369,4 @@ tests/                 # Offline pytest suite
 CHANGELOG.md           # Release notes
 ```
 
-See [CHANGELOG.md](CHANGELOG.md) for the v8.2.0-paper release summary.
+See [CHANGELOG.md](CHANGELOG.md) for the v9.0.0-review release summary.

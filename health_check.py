@@ -59,7 +59,7 @@ def check_config_loads() -> None:
         VERSION,
     )
 
-    if VERSION != "8.2.0-paper":
+    if VERSION != "9.0.0-review":
         raise RuntimeError(f"Unexpected VERSION: {VERSION!r}")
 
     _ = (DATA, DEFAULT_BACKTEST, MARKET, PAPER_TRADING, SIGNAL, TEST_MODE)
@@ -78,6 +78,12 @@ def check_experiment_imports() -> None:
     import strategy_profiles  # noqa: F401
 
 
+def check_review_imports() -> None:
+    import capital_readiness  # noqa: F401
+    import review_package  # noqa: F401
+    import dashboard_review  # noqa: F401
+
+
 def check_no_execution_modules() -> None:
     python_files = [
         path
@@ -85,8 +91,10 @@ def check_no_execution_modules() -> None:
         if ".git" not in path.parts and ".pytest_cache" not in path.parts
     ]
 
+    skip_files = {"health_check.py", "review_check.py", "review_data.py"}
+
     for path in python_files:
-        if path.name == "health_check.py":
+        if path.name in skip_files:
             continue
 
         stem = path.stem
@@ -139,6 +147,7 @@ def main() -> int:
         ("Dashboard import", check_dashboard_imports),
         ("Backtester import", check_backtester_imports),
         ("Experiment framework import", check_experiment_imports),
+        ("Review framework import", check_review_imports),
         ("No wallet/execution modules", check_no_execution_modules),
         ("Test suite", check_tests_pass),
     ]

@@ -2,6 +2,33 @@
 
 All notable changes to this project are documented here.
 
+## [9.0.0-review] — 2026-06-17
+
+Supervised review-ready release. Still read-only market data and simulated trades only — no wallets, signing, or live order execution.
+
+### Added
+
+- **Review package generator** (`review_package.py`) — creates timestamped `review_packages/<package_id>/` with executive summary, architecture docs, strategy documentation, risk management, evidence summary, experiment/session CSVs, failure scenarios, adviser questions, review checklist, manifest, and SHA-256 checksums.
+- **Capital readiness assessment** (`capital_readiness.py`) — conservative descriptive tiers (`NOT_READY`, `NEEDS_MORE_EVIDENCE`, `READY_FOR_ADVISOR_REVIEW`, `ELIGIBLE_FOR_TINY_SUPERVISED_PILOT_REVIEW`); never authorizes real trading.
+- **Release review check** (`review_check.py`) — verifies version, imports, tests, package generation, checksums, sensitive-file exclusion, and capital-readiness safety.
+- **Review Mode dashboard tab** (`dashboard_review.py`) — read-only adviser meeting view with safety banner, architecture, health status, experiments, evidence labels, risk limits, and capital readiness. No export from UI.
+- **Review helpers** (`review_data.py`, `review_documents.py`) — shared data loading, sanitization, and markdown generation.
+- **Tests** — 25 new offline tests in `tests/test_review.py` (124 tests total).
+
+### Changed
+
+- **Version** — `VERSION = "9.0.0-review"`.
+- **`health_check.py`** — version check updated; review module import check added.
+- **`dashboard.py`** — tabbed layout with Dashboard and Review Mode.
+- **`.gitignore`** — excludes generated `review_packages/` directory.
+
+### Safety
+
+- No wallet, signing, exchange execution, deposits, withdrawals, or leverage added.
+- Review package excludes secrets, `.env` files, absolute local paths, and raw trading history.
+- Capital readiness highest tier means evidence may be presented to a qualified adviser — not automatic approval.
+- v8.0–v8.2 behavior, data formats, and tests preserved.
+
 ## [8.2.0-paper] — 2026-06-17
 
 Evidence-analysis and strategy-experiment framework. Still read-only market data and simulated trades only — no wallets, signing, or live order execution.

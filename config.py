@@ -10,7 +10,7 @@ No wallets, signing, or real orders — paper trading only.
 from dataclasses import dataclass
 from pathlib import Path
 
-VERSION = "8.2.0-paper"
+VERSION = "9.0.0-review"
 
 
 @dataclass(frozen=True)

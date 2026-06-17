@@ -13,6 +13,7 @@ import streamlit as st
 
 from config import DATA, MARKET, PAPER_TRADING, VERSION
 import dashboard_data
+import dashboard_review
 
 
 @st.cache_data(ttl=30)
@@ -692,6 +693,19 @@ def main() -> None:
         "forward-testing analytics, and simulated trades."
     )
 
+    tab_dashboard, tab_review = st.tabs(["Dashboard", "Review Mode"])
+
+    with tab_review:
+        dashboard_review.render_review_mode(
+            load_experiment=load_experiment,
+            list_experiments_fn=list_experiments,
+        )
+
+    with tab_dashboard:
+        _render_dashboard()
+
+
+def _render_dashboard() -> None:
     snapshot = load_recommendations()
 
     _render_session_summary(snapshot)
