@@ -57,6 +57,12 @@ class PaperTraderSummary:
     fees_paid: float
     session_id: str
     mode: str
+    profile_id: str = ""
+    trade_size_usdc: float = 0.0
+    max_allocation_per_coin_usdc: float = 0.0
+    max_total_open_exposure_usdc: float = 0.0
+    leverage_enabled: bool = False
+    paper_only: bool = True
 
 
 @dataclass
@@ -82,6 +88,7 @@ class MarketSnapshot:
     open_positions: list[OpenPositionRow]
     decisions: list[CoinDecision]
     decision_summary: DecisionSessionSummary | None
+    strategy_profile: str = ""
 
     def to_dict(self) -> dict:
         """Return the snapshot as a plain dictionary."""
@@ -177,6 +184,8 @@ def build_paper_trader_summary(
     if paper_trader.is_paused:
         pause_reason = "equity protection"
 
+    limits = paper_trader.trading_limits()
+
     return PaperTraderSummary(
         cash_balance=paper_trader.cash_balance,
         realized_pnl=paper_trader.realized_pnl,
@@ -186,10 +195,16 @@ def build_paper_trader_summary(
         paused=paper_trader.is_paused,
         pause_reason=pause_reason,
         session_trades=paper_trader.successful_trades_this_session,
-        max_session_trades=PAPER_TRADING.max_successful_trades_per_session,
+        max_session_trades=paper_trader.session_trade_limit(),
         fees_paid=paper_trader.total_fees_paid,
         session_id=paper_trader.session_id,
         mode=paper_trader.mode,
+        profile_id=paper_trader.profile_id,
+        trade_size_usdc=limits.trade_size_usdc,
+        max_allocation_per_coin_usdc=limits.max_allocation_per_coin_usdc,
+        max_total_open_exposure_usdc=limits.max_total_open_exposure_usdc,
+        leverage_enabled=False,
+        paper_only=True,
     )
 
 
@@ -275,6 +290,7 @@ def build_snapshot(
         timestamp=timestamp,
         test_mode=test_mode,
         session_id=session_id,
+        strategy_profile=paper_trader.profile_id if paper_trader is not None else "",
         market_rows=market_rows,
         paper_trader=paper_summary,
         open_positions=open_positions,

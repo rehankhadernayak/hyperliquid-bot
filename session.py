@@ -15,8 +15,10 @@ from config import (
     TEST_MODE,
     VERSION,
 )
+from strategy_profiles import get_profile
 
 LIVE_STRATEGY_PROFILE = "contrarian_v1"
+PAPER_TEST_PROFILE_SIZE_300 = "contrarian_v1_size_300_test"
 
 
 def generate_session_id() -> str:
@@ -29,15 +31,43 @@ def mode_label(test_mode: bool) -> str:
     return "TEST_MODE" if test_mode else "production"
 
 
-def session_config_snapshot(*, test_mode: bool = TEST_MODE) -> dict:
+def resolve_test_mode(*, profile_id: str | None = None, test_mode: bool = TEST_MODE) -> bool:
+    """Return whether test-mode signal thresholds should be active."""
+    if profile_id is None:
+        return test_mode
+
+    profile = get_profile(profile_id)
+    return profile.thresholds == SIGNAL.test_mode
+
+
+def session_config_snapshot(
+    *,
+    test_mode: bool = TEST_MODE,
+    profile_id: str | None = None,
+) -> dict:
     """Capture configuration values active for this session."""
+    active_test_mode = resolve_test_mode(profile_id=profile_id, test_mode=test_mode)
+    profile_payload = None
+    strategy_profile = LIVE_STRATEGY_PROFILE
+
+    if profile_id is not None:
+        profile = get_profile(profile_id)
+        profile_payload = profile.to_dict()
+        strategy_profile = profile_id
+
     return {
         "version": VERSION,
-        "test_mode": test_mode,
-        "mode": mode_label(test_mode),
-        "strategy_profile": LIVE_STRATEGY_PROFILE,
+        "test_mode": active_test_mode,
+        "mode": mode_label(active_test_mode),
+        "strategy_profile": strategy_profile,
+        "profile": profile_payload,
+        "paper_only": True,
+        "leverage_enabled": False,
+        "margin_enabled": False,
         "market": asdict(MARKET),
-        "signal_thresholds": asdict(SIGNAL.test_mode if test_mode else SIGNAL.production),
+        "signal_thresholds": asdict(
+            SIGNAL.test_mode if active_test_mode else SIGNAL.production
+        ),
         "paper_trading": asdict(PAPER_TRADING),
         "costs": {
             "trading_fee_pct": PAPER_TRADING.trading_fee_pct,
@@ -57,8 +87,6 @@ def save_session_config(session_id: str, config_snapshot: dict, output_dir) -> N
     """Write the session configuration snapshot to disk."""
     output_dir.mkdir(parents=True, exist_ok=True)
     path = output_dir / f"{session_id}.json"
-
-    import json
 
     with path.open("w", encoding="utf-8") as handle:
         json.dump(config_snapshot, handle, indent=2)

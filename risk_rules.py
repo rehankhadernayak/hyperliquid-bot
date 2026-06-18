@@ -9,10 +9,9 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING, Protocol
 
-from config import PAPER_TRADING
-
 if TYPE_CHECKING:
     from paper_trader import PaperTrader, Position
+    from strategy_types import TradingLimits
 
 SESSION_TRADE_LIMIT_REASON = "session trade limit reached"
 
@@ -28,6 +27,8 @@ class RiskCheckTrader(Protocol):
     def total_open_exposure(self) -> float: ...
 
     def session_trade_limit(self) -> int: ...
+
+    def trading_limits(self) -> TradingLimits: ...
 
 
 def _get_position(trader: RiskCheckTrader, coin: str) -> Position:
@@ -84,6 +85,8 @@ def session_trade_block_reason(
 
 def buy_block_reason(trader: RiskCheckTrader, coin: str, now: float) -> str | None:
     """Return a reason if a PAPER BUY would be blocked, else None."""
+    limits = trader.trading_limits()
+
     if trader.is_paused:
         return "equity protection triggered"
 
@@ -93,26 +96,26 @@ def buy_block_reason(trader: RiskCheckTrader, coin: str, now: float) -> str | No
 
     position = _get_position(trader, coin)
 
-    if trader.cash_balance < PAPER_TRADING.trade_size_usdc:
+    if trader.cash_balance < limits.trade_size_usdc:
         return "insufficient fake cash"
 
     if (
-        position.allocation_usdc + PAPER_TRADING.trade_size_usdc
-        > PAPER_TRADING.max_allocation_per_coin_usdc
+        position.allocation_usdc + limits.trade_size_usdc
+        > limits.max_allocation_per_coin_usdc
     ):
         return "per-coin allocation reached"
 
-    if position.entry_count >= PAPER_TRADING.max_entries_per_coin:
+    if position.entry_count >= limits.max_entries_per_coin:
         return "maximum entries reached"
 
     if position.last_buy_time is not None:
         seconds_since_last_buy = now - position.last_buy_time
-        if seconds_since_last_buy < PAPER_TRADING.min_seconds_between_buys:
+        if seconds_since_last_buy < limits.min_seconds_between_buys:
             return "cooldown active"
 
     if (
-        trader.total_open_exposure() + PAPER_TRADING.trade_size_usdc
-        > PAPER_TRADING.max_total_open_exposure_usdc
+        trader.total_open_exposure() + limits.trade_size_usdc
+        > limits.max_total_open_exposure_usdc
     ):
         return "total exposure reached"
 

@@ -63,6 +63,7 @@ class SessionShutdownContext:
     blocked_proposals_by_reason: dict[str, int] = field(default_factory=dict)
     positions_force_closed: bool = False
     force_close_reason: str | None = None
+    profile: dict | None = None
 
 
 def _profit_factor(trades: pd.DataFrame) -> float | None:
@@ -124,6 +125,65 @@ def build_open_position_snapshots(
     return snapshots
 
 
+def _quantities_bought(trades: pd.DataFrame) -> list[dict]:
+    if trades.empty or "action" not in trades.columns:
+        return []
+
+    buys = trades[trades["action"] == "BUY"]
+    records: list[dict] = []
+    for _, row in buys.iterrows():
+        records.append(
+            {
+                "coin": str(row["coin"]),
+                "quantity": round(float(row["quantity"]), 8),
+                "execution_price": round(float(row["price"]), 8),
+                "trade_value": round(float(row["trade_value"]), 2),
+            }
+        )
+    return records
+
+
+def _profile_report_section(
+    shutdown: SessionShutdownContext | None,
+    *,
+    starting_equity: float,
+    ending_equity: float,
+    fees_paid: float,
+    slippage_cost: float,
+    accounting_valid: bool,
+    session_trades: pd.DataFrame,
+) -> dict | None:
+    profile = shutdown.profile if shutdown else None
+    if not profile:
+        return None
+
+    total_buys = 0
+    total_sells = 0
+    if not session_trades.empty and "action" in session_trades.columns:
+        total_buys = int((session_trades["action"] == "BUY").sum())
+        total_sells = int((session_trades["action"] == "SELL").sum())
+
+    return {
+        "profile_name": profile.get("profile_id", shutdown.strategy_profile if shutdown else ""),
+        "trade_size_usdc": profile.get("trade_size_usdc"),
+        "max_allocation_per_coin_usdc": profile.get("max_allocation_per_coin_usdc"),
+        "max_total_open_exposure_usdc": profile.get("max_total_open_exposure_usdc"),
+        "starting_equity": round(starting_equity, 2),
+        "quantities_bought": _quantities_bought(session_trades),
+        "total_executions": total_buys + total_sells,
+        "exposure_increasing_entries": total_buys,
+        "risk_reducing_exits": total_sells,
+        "fees_paid": round(fees_paid, 2),
+        "slippage_cost": round(slippage_cost, 2),
+        "ending_equity": round(ending_equity, 2),
+        "accounting_valid": accounting_valid,
+        "leverage_enabled": False,
+        "margin_enabled": False,
+        "paper_only": True,
+        "profile": profile,
+    }
+
+
 def validate_accounting_identity(
     *,
     starting_equity: float,
@@ -179,6 +239,16 @@ def build_session_report(
         mode = paper_trader.mode
 
     starting_equity = PAPER_TRADING.starting_balance_usdc
+    if shutdown and shutdown.profile:
+        starting_equity = float(
+            shutdown.profile.get(
+                "starting_balance_usdc",
+                PAPER_TRADING.starting_balance_usdc,
+            )
+        )
+    elif paper_trader is not None:
+        starting_equity = paper_trader.trading_limits().starting_balance_usdc
+
     ending_equity = starting_equity
     unrealized_pnl = 0.0
     fees_paid = 0.0
@@ -191,7 +261,6 @@ def build_session_report(
         fees_paid = float(session_equity["fees_paid"].iloc[-1])
         final_open_exposure = float(session_equity["open_exposure"].iloc[-1])
     elif paper_trader is not None and shutdown and shutdown.current_prices:
-        starting_equity = PAPER_TRADING.starting_balance_usdc
         unrealized_pnl = paper_trader.unrealized_pnl(shutdown.current_prices)
         fees_paid = paper_trader.total_fees_paid
         ending_equity = paper_trader.total_equity(shutdown.current_prices)
@@ -315,6 +384,18 @@ def build_session_report(
         "maximum_drawdown_pct": round(compute_max_drawdown(equity_curve), 2),
         "results_by_coin": pnl_by_coin(session_trades),
     }
+
+    profile_section = _profile_report_section(
+        shutdown,
+        starting_equity=starting_equity,
+        ending_equity=ending_equity,
+        fees_paid=fees_paid,
+        slippage_cost=slippage_cost,
+        accounting_valid=accounting_valid,
+        session_trades=session_trades,
+    )
+    if profile_section is not None:
+        report["profile_session"] = profile_section
 
     return report
 

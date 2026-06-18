@@ -14,6 +14,7 @@ import streamlit as st
 from config import DATA, MARKET, PAPER_TRADING, VERSION
 import dashboard_data
 import dashboard_review
+import session
 
 
 @st.cache_data(ttl=30)
@@ -103,8 +104,28 @@ def _mode_badge(snapshot: dict | None) -> str:
     return "production"
 
 
+def _render_profile_banner(snapshot: dict | None) -> None:
+    if snapshot is None:
+        return
+
+    paper = snapshot.get("paper_trader") or {}
+    profile_id = paper.get("profile_id") or snapshot.get("strategy_profile", "")
+
+    if profile_id != session.PAPER_TEST_PROFILE_SIZE_300:
+        return
+
+    st.info(
+        "**PAPER TEST PROFILE:** `contrarian_v1_size_300_test`  \n"
+        f"Trade size: ${paper.get('trade_size_usdc', 0):,.0f}  \n"
+        f"Per-coin cap: ${paper.get('max_allocation_per_coin_usdc', 0):,.0f}  \n"
+        f"Total exposure cap: ${paper.get('max_total_open_exposure_usdc', 0):,.0f}  \n"
+        "Leverage: disabled"
+    )
+
+
 def _render_session_summary(snapshot: dict | None) -> None:
     st.subheader("Session Summary")
+    _render_profile_banner(snapshot)
 
     if snapshot is None:
         st.info(

@@ -98,6 +98,24 @@ STRATEGY_PROFILES: dict[str, StrategyProfile] = {
         thresholds=SIGNAL.production,
         **_base_limits(),
     ),
+    "contrarian_v1_size_300_test": StrategyProfile(
+        profile_id="contrarian_v1_size_300_test",
+        strategy_name="contrarian_v1",
+        strategy_version="1.0.0",
+        thresholds=SIGNAL.test_mode,
+        starting_balance_usdc=1000.0,
+        trade_size_usdc=300.0,
+        max_allocation_per_coin_usdc=300.0,
+        max_entries_per_coin=1,
+        max_total_open_exposure_usdc=600.0,
+        max_successful_trades_per_session=PAPER_TRADING.max_successful_trades_per_session,
+        min_equity_before_pause_usdc=PAPER_TRADING.min_equity_before_pause_usdc,
+        trading_fee_pct=PAPER_TRADING.trading_fee_pct,
+        slippage_pct=PAPER_TRADING.slippage_pct,
+        lookback_seconds=WINDOW_1M_SECONDS,
+        cooldown_seconds=PAPER_TRADING.min_seconds_between_buys,
+        close_positions_at_end=True,
+    ),
 }
 
 

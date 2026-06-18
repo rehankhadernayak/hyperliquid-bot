@@ -139,6 +139,7 @@ def build_supporting_reasons(
     coin: str,
 ) -> list[str]:
     """Build short supporting context lines for a decision."""
+    limits = trader.trading_limits()
     reasons: list[str] = []
 
     if signal in BUY_SIGNALS_SET:
@@ -162,10 +163,10 @@ def build_supporting_reasons(
     if recommendation == RECOMMENDATION_BUY and block_reason is None:
         reasons.append(
             f"Cash available: ${trader.cash_balance:,.2f} "
-            f"(trade size ${PAPER_TRADING.trade_size_usdc:,.2f})"
+            f"(trade size ${limits.trade_size_usdc:,.2f})"
         )
         reasons.append(
-            f"Entries used: {position.entry_count}/{PAPER_TRADING.max_entries_per_coin}"
+            f"Entries used: {position.entry_count}/{limits.max_entries_per_coin}"
         )
 
     if recommendation == RECOMMENDATION_SELL and block_reason is None:
@@ -224,6 +225,7 @@ def decide_for_coin(
     now: float,
 ) -> CoinDecision:
     """Build one coin decision from market data and paper trader state."""
+    limits = trader.trading_limits()
     position = _get_position(trader, coin)
     has_open_position = position.is_open and current_price is not None
     position_value = position_market_value(trader, coin, current_price)
@@ -238,7 +240,7 @@ def decide_for_coin(
             change_1m=change_1m,
             change_5m=change_5m,
             current_position_value=position_value,
-            per_coin_allocation_limit=PAPER_TRADING.max_allocation_per_coin_usdc,
+            per_coin_allocation_limit=limits.max_allocation_per_coin_usdc,
             risk_status="OK — price data unavailable",
             primary_reason="price data unavailable — hold",
             supporting_reasons=["Waiting for a valid market price"],
@@ -277,7 +279,7 @@ def decide_for_coin(
         change_1m=change_1m,
         change_5m=change_5m,
         current_position_value=position_value,
-        per_coin_allocation_limit=PAPER_TRADING.max_allocation_per_coin_usdc,
+        per_coin_allocation_limit=limits.max_allocation_per_coin_usdc,
         risk_status=risk_status_label(recommendation, block_reason),
         primary_reason=primary_reason,
         supporting_reasons=supporting,
@@ -295,7 +297,7 @@ def current_drawdown_pct(trader: PaperTrader, current_prices: dict[str, float]) 
         return None
 
     equity = trader.total_equity(current_prices)
-    starting = PAPER_TRADING.starting_balance_usdc
+    starting = trader.trading_limits().starting_balance_usdc
 
     if starting <= 0:
         return None

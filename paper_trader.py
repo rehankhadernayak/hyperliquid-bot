@@ -8,9 +8,14 @@ No wallet, signing, or real exchange orders — read-only simulation only.
 import csv
 import time
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING
 
 from config import DATA, MARKET, PAPER_TRADING
 from risk_rules import buy_block_reason, sell_block_reason
+
+if TYPE_CHECKING:
+    from strategy_profiles import StrategyProfile
+    from strategy_types import TradingLimits
 
 LEGACY_CSV_COLUMNS = (
     "timestamp",
@@ -84,6 +89,8 @@ class PaperTrader:
     _equity_pause_announced: bool = False
     session_id: str = ""
     mode: str = ""
+    profile_id: str = ""
+    profile: StrategyProfile | None = None
     total_fees_paid: float = 0.0
     total_slippage_cost: float = 0.0
     started_at: float = field(default_factory=time.time)
@@ -91,6 +98,32 @@ class PaperTrader:
     blocked_proposals_by_reason: dict[str, int] = field(default_factory=dict)
     _blocked_message_last_printed: dict[str, float] = field(default_factory=dict)
     _blocked_summary_last_printed: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.profile is not None:
+            self.profile_id = self.profile.profile_id
+            limits = self.profile.trading_limits()
+            self.cash_balance = limits.starting_balance_usdc
+
+    def trading_limits(self) -> TradingLimits:
+        """Return active execution and risk limits for this trader."""
+        from strategy_types import TradingLimits
+
+        if self.profile is not None:
+            return self.profile.trading_limits()
+        return TradingLimits(
+            starting_balance_usdc=PAPER_TRADING.starting_balance_usdc,
+            trade_size_usdc=PAPER_TRADING.trade_size_usdc,
+            max_allocation_per_coin_usdc=PAPER_TRADING.max_allocation_per_coin_usdc,
+            max_entries_per_coin=PAPER_TRADING.max_entries_per_coin,
+            min_seconds_between_buys=PAPER_TRADING.min_seconds_between_buys,
+            max_total_open_exposure_usdc=PAPER_TRADING.max_total_open_exposure_usdc,
+            max_successful_trades_per_session=PAPER_TRADING.max_successful_trades_per_session,
+            min_equity_before_pause_usdc=PAPER_TRADING.min_equity_before_pause_usdc,
+            trading_fee_pct=PAPER_TRADING.trading_fee_pct,
+            slippage_pct=PAPER_TRADING.slippage_pct,
+            close_positions_at_end=True,
+        )
 
     def record_blocked_proposal(self, reason: str) -> None:
         """Record a blocked trade proposal for session analytics."""
@@ -150,7 +183,8 @@ class PaperTrader:
             return
 
         equity = self.total_equity(current_prices)
-        if equity < PAPER_TRADING.min_equity_before_pause_usdc:
+        min_equity = self.trading_limits().min_equity_before_pause_usdc
+        if equity < min_equity:
             self.is_paused = True
 
             if not self._equity_pause_announced:
@@ -158,7 +192,7 @@ class PaperTrader:
                 print("  >> PAPER TRADING PAUSED")
                 print("     Reason:      equity protection triggered")
                 print(f"     Total equity: ${equity:,.2f}")
-                print(f"     Minimum:      ${PAPER_TRADING.min_equity_before_pause_usdc:,.2f}")
+                print(f"     Minimum:      ${min_equity:,.2f}")
                 print()
                 self._equity_pause_announced = True
 
@@ -205,24 +239,24 @@ class PaperTrader:
 
     def session_trade_limit(self) -> int:
         """Maximum successful trades allowed this session (subclasses may override)."""
-        return PAPER_TRADING.max_successful_trades_per_session
+        return self.trading_limits().max_successful_trades_per_session
 
     def execution_price(self, action: str, mid_price: float) -> float:
         """Price used for fills; applies configured slippage like the backtester."""
-        slip = PAPER_TRADING.slippage_pct / 100.0
+        slip = self.trading_limits().slippage_pct / 100.0
         if action == "BUY":
             return mid_price * (1 + slip)
         return mid_price * (1 - slip)
 
     def buy_fee(self, trade_value: float) -> float:
         """Fee charged on a BUY notional."""
-        fee = trade_value * (PAPER_TRADING.trading_fee_pct / 100.0)
+        fee = trade_value * (self.trading_limits().trading_fee_pct / 100.0)
         self.total_fees_paid += fee
         return fee
 
     def sell_fee(self, trade_value: float) -> float:
         """Fee charged on SELL proceeds."""
-        fee = trade_value * (PAPER_TRADING.trading_fee_pct / 100.0)
+        fee = trade_value * (self.trading_limits().trading_fee_pct / 100.0)
         self.total_fees_paid += fee
         return fee
 
@@ -281,21 +315,21 @@ class PaperTrader:
             return
 
         execution_price = self.execution_price("BUY", price)
-        quantity = PAPER_TRADING.trade_size_usdc / execution_price
+        limits = self.trading_limits()
+        trade_size = limits.trade_size_usdc
+        quantity = trade_size / execution_price
         position = self._get_position(coin)
 
         # Weighted average entry when adding to an existing position
-        total_cost = (
-            (position.avg_entry_price * position.quantity) + PAPER_TRADING.trade_size_usdc
-        )
+        total_cost = (position.avg_entry_price * position.quantity) + trade_size
         position.quantity += quantity
         position.avg_entry_price = total_cost / position.quantity
         position.entry_count += 1
         position.last_buy_time = now
 
-        buy_fee = self.buy_fee(PAPER_TRADING.trade_size_usdc)
+        buy_fee = self.buy_fee(trade_size)
         slippage = self.slippage_cost("BUY", price, quantity)
-        self.cash_balance -= PAPER_TRADING.trade_size_usdc + buy_fee
+        self.cash_balance -= trade_size + buy_fee
 
         self._log_trade(
             timestamp=timestamp,
@@ -304,7 +338,7 @@ class PaperTrader:
             mid_price=price,
             price=execution_price,
             quantity=quantity,
-            trade_value=PAPER_TRADING.trade_size_usdc,
+            trade_value=trade_size,
             trade_realized_pnl=0.0,
             signal=signal,
             entry_count=position.entry_count,
@@ -341,18 +375,20 @@ class PaperTrader:
 
         execution_price = self.execution_price("SELL", price)
         position_value = position.quantity * execution_price
+        limits = self.trading_limits()
+        trade_size = limits.trade_size_usdc
 
-        if position_value <= PAPER_TRADING.trade_size_usdc:
+        if position_value <= trade_size:
             quantity = position.quantity
             trade_value = position_value
             entry_count = position.entry_count
         else:
-            trade_value = PAPER_TRADING.trade_size_usdc
+            trade_value = trade_size
             quantity = trade_value / execution_price
             entry_count = position.entry_count
 
             remaining_value = (position.quantity - quantity) * execution_price
-            if remaining_value < PAPER_TRADING.trade_size_usdc:
+            if remaining_value < trade_size:
                 quantity = position.quantity
                 trade_value = position_value
                 entry_count = position.entry_count
@@ -405,6 +441,7 @@ class PaperTrader:
             price=price,
             signal=signal,
             reason=reason,
+            trade_size_usdc=self.trading_limits().trade_size_usdc,
             throttle_state=self._blocked_message_last_printed,
         )
         self.maybe_print_blocked_summary(now)
@@ -424,6 +461,12 @@ class PaperTrader:
         fee: float,
         slippage: float,
     ) -> None:
+        coin_exposure = None
+        remaining_cash = None
+        if action == "BUY":
+            coin_exposure = self._get_position(coin).allocation_usdc
+            remaining_cash = self.cash_balance
+
         print_paper_trade_proposal(
             timestamp=timestamp,
             coin=coin,
@@ -433,6 +476,9 @@ class PaperTrader:
             signal=signal,
             fee=fee,
             slippage=slippage,
+            quantity=quantity if action == "BUY" else None,
+            coin_exposure=coin_exposure if action == "BUY" else None,
+            remaining_cash=self.cash_balance if action == "BUY" else None,
         )
 
         self.successful_trades_this_session += 1
@@ -548,9 +594,12 @@ def print_skipped_trade_proposal(
     signal: str,
     reason: str,
     *,
+    trade_size_usdc: float | None = None,
     throttle_state: dict[str, float] | None = None,
 ) -> None:
     """Print a readable skip message when risk rules block a fake trade."""
+    if trade_size_usdc is None:
+        trade_size_usdc = PAPER_TRADING.trade_size_usdc
     throttle_key = f"{coin}:{action}:{reason}"
     now = time.time()
 
@@ -568,7 +617,7 @@ def print_skipped_trade_proposal(
     print(f"     Coin:        {coin}")
     print(f"     Action:      {action} (skipped)")
     print(f"     Price:       ${price:,.2f}")
-    print(f"     Trade value: ${PAPER_TRADING.trade_size_usdc:,.2f}")
+    print(f"     Trade value: ${trade_size_usdc:,.2f}")
     print(f"     Signal:      {signal}")
     print(f"     Reason:      {reason}")
     print()
@@ -583,6 +632,9 @@ def print_paper_trade_proposal(
     signal: str,
     fee: float = 0.0,
     slippage: float = 0.0,
+    quantity: float | None = None,
+    coin_exposure: float | None = None,
+    remaining_cash: float | None = None,
 ) -> None:
     """Print a readable paper trade proposal when a simulated trade executes."""
     print()
@@ -592,6 +644,12 @@ def print_paper_trade_proposal(
     print(f"     Action:      {action}")
     print(f"     Price:       ${price:,.2f}")
     print(f"     Trade value: ${trade_value:,.2f}")
+    if action == "BUY" and quantity is not None:
+        print(f"     Quantity:    {format_quantity(quantity)} {coin}")
+    if action == "BUY" and coin_exposure is not None:
+        print(f"     Coin exposure: ${coin_exposure:,.2f}")
+    if action == "BUY" and remaining_cash is not None:
+        print(f"     Remaining cash: ${remaining_cash:,.2f}")
     print(f"     Signal:      {signal}")
     print(f"     Fee:         ${fee:,.4f}")
     print(f"     Slippage:    ${slippage:,.4f}")
@@ -625,10 +683,13 @@ def print_paper_trading_summary(
     total_equity = paper_trader.total_equity(current_prices)
     open_exposure = paper_trader.total_open_exposure()
     paused_label = "YES (equity protection)" if paper_trader.is_paused else "NO"
+    limits = paper_trader.trading_limits()
 
     print()
     print("Paper trading summary:")
     print("-" * 78)
+    if paper_trader.profile_id:
+        print(f"  Profile:         {paper_trader.profile_id}")
     if paper_trader.session_id:
         print(f"  Session ID:      {paper_trader.session_id}")
     if paper_trader.mode:
@@ -642,7 +703,7 @@ def print_paper_trading_summary(
     print(f"  Open exposure:   ${open_exposure:,.2f}")
     print(
         f"  Session trades:  {paper_trader.successful_trades_this_session}"
-        f" / {PAPER_TRADING.max_successful_trades_per_session}"
+        f" / {limits.max_successful_trades_per_session}"
     )
     print()
     print(
