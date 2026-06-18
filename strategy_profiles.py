@@ -12,6 +12,7 @@ from typing import Any
 
 from config import PAPER_TRADING, SIGNAL, SignalThresholds
 from market_analyzer import WINDOW_1M_SECONDS
+from profile_validation import validate_profile_fields, validate_thresholds
 from strategy_types import TradingLimits
 
 
@@ -98,6 +99,30 @@ STRATEGY_PROFILES: dict[str, StrategyProfile] = {
         thresholds=SIGNAL.production,
         **_base_limits(),
     ),
+    "contrarian_v1_entry_medium": StrategyProfile(
+        profile_id="contrarian_v1_entry_medium",
+        strategy_name="contrarian_v1",
+        strategy_version="1.0.0",
+        thresholds=SignalThresholds(
+            strong_up_pct=SIGNAL.test_mode.strong_up_pct,
+            up_pct=SIGNAL.test_mode.up_pct,
+            strong_down_pct=-0.25,
+            down_pct=-0.15,
+        ),
+        **_base_limits(),
+    ),
+    "contrarian_v1_entry_selective": StrategyProfile(
+        profile_id="contrarian_v1_entry_selective",
+        strategy_name="contrarian_v1",
+        strategy_version="1.0.0",
+        thresholds=SignalThresholds(
+            strong_up_pct=SIGNAL.test_mode.strong_up_pct,
+            up_pct=SIGNAL.test_mode.up_pct,
+            strong_down_pct=-0.40,
+            down_pct=-0.25,
+        ),
+        **_base_limits(),
+    ),
     "contrarian_v1_size_300_test": StrategyProfile(
         profile_id="contrarian_v1_size_300_test",
         strategy_name="contrarian_v1",
@@ -124,7 +149,17 @@ def get_profile(profile_id: str) -> StrategyProfile:
     if profile_id not in STRATEGY_PROFILES:
         known = ", ".join(sorted(STRATEGY_PROFILES))
         raise KeyError(f"Unknown profile {profile_id!r}. Known profiles: {known}")
-    return STRATEGY_PROFILES[profile_id]
+    profile = STRATEGY_PROFILES[profile_id]
+    validate_profile_fields(profile)
+    return profile
+
+
+def _validate_all_profiles() -> None:
+    for profile in STRATEGY_PROFILES.values():
+        validate_profile_fields(profile)
+
+
+_validate_all_profiles()
 
 
 def list_profile_ids() -> list[str]:

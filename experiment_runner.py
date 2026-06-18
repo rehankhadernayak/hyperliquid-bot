@@ -23,6 +23,7 @@ from config import DATA, DEFAULT_EXPERIMENT, EVIDENCE, VERSION
 from experiment_evidence import assess_evidence
 from experiment_metrics import compute_period_metrics
 from experiment_overfitting import collect_overfitting_warnings
+from experiment_threshold_comparison import build_threshold_comparison
 from experiment_split import (
     ChronologicalSplit,
     split_timestamps_chronologically,
@@ -33,6 +34,7 @@ from market_analyzer import PriceHistory, update_start_prices
 from market_analyzer import record_price_history, rolling_percent_change
 from strategies import get_strategy
 from strategy_profiles import StrategyProfile, get_profile
+from profile_validation import validate_profile_fields
 from strategy_types import StrategyContext
 
 
@@ -171,6 +173,7 @@ def run_profile_period(
             "fees_paid": 0.0,
             "slippage_cost": 0.0,
             "gross_profit": 0.0,
+            "costs_pct_of_gross_profit": "N/A",
             "total_buys": 0,
             "total_sells": 0,
             "completed_trades": 0,
@@ -221,6 +224,8 @@ def run_experiment(
         raise FileNotFoundError(f"Price log not found: {csv_path}")
 
     profiles = [get_profile(profile_id) for profile_id in profile_ids]
+    for profile in profiles:
+        validate_profile_fields(profile)
     timestamps, prices_by_timestamp = load_price_ticks(csv_path)
     if not timestamps:
         raise ValueError(f"No price rows found in {csv_path}")
@@ -308,6 +313,8 @@ def run_experiment(
             "walk_forward": walk_forward_results,
         }
 
+    threshold_comparison = build_threshold_comparison(profile_results)
+
     return {
         "experiment_id": experiment_id,
         "version": VERSION,
@@ -337,6 +344,7 @@ def run_experiment(
         },
         "warnings": global_warnings,
         "profile_results": profile_results,
+        "threshold_comparison": threshold_comparison,
     }
 
 
@@ -418,6 +426,17 @@ def main() -> None:
         )
         for warning in payload["overfitting_warnings"]:
             print(f"    warning: {warning}")
+
+    comparison = results.get("threshold_comparison")
+    if comparison:
+        print("\nThreshold comparison vs contrarian_v1_test:")
+        for variant_id, summary in comparison.get("comparisons", {}).items():
+            print(
+                f"  {variant_id}: {summary['label']} | "
+                f"trade reduction={summary['trade_count_reduction_vs_baseline']} | "
+                f"OOS return diff={summary['oos_return_difference_vs_baseline']:+.2f}% | "
+                f"cost reduction=${summary['total_cost_reduction_vs_baseline']:.2f}"
+            )
 
     print(
         "\nHistorical and paper results do not guarantee future performance."

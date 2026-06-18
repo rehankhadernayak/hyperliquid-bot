@@ -102,6 +102,9 @@ def compute_period_metrics(
     if closed_trades:
         return_per_trade = trader.realized_pnl / closed_trades
 
+    total_costs = trader.total_fees_paid + trader.total_slippage_cost
+    costs_pct_of_gross_profit = _costs_pct_of_gross_profit(gross_profit, total_costs)
+
     return {
         "period_label": period_label,
         "starting_equity": round(starting_equity, 2),
@@ -111,6 +114,7 @@ def compute_period_metrics(
         "fees_paid": round(trader.total_fees_paid, 2),
         "slippage_cost": round(trader.total_slippage_cost, 2),
         "gross_profit": round(gross_profit, 2),
+        "costs_pct_of_gross_profit": costs_pct_of_gross_profit,
         "total_buys": len(buy_trades),
         "total_sells": len(sell_trades),
         "completed_trades": closed_trades,
@@ -140,6 +144,12 @@ def compute_period_metrics(
         "trade_log": _serialize_trades(trader.trade_log),
         "paused_during_period": trader.is_paused,
     }
+
+
+def _costs_pct_of_gross_profit(gross_profit: float, total_costs: float) -> float | str | None:
+    if gross_profit <= 0:
+        return "N/A"
+    return round((total_costs / gross_profit) * 100, 2)
 
 
 def _format_profit_factor(value: float | None) -> float | str | None:

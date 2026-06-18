@@ -492,6 +492,48 @@ def _coin_results_table(mode_label: str, block: dict) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
+def _format_costs_pct(value: float | str | None) -> str:
+    if value is None:
+        return "—"
+    if value == "N/A":
+        return "N/A"
+    return f"{value:.2f}%"
+
+
+def _contrarian_threshold_profiles(profile_results: dict) -> list[str]:
+    """Return contrarian entry-threshold profiles present in an experiment."""
+    known = (
+        "contrarian_v1_test",
+        "contrarian_v1_entry_medium",
+        "contrarian_v1_entry_selective",
+    )
+    return [profile_id for profile_id in known if profile_id in profile_results]
+
+
+def _threshold_summary_row(profile_id: str, payload: dict) -> dict:
+    profile = payload.get("profile", {})
+    thresholds = profile.get("thresholds", {})
+    oos = payload.get("out_of_sample", {})
+    dev = payload.get("development", {})
+    combined = payload.get("combined", {})
+    return {
+        "Profile": profile_id,
+        "DOWN (%)": thresholds.get("down_pct"),
+        "STRONG_DOWN (%)": thresholds.get("strong_down_pct"),
+        "UP (%)": thresholds.get("up_pct"),
+        "STRONG_UP (%)": thresholds.get("strong_up_pct"),
+        "Dev return (%)": dev.get("net_return_pct"),
+        "OOS return (%)": oos.get("net_return_pct"),
+        "Combined return (%)": combined.get("net_return_pct"),
+        "OOS completed trades": oos.get("completed_trades"),
+        "OOS fees": oos.get("fees_paid"),
+        "OOS slippage": oos.get("slippage_cost"),
+        "OOS profit factor": oos.get("profit_factor"),
+        "OOS max drawdown (%)": oos.get("maximum_drawdown_pct"),
+        "Evidence": payload.get("evidence_assessment", "—"),
+    }
+
+
 def _render_experiment_analysis() -> None:
     st.subheader("Experiment Analysis")
     st.caption(
@@ -533,6 +575,20 @@ def _render_experiment_analysis() -> None:
     )
 
     profile_results = experiment.get("profile_results", {})
+
+    contrarian_profiles = _contrarian_threshold_profiles(profile_results)
+    if contrarian_profiles:
+        st.markdown("**Contrarian entry thresholds (side by side)**")
+        st.caption(
+            "Wider thresholds may reduce trade frequency, but fewer trades do not "
+            "automatically mean better performance."
+        )
+        threshold_rows = [
+            _threshold_summary_row(profile_id, profile_results[profile_id])
+            for profile_id in contrarian_profiles
+        ]
+        st.dataframe(pd.DataFrame(threshold_rows), width="stretch", hide_index=True)
+
     comparison_rows = []
     for profile_id, payload in profile_results.items():
         dev = payload.get("development", {})
@@ -549,11 +605,41 @@ def _render_experiment_analysis() -> None:
                 "OOS profit factor": oos.get("profit_factor"),
                 "OOS fees": oos.get("fees_paid"),
                 "OOS slippage": oos.get("slippage_cost"),
+                "OOS costs % of gross": oos.get("costs_pct_of_gross_profit"),
             }
         )
 
     st.markdown("**Profile comparison**")
     st.dataframe(pd.DataFrame(comparison_rows), width="stretch", hide_index=True)
+
+    threshold_comparison = experiment.get("threshold_comparison")
+    if threshold_comparison:
+        st.markdown("**Threshold comparison vs contrarian_v1_test**")
+        st.caption(
+            "Labels are descriptive only — no automatic winner is declared. "
+            "See label rules in the experiment JSON."
+        )
+        comparison_summary_rows = []
+        for variant_id, summary in threshold_comparison.get("comparisons", {}).items():
+            comparison_summary_rows.append(
+                {
+                    "Variant": variant_id,
+                    "Label": summary.get("label"),
+                    "Trade reduction": summary.get("trade_count_reduction_vs_baseline"),
+                    "Fee reduction": summary.get("fee_reduction_vs_baseline"),
+                    "Slippage reduction": summary.get("slippage_reduction_vs_baseline"),
+                    "OOS return diff (%)": summary.get("oos_return_difference_vs_baseline"),
+                    "Profit factor diff": summary.get("profit_factor_difference_vs_baseline"),
+                    "Max drawdown diff (%)": summary.get(
+                        "maximum_drawdown_difference_vs_baseline"
+                    ),
+                }
+            )
+        st.dataframe(
+            pd.DataFrame(comparison_summary_rows),
+            width="stretch",
+            hide_index=True,
+        )
 
     selected_profile = st.selectbox(
         "Profile detail",
@@ -589,17 +675,21 @@ def _render_experiment_analysis() -> None:
             metric_cols[4].metric("Completed trades", str(metrics.get("completed_trades", 0)))
             metric_cols[5].metric("Win rate", _format_pct(metrics.get("win_rate_pct")))
 
-            detail_cols = st.columns(4)
+            detail_cols = st.columns(5)
             detail_cols[0].metric("Max drawdown", _format_pct(metrics.get("maximum_drawdown_pct")))
             detail_cols[1].metric(
                 "Profit factor",
                 _format_profit_factor(metrics.get("profit_factor")),
             )
             detail_cols[2].metric(
-                "Exposure time",
-                _format_pct(metrics.get("exposure_time_pct")),
+                "Costs % of gross",
+                _format_costs_pct(metrics.get("costs_pct_of_gross_profit")),
             )
             detail_cols[3].metric(
+                "Longest losing seq.",
+                str(metrics.get("longest_losing_sequence", 0)),
+            )
+            detail_cols[4].metric(
                 "Return / trade",
                 _format_money(metrics.get("return_per_completed_trade")),
             )
