@@ -8,6 +8,10 @@ from config import MARKET
 WINDOW_1M_SECONDS = 60
 WINDOW_5M_SECONDS = 300
 
+# Allow the nearest stored sample to be this many seconds after the ideal
+# lookback timestamp. Matches one polling interval by default.
+LOOKBACK_TOLERANCE_SECONDS = MARKET.polling_interval_seconds
+
 # Each coin's in-memory history is a list of (unix_time, price) tuples
 PriceHistory = dict[str, list[tuple[float, float]]]
 
@@ -44,38 +48,47 @@ def update_start_prices(start_prices: dict[str, float], mids: dict[str, str]) ->
             continue
 
 
+def history_retention_seconds() -> int:
+    """How long in-memory price history is kept beyond the 5-minute window."""
+    # Keep two polling intervals beyond the longest window so pruning does not
+    # remove the reference sample needed for 5-minute lookbacks.
+    return WINDOW_5M_SECONDS + (2 * MARKET.polling_interval_seconds)
+
+
 def record_price_history(
     price_history: PriceHistory,
     coin: str,
     price: float,
     now: float,
 ) -> None:
-    """Append the latest price and drop entries older than the 5-minute window."""
+    """Append the latest price and drop entries older than the retention window."""
     if coin not in price_history:
         price_history[coin] = []
 
     price_history[coin].append((now, price))
 
-    # Keep a little extra beyond 5 minutes so lookups stay accurate
-    cutoff = now - WINDOW_5M_SECONDS - MARKET.polling_interval_seconds
+    cutoff = now - history_retention_seconds()
     price_history[coin] = [(t, p) for t, p in price_history[coin] if t >= cutoff]
 
 
-def price_at_or_before(history: list[tuple[float, float]], target_time: float) -> float | None:
+def price_at_or_before(
+    history: list[tuple[float, float]],
+    target_time: float,
+) -> tuple[float, float] | None:
     """
-    Find the most recent stored price at or before target_time.
+    Find the most recent stored (time, price) at or before target_time.
 
     History entries are stored in time order (oldest first).
     """
-    reference_price = None
+    reference: tuple[float, float] | None = None
 
     for entry_time, entry_price in history:
         if entry_time <= target_time:
-            reference_price = entry_price
+            reference = (entry_time, entry_price)
         else:
             break
 
-    return reference_price
+    return reference
 
 
 def rolling_percent_change(
@@ -83,23 +96,38 @@ def rolling_percent_change(
     current_price: float,
     now: float,
     window_seconds: int,
+    *,
+    tolerance_seconds: int | None = None,
 ) -> float | None:
     """
     Calculate approximate percentage change over a rolling time window.
 
-    Returns None when we do not yet have a price old enough for the window.
+    Uses the nearest valid sample at or before ``now - window_seconds``.
+    When no sample exists at or before the target, the oldest stored sample
+    may be used if it falls within ``tolerance_seconds`` after the target.
+
+    Returns None when insufficient history genuinely exists.
     """
     if not history:
         return None
 
+    tolerance = (
+        LOOKBACK_TOLERANCE_SECONDS
+        if tolerance_seconds is None
+        else tolerance_seconds
+    )
     target_time = now - window_seconds
 
-    # The oldest entry must be at or before the window start
-    if history[0][0] > target_time:
-        return None
+    reference = price_at_or_before(history, target_time)
+    if reference is None:
+        oldest_time, oldest_price = history[0]
+        if oldest_time - target_time <= tolerance:
+            reference = (oldest_time, oldest_price)
+        else:
+            return None
 
-    reference_price = price_at_or_before(history, target_time)
-    if reference_price is None:
+    reference_time, reference_price = reference
+    if reference_time - target_time > tolerance:
         return None
 
     return percent_change(reference_price, current_price)

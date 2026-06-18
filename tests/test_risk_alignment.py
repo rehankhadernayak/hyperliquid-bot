@@ -232,29 +232,6 @@ class TestRecommendationPaperTraderAlignment:
                 10_000.0,
                 "session trade limit reached",
             ),
-            (
-                lambda t: (
-                    setattr(
-                        t,
-                        "successful_trades_this_session",
-                        t.session_trade_limit(),
-                    ),
-                    t.positions.update(
-                        {
-                            "BTC": Position(
-                                quantity=1.0,
-                                avg_entry_price=100.0,
-                                entry_count=1,
-                            )
-                        }
-                    ),
-                ),
-                "BTC",
-                "UP",
-                110.0,
-                10_000.0,
-                "session trade limit reached",
-            ),
         ],
     )
     def test_blocked_recommendation_matches_paper_trader_reason(
@@ -316,3 +293,23 @@ class TestRecommendationPaperTraderAlignment:
 
         assert trader.cash_balance == cash_before
         assert trader.successful_trades_this_session == trades_before
+
+    def test_session_limit_allows_risk_reducing_exits(
+        self,
+        temp_data_paths,
+        silent_trade_output,
+    ):
+        trader = _trader_with_open_btc()
+        trader.successful_trades_this_session = trader.session_trade_limit()
+
+        decision = _decide(trader, coin="BTC", signal="UP", price=110.0, now=10_000.0)
+
+        assert decision.recommendation == RECOMMENDATION_SELL
+        assert _paper_block_reason(trader, "BTC", "UP", 10_000.0) is None
+
+        before = _snapshot_trader(trader)
+        _apply_paper_signal(trader, coin="BTC", signal="UP", price=110.0, now=10_000.0)
+        after = _snapshot_trader(trader)
+
+        assert after != before
+        assert after["successful_trades_this_session"] == before["successful_trades_this_session"] + 1

@@ -150,6 +150,15 @@ def _render_session_summary(snapshot: dict | None) -> None:
     cols[6].metric("Session Trades", f"{session_trades} / {max_session_trades}")
     cols[7].metric("Paused", paused_label)
 
+    open_positions = decision_summary.get("open_positions", 0)
+    if session_trades >= max_session_trades and open_positions:
+        st.warning(
+            "**SESSION TRADE LIMIT REACHED**\n\n"
+            "New exposure is blocked.\n\n"
+            "Risk-reducing exits remain allowed.\n\n"
+            f"Open positions: {open_positions}"
+        )
+
     session_id = paper.get("session_id") or snapshot.get("session_id", "")
     st.caption(
         f"Session ID: `{session_id or 'unknown'}` | "

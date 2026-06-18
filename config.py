@@ -55,6 +55,8 @@ class PaperTradingConfig:
     min_equity_before_pause_usdc: float
     trading_fee_pct: float
     slippage_pct: float
+    blocked_message_throttle_seconds: int
+    force_close_on_shutdown: bool
 
 
 @dataclass
@@ -168,6 +170,8 @@ PAPER_TRADING = PaperTradingConfig(
     min_equity_before_pause_usdc=980.0,
     trading_fee_pct=0.05,
     slippage_pct=0.02,
+    blocked_message_throttle_seconds=60,
+    force_close_on_shutdown=False,
 )
 
 

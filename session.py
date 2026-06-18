@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
 import uuid
 from dataclasses import asdict
 
@@ -13,6 +15,8 @@ from config import (
     TEST_MODE,
     VERSION,
 )
+
+LIVE_STRATEGY_PROFILE = "contrarian_v1"
 
 
 def generate_session_id() -> str:
@@ -31,6 +35,7 @@ def session_config_snapshot(*, test_mode: bool = TEST_MODE) -> dict:
         "version": VERSION,
         "test_mode": test_mode,
         "mode": mode_label(test_mode),
+        "strategy_profile": LIVE_STRATEGY_PROFILE,
         "market": asdict(MARKET),
         "signal_thresholds": asdict(SIGNAL.test_mode if test_mode else SIGNAL.production),
         "paper_trading": asdict(PAPER_TRADING),
@@ -40,6 +45,12 @@ def session_config_snapshot(*, test_mode: bool = TEST_MODE) -> dict:
         },
         "backtest_defaults": asdict(DEFAULT_BACKTEST),
     }
+
+
+def configuration_hash(config_snapshot: dict) -> str:
+    """Return a stable SHA-256 hash of the session configuration snapshot."""
+    payload = json.dumps(config_snapshot, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
 
 
 def save_session_config(session_id: str, config_snapshot: dict, output_dir) -> None:

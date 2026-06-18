@@ -29,10 +29,11 @@ from paper_trader import PaperTrader
 import session
 import session_report
 import signals
+from session_report import SessionShutdownContext
 from signals import apply_signal_thresholds
 
 
-def run_analyzer(session_id: str, mode: str) -> None:
+def run_analyzer(session_id: str, mode: str, config_snapshot: dict) -> None:
     """
     Fetch prices, track history, and print analysis in a loop.
 
@@ -61,67 +62,148 @@ def run_analyzer(session_id: str, mode: str) -> None:
         f"{PAPER_TRADING.max_successful_trades_per_session} trades/session, "
         f"pause below ${PAPER_TRADING.min_equity_before_pause_usdc:,.0f} equity"
     )
+    if PAPER_TRADING.force_close_on_shutdown:
+        print("Shutdown policy: open positions will be force-closed on exit.")
+    else:
+        print(
+            "Shutdown policy: open positions are preserved in the session report "
+            "(no force-close)."
+        )
 
     start_prices: dict[str, float] = {}
     price_history: PriceHistory = {}
     paper_trader = PaperTrader(session_id=session_id, mode=mode)
+    last_current_prices: dict[str, float] = {}
 
-    while True:
-        try:
-            mids = fetch_all_mids()
-            update_start_prices(start_prices, mids)
+    try:
+        while True:
+            try:
+                mids = fetch_all_mids()
+                update_start_prices(start_prices, mids)
 
-            now = time.time()
-            timestamp = current_timestamp()
+                now = time.time()
+                timestamp = current_timestamp()
 
-            snapshot = build_snapshot(
-                mids,
-                start_prices,
-                price_history,
-                TEST_MODE,
-                paper_trader=None,
-                timestamp=timestamp,
-                now=now,
-                session_id=session_id,
-            )
-
-            current_prices = current_prices_from_rows(snapshot.market_rows)
-            paper_trader.update_session_risk(current_prices)
-
-            for coin, signal, current_price in tradable_signals_from_rows(
-                snapshot.market_rows
-            ):
-                paper_trader.process_signal(
-                    coin, signal, current_price, timestamp, now
+                snapshot = build_snapshot(
+                    mids,
+                    start_prices,
+                    price_history,
+                    TEST_MODE,
+                    paper_trader=None,
+                    timestamp=timestamp,
+                    now=now,
+                    session_id=session_id,
                 )
 
-            snapshot = build_snapshot(
-                mids,
-                start_prices,
-                price_history,
-                TEST_MODE,
-                paper_trader=paper_trader,
-                timestamp=timestamp,
-                now=now,
-                market_rows=snapshot.market_rows,
-                session_id=session_id,
-            )
+                current_prices = current_prices_from_rows(snapshot.market_rows)
+                if current_prices:
+                    last_current_prices = current_prices
 
-            print_snapshot(snapshot)
-            save_recommendations_json(snapshot)
-            append_equity_snapshot(
-                timestamp=timestamp,
-                session_id=session_id,
-                mode=mode,
-                paper_trader=paper_trader,
-                current_prices=current_prices,
-            )
-            append_prices_to_csv(mids, timestamp)
-        except Exception as exc:
-            print(f"\n[{current_timestamp()}]")
-            handle_request_error(exc)
+                paper_trader.update_session_risk(current_prices)
 
-        time.sleep(MARKET.polling_interval_seconds)
+                for coin, signal, current_price in tradable_signals_from_rows(
+                    snapshot.market_rows
+                ):
+                    paper_trader.process_signal(
+                        coin, signal, current_price, timestamp, now
+                    )
+
+                snapshot = build_snapshot(
+                    mids,
+                    start_prices,
+                    price_history,
+                    TEST_MODE,
+                    paper_trader=paper_trader,
+                    timestamp=timestamp,
+                    now=now,
+                    market_rows=snapshot.market_rows,
+                    session_id=session_id,
+                )
+
+                print_snapshot(snapshot)
+                save_recommendations_json(snapshot)
+                append_equity_snapshot(
+                    timestamp=timestamp,
+                    session_id=session_id,
+                    mode=mode,
+                    paper_trader=paper_trader,
+                    current_prices=current_prices,
+                )
+                append_prices_to_csv(mids, timestamp)
+            except Exception as exc:
+                print(f"\n[{current_timestamp()}]")
+                handle_request_error(exc)
+
+            time.sleep(MARKET.polling_interval_seconds)
+    except KeyboardInterrupt:
+        shutdown_time = time.time()
+        shutdown = SessionShutdownContext(
+            shutdown_reason="keyboard_interrupt",
+            started_at=paper_trader.started_at,
+            ended_at=shutdown_time,
+            current_prices=last_current_prices,
+            strategy_profile=config_snapshot.get("strategy_profile", ""),
+            configuration_hash=session.configuration_hash(config_snapshot),
+            session_trade_limit=paper_trader.session_trade_limit(),
+            blocked_proposals_total=paper_trader.blocked_proposals_total,
+            blocked_proposals_by_reason=dict(paper_trader.blocked_proposals_by_reason),
+        )
+
+        positions_force_closed = False
+        force_close_reason = None
+
+        if PAPER_TRADING.force_close_on_shutdown and last_current_prices:
+            open_before = sum(
+                1 for position in paper_trader.positions.values() if position.is_open
+            )
+            if open_before > 0:
+                force_close_reason = "force_close_on_shutdown enabled"
+                paper_trader.force_close_all_positions(
+                    last_current_prices,
+                    current_timestamp(),
+                )
+                positions_force_closed = True
+                append_equity_snapshot(
+                    timestamp=current_timestamp(),
+                    session_id=session_id,
+                    mode=mode,
+                    paper_trader=paper_trader,
+                    current_prices=last_current_prices,
+                )
+
+        shutdown.positions_force_closed = positions_force_closed
+        shutdown.force_close_reason = force_close_reason
+
+        print("\nAnalyzer stopped.")
+        if paper_trader.blocked_proposals_total > 0:
+            paper_trader.maybe_print_blocked_summary(shutdown_time)
+
+        open_positions = session_report.build_open_position_snapshots(
+            paper_trader,
+            last_current_prices,
+        )
+        if open_positions and not positions_force_closed:
+            print("Open positions preserved at shutdown:")
+            for position in open_positions:
+                print(
+                    f"  {position['coin']}: qty={position['quantity']}, "
+                    f"entry=${position['average_entry']:,.2f}, "
+                    f"price=${position['final_market_price']:,.2f}, "
+                    f"value=${position['position_value']:,.2f}, "
+                    f"unrealized={position['unrealized_pnl']:+,.2f}, "
+                    f"entries={position['entry_count']}"
+                )
+
+        try:
+            report_path = session_report.save_session_report(
+                session_id,
+                shutdown=shutdown,
+                paper_trader=paper_trader,
+            )
+            print(f"Session report saved to {report_path}")
+        except ValueError:
+            pass
+        sys.exit(0)
 
 
 def main() -> None:
@@ -132,16 +214,7 @@ def main() -> None:
     config_snapshot = session.session_config_snapshot(test_mode=TEST_MODE)
     session.save_session_config(session_id, config_snapshot, DATA.session_configs_dir)
 
-    try:
-        run_analyzer(session_id, mode)
-    except KeyboardInterrupt:
-        print("\nAnalyzer stopped.")
-        try:
-            report_path = session_report.save_session_report(session_id)
-            print(f"Session report saved to {report_path}")
-        except ValueError:
-            pass
-        sys.exit(0)
+    run_analyzer(session_id, mode, config_snapshot)
 
 
 if __name__ == "__main__":

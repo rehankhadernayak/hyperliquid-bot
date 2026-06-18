@@ -6,6 +6,7 @@ No wallet, signing, or real exchange orders — read-only simulation only.
 """
 
 import csv
+import time
 from dataclasses import dataclass, field
 
 from config import DATA, MARKET, PAPER_TRADING
@@ -84,6 +85,40 @@ class PaperTrader:
     session_id: str = ""
     mode: str = ""
     total_fees_paid: float = 0.0
+    total_slippage_cost: float = 0.0
+    started_at: float = field(default_factory=time.time)
+    blocked_proposals_total: int = 0
+    blocked_proposals_by_reason: dict[str, int] = field(default_factory=dict)
+    _blocked_message_last_printed: dict[str, float] = field(default_factory=dict)
+    _blocked_summary_last_printed: float = 0.0
+
+    def record_blocked_proposal(self, reason: str) -> None:
+        """Record a blocked trade proposal for session analytics."""
+        self.blocked_proposals_total += 1
+        self.blocked_proposals_by_reason[reason] = (
+            self.blocked_proposals_by_reason.get(reason, 0) + 1
+        )
+
+    def maybe_print_blocked_summary(self, now: float | None = None) -> None:
+        """Print a periodic summary of blocked proposals without log spam."""
+        if self.blocked_proposals_total == 0:
+            return
+
+        current = now if now is not None else time.time()
+        elapsed = current - self._blocked_summary_last_printed
+        if (
+            self._blocked_summary_last_printed > 0
+            and elapsed < PAPER_TRADING.blocked_message_throttle_seconds
+        ):
+            return
+
+        self._blocked_summary_last_printed = current
+        print()
+        print("  >> BLOCKED PROPOSAL SUMMARY")
+        print(f"     Total blocked: {self.blocked_proposals_total}")
+        for reason, count in sorted(self.blocked_proposals_by_reason.items()):
+            print(f"     - {reason}: {count}")
+        print()
 
     def total_open_exposure(self) -> float:
         """Sum of cost basis across all open positions (USDC tied up)."""
@@ -195,8 +230,34 @@ class PaperTrader:
         """Return the USDC cost of slippage relative to the mid price."""
         execution_price = self.execution_price(action, mid_price)
         if action == "BUY":
-            return max((execution_price - mid_price) * quantity, 0.0)
-        return max((mid_price - execution_price) * quantity, 0.0)
+            cost = max((execution_price - mid_price) * quantity, 0.0)
+        else:
+            cost = max((mid_price - execution_price) * quantity, 0.0)
+        self.total_slippage_cost += cost
+        return cost
+
+    def force_close_all_positions(
+        self,
+        current_prices: dict[str, float],
+        timestamp: str,
+    ) -> None:
+        """Close every open position at current mids (optional shutdown only)."""
+        for coin in MARKET.watchlist:
+            position = self.positions.get(coin)
+            if position is None or not position.is_open:
+                continue
+
+            current_price = current_prices.get(coin)
+            if current_price is None:
+                continue
+
+            self._fake_sell(
+                coin,
+                current_price,
+                timestamp,
+                "FORCED_CLOSE",
+                bypass_risk_checks=True,
+            )
 
     def _fake_buy(
         self,
@@ -208,13 +269,14 @@ class PaperTrader:
     ) -> None:
         block_reason = buy_block_reason(self, coin, now)
         if block_reason is not None:
-            print_skipped_trade_proposal(
+            self._handle_blocked_proposal(
                 timestamp=timestamp,
                 coin=coin,
                 action="BUY",
                 price=price,
                 signal=signal,
                 reason=block_reason,
+                now=now,
             )
             return
 
@@ -250,23 +312,32 @@ class PaperTrader:
             slippage=slippage,
         )
 
-    def _fake_sell(self, coin: str, price: float, timestamp: str, signal: str) -> None:
+    def _fake_sell(
+        self,
+        coin: str,
+        price: float,
+        timestamp: str,
+        signal: str,
+        *,
+        bypass_risk_checks: bool = False,
+    ) -> None:
         position = self._get_position(coin)
 
         if not position.is_open:
             return
 
-        block_reason = sell_block_reason(self, coin)
-        if block_reason is not None:
-            print_skipped_trade_proposal(
-                timestamp=timestamp,
-                coin=coin,
-                action="SELL",
-                price=price,
-                signal=signal,
-                reason=block_reason,
-            )
-            return
+        if not bypass_risk_checks:
+            block_reason = sell_block_reason(self, coin)
+            if block_reason is not None:
+                self._handle_blocked_proposal(
+                    timestamp=timestamp,
+                    coin=coin,
+                    action="SELL",
+                    price=price,
+                    signal=signal,
+                    reason=block_reason,
+                )
+                return
 
         execution_price = self.execution_price("SELL", price)
         position_value = position.quantity * execution_price
@@ -313,6 +384,30 @@ class PaperTrader:
             fee=sell_fee,
             slippage=slippage,
         )
+
+    def _handle_blocked_proposal(
+        self,
+        *,
+        timestamp: str,
+        coin: str,
+        action: str,
+        price: float,
+        signal: str,
+        reason: str,
+        now: float | None = None,
+    ) -> None:
+        """Record and optionally print a throttled blocked-proposal message."""
+        self.record_blocked_proposal(reason)
+        print_skipped_trade_proposal(
+            timestamp=timestamp,
+            coin=coin,
+            action=action,
+            price=price,
+            signal=signal,
+            reason=reason,
+            throttle_state=self._blocked_message_last_printed,
+        )
+        self.maybe_print_blocked_summary(now)
 
     def _log_trade(
         self,
@@ -452,8 +547,21 @@ def print_skipped_trade_proposal(
     price: float,
     signal: str,
     reason: str,
+    *,
+    throttle_state: dict[str, float] | None = None,
 ) -> None:
     """Print a readable skip message when risk rules block a fake trade."""
+    throttle_key = f"{coin}:{action}:{reason}"
+    now = time.time()
+
+    if throttle_state is not None:
+        last_printed = throttle_state.get(throttle_key, 0.0)
+        if last_printed > 0 and (
+            now - last_printed
+        ) < PAPER_TRADING.blocked_message_throttle_seconds:
+            return
+        throttle_state[throttle_key] = now
+
     print()
     print("  >> SKIPPED PAPER TRADE PROPOSAL")
     print(f"     Timestamp:   {timestamp}")

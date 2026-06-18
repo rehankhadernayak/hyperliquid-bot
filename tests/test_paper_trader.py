@@ -208,7 +208,7 @@ class TestPaperTraderRiskRules:
         )
         assert trader.cash_balance == cash_before_blocked_buy
 
-    def test_session_trade_limit_blocks_buy_and_sell(
+    def test_session_trade_limit_blocks_buy_allows_sell(
         self, temp_data_paths, silent_trade_output
     ):
         trader = PaperTrader()
@@ -228,8 +228,9 @@ class TestPaperTraderRiskRules:
 
         _sell(trader, price=110.0)
 
-        assert trader.positions["BTC"].is_open
-        assert trader.cash_balance == cash_with_open_position
+        assert not trader.positions["BTC"].is_open
+        assert trader.cash_balance > cash_with_open_position
+        assert trader.successful_trades_this_session == trader.session_trade_limit() + 1
 
     def test_equity_protection_pauses_trading(
         self, temp_data_paths, silent_trade_output

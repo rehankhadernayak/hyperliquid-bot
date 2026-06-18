@@ -247,7 +247,7 @@ class TestBlockingRules:
         assert decision.recommendation == RECOMMENDATION_BLOCKED
         assert decision.primary_reason == "total exposure reached"
 
-    def test_session_trade_limit_blocks_buy_and_sell(self):
+    def test_session_trade_limit_blocks_buy_allows_sell(self):
         trader = PaperTrader()
         trader.successful_trades_this_session = trader.session_trade_limit()
         trader.positions["BTC"] = Position(
@@ -279,8 +279,8 @@ class TestBlockingRules:
 
         assert buy_decision.recommendation == RECOMMENDATION_BLOCKED
         assert buy_decision.primary_reason == "session trade limit reached"
-        assert sell_decision.recommendation == RECOMMENDATION_BLOCKED
-        assert sell_decision.primary_reason == "session trade limit reached"
+        assert sell_decision.recommendation == RECOMMENDATION_SELL
+        assert sell_decision.primary_reason == "UP signal — paper sell with open position"
 
     def test_equity_protection_blocks_buy(self):
         trader = PaperTrader()

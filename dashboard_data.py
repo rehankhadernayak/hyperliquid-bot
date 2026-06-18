@@ -336,6 +336,9 @@ def compute_drawdown_series(equity: pd.DataFrame) -> pd.DataFrame:
 
 def pnl_by_coin(trades: pd.DataFrame) -> dict[str, dict]:
     """Build per-coin trade stats from normalized paper trades."""
+    if trades.empty or "coin" not in trades.columns:
+        return {}
+
     results: dict[str, dict] = {}
 
     for coin in sorted(trades["coin"].dropna().unique()):
