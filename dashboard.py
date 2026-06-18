@@ -500,6 +500,51 @@ def _format_costs_pct(value: float | str | None) -> str:
     return f"{value:.2f}%"
 
 
+def _exit_strategy_profiles(profile_results: dict) -> list[str]:
+    """Return exit experiment profiles present in an experiment."""
+    known = (
+        "contrarian_v1_entry_medium",
+        "contrarian_v1_medium_signal_exit",
+        "contrarian_v1_medium_tp25_sl25",
+        "contrarian_v1_medium_tp35_sl25",
+        "contrarian_v1_medium_tp50_sl30",
+        "contrarian_v1_medium_tp35_sl25_maxhold",
+        "hold_baseline",
+    )
+    return [profile_id for profile_id in known if profile_id in profile_results]
+
+
+def _exit_summary_row(profile_id: str, payload: dict) -> dict:
+    profile = payload.get("profile", {})
+    thresholds = profile.get("thresholds", {})
+    exit_config = profile.get("exit_config") or {}
+    oos = payload.get("out_of_sample", {})
+    dev = payload.get("development", {})
+    comparison_label = payload.get("exit_comparison_label", "—")
+    return {
+        "Profile": profile_id,
+        "DOWN (%)": thresholds.get("down_pct"),
+        "STRONG_DOWN (%)": thresholds.get("strong_down_pct"),
+        "Take-profit (%)": exit_config.get("take_profit_pct"),
+        "Stop-loss (%)": exit_config.get("stop_loss_pct"),
+        "Max hold (s)": exit_config.get("max_hold_seconds"),
+        "Exit mode": exit_config.get("exit_mode", "legacy_signal"),
+        "Dev return (%)": dev.get("net_return_pct"),
+        "OOS return (%)": oos.get("net_return_pct"),
+        "Completed trades": oos.get("completed_trades"),
+        "TP exits": oos.get("take_profit_exits"),
+        "SL exits": oos.get("stop_loss_exits"),
+        "Avg net return/trade": oos.get("average_net_return_per_trade"),
+        "Avg holding (s)": oos.get("average_holding_seconds"),
+        "Profit factor": oos.get("profit_factor"),
+        "Drawdown (%)": oos.get("maximum_drawdown_pct"),
+        "Fees": oos.get("fees_paid"),
+        "Slippage": oos.get("slippage_cost"),
+        "Evidence": payload.get("evidence_assessment", "—"),
+        "Comparison label": comparison_label,
+    }
+
+
 def _contrarian_threshold_profiles(profile_results: dict) -> list[str]:
     """Return contrarian entry-threshold profiles present in an experiment."""
     known = (
@@ -575,6 +620,70 @@ def _render_experiment_analysis() -> None:
     )
 
     profile_results = experiment.get("profile_results", {})
+
+    exit_profiles = _exit_strategy_profiles(profile_results)
+    exit_comparison = experiment.get("exit_comparison")
+    if exit_profiles:
+        st.markdown("**Exit Strategy Comparison**")
+        st.caption(
+            "Exit targets can change trade duration and risk. "
+            "Better historical results do not guarantee future performance."
+        )
+        if exit_comparison:
+            for variant_id, summary in exit_comparison.get("comparisons", {}).items():
+                if variant_id in profile_results:
+                    profile_results[variant_id]["exit_comparison_label"] = summary.get(
+                        "label", "—"
+                    )
+        exit_rows = [
+            _exit_summary_row(profile_id, profile_results[profile_id])
+            for profile_id in exit_profiles
+        ]
+        st.dataframe(pd.DataFrame(exit_rows), width="stretch", hide_index=True)
+
+        if exit_comparison:
+            st.caption(
+                f"Baseline: {exit_comparison.get('baseline_profile')} — "
+                "labels are descriptive only."
+            )
+            exit_comparison_rows = []
+            for variant_id, summary in exit_comparison.get("comparisons", {}).items():
+                exit_comparison_rows.append(
+                    {
+                        "Variant": variant_id,
+                        "Label": summary.get("label"),
+                        "OOS return diff (%)": summary.get(
+                            "oos_return_difference_vs_baseline"
+                        ),
+                        "Trade diff": summary.get(
+                            "completed_trade_difference_vs_baseline"
+                        ),
+                        "Avg net/trade diff": summary.get(
+                            "average_net_return_per_trade_difference_vs_baseline"
+                        ),
+                        "Profit factor diff": summary.get(
+                            "profit_factor_difference_vs_baseline"
+                        ),
+                        "Drawdown diff (%)": summary.get(
+                            "maximum_drawdown_difference_vs_baseline"
+                        ),
+                        "Cost diff": summary.get("total_cost_difference_vs_baseline"),
+                        "Holding time diff (s)": summary.get(
+                            "average_holding_time_difference_vs_baseline"
+                        ),
+                        "SL exit diff": summary.get(
+                            "stop_loss_exit_difference_vs_baseline"
+                        ),
+                        "TP exit diff": summary.get(
+                            "take_profit_exit_difference_vs_baseline"
+                        ),
+                    }
+                )
+            st.dataframe(
+                pd.DataFrame(exit_comparison_rows),
+                width="stretch",
+                hide_index=True,
+            )
 
     contrarian_profiles = _contrarian_threshold_profiles(profile_results)
     if contrarian_profiles:

@@ -60,6 +60,7 @@ class Position:
     avg_entry_price: float = 0.0
     entry_count: int = 0
     last_buy_time: float | None = None
+    opened_at: float | None = None
 
     @property
     def is_open(self) -> bool:

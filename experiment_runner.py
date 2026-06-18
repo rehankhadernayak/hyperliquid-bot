@@ -21,6 +21,7 @@ from typing import Any
 from backtester import load_price_ticks, parse_timestamp, prices_to_mids
 from config import DATA, DEFAULT_EXPERIMENT, EVIDENCE, VERSION
 from experiment_evidence import assess_evidence
+from experiment_exit_comparison import build_exit_comparison
 from experiment_metrics import compute_period_metrics
 from experiment_overfitting import collect_overfitting_warnings
 from experiment_threshold_comparison import build_threshold_comparison
@@ -30,8 +31,14 @@ from experiment_split import (
     walk_forward_folds,
 )
 from experiment_trader import ExperimentPaperTrader
+from exit_evaluator import (
+    build_position_exit_context,
+    evaluate_position_exit,
+    should_skip_signal_sell,
+)
 from market_analyzer import PriceHistory, update_start_prices
 from market_analyzer import record_price_history, rolling_percent_change
+from paper_trader import BUY_SIGNALS, SELL_SIGNALS
 from strategies import get_strategy
 from strategy_profiles import StrategyProfile, get_profile
 from profile_validation import validate_profile_fields
@@ -84,6 +91,99 @@ def _evaluate_tradable_signal(
     return result.signal
 
 
+def _trader_state_snapshot(trader: ExperimentPaperTrader) -> dict:
+    return {
+        "cash_balance": trader.cash_balance,
+        "realized_pnl": trader.realized_pnl,
+        "is_paused": trader.is_paused,
+        "successful_trades_this_session": trader.successful_trades_this_session,
+    }
+
+
+def _process_coin_tick(
+    *,
+    strategy,
+    profile: StrategyProfile,
+    coin: str,
+    price: float,
+    price_history: PriceHistory,
+    timestamp: str,
+    now: float,
+    trader: ExperimentPaperTrader,
+) -> None:
+    """Evaluate entry and position-aware exits for one coin at one timestamp."""
+    exit_config = profile.exit_config
+    position = trader._get_position(coin)
+
+    if exit_config is not None and position.is_open:
+        exit_context = build_position_exit_context(
+            coin=coin,
+            current_price=price,
+            avg_entry_price=position.avg_entry_price,
+            quantity=position.quantity,
+            opened_at=position.opened_at,
+            entry_count=position.entry_count,
+            now=now,
+            price_history=price_history,
+            trader_state=_trader_state_snapshot(trader),
+            profile=profile,
+            lookback_seconds=profile.lookback_seconds,
+            thresholds=profile.thresholds,
+        )
+        exit_result = evaluate_position_exit(
+            exit_context,
+            exit_config,
+            strategy_name=profile.strategy_name,
+            strategy_version=profile.strategy_version,
+        )
+        trader.run_state.exit_ambiguity_warnings.extend(exit_result.ambiguity_warnings)
+        if exit_result.action == "SELL":
+            trader.process_position_exit(coin, price, timestamp, now, exit_result)
+            return
+
+    if exit_config is not None:
+        history = price_history.get(coin, [])
+        change_since_start = rolling_percent_change(
+            history,
+            price,
+            now,
+            profile.lookback_seconds,
+        )
+        if change_since_start is None:
+            return
+
+        context = StrategyContext(
+            coin=coin,
+            current_price=price,
+            price_history=price_history,
+            timestamp=timestamp,
+            now=now,
+            trader=trader,
+            thresholds=profile.thresholds,
+            lookback_seconds=profile.lookback_seconds,
+        )
+        result = strategy.evaluate(context)
+        if result.signal in BUY_SIGNALS:
+            trader.process_signal(coin, result.signal, price, timestamp, now)
+        elif result.signal in SELL_SIGNALS and not should_skip_signal_sell(exit_config):
+            trader.process_signal(coin, result.signal, price, timestamp, now)
+        return
+
+    signal = _evaluate_tradable_signal(
+        strategy,
+        profile,
+        coin,
+        price,
+        price_history,
+        timestamp,
+        now,
+        trader,
+    )
+    if signal is None:
+        return
+    trader.process_signal(coin, signal, price, timestamp, now)
+
+
 def replay_profile(
     timestamps: list[str],
     prices_by_timestamp: dict[str, dict[str, float]],
@@ -125,19 +225,16 @@ def replay_profile(
             if coin not in start_prices:
                 continue
 
-            signal = _evaluate_tradable_signal(
-                strategy,
-                profile,
-                coin,
-                price,
-                price_history,
-                timestamp,
-                now,
-                trader,
+            _process_coin_tick(
+                strategy=strategy,
+                profile=profile,
+                coin=coin,
+                price=price,
+                price_history=price_history,
+                timestamp=timestamp,
+                now=now,
+                trader=trader,
             )
-            if signal is None:
-                continue
-            trader.process_signal(coin, signal, price, timestamp, now)
 
         trader.record_exposure_tick(current_prices)
         equity_curve.append(trader.total_equity(current_prices))
@@ -205,6 +302,7 @@ def run_profile_period(
         current_prices,
         period_label=period_label,
         limits=profile.trading_limits(),
+        profile=profile,
     )
 
 
@@ -311,9 +409,16 @@ def run_experiment(
             "evidence_assessment": evidence,
             "overfitting_warnings": warnings,
             "walk_forward": walk_forward_results,
+            "exit_ambiguity_warnings": list(
+                dict.fromkeys(
+                    development_metrics.get("exit_ambiguity_warnings", [])
+                    + out_of_sample_metrics.get("exit_ambiguity_warnings", [])
+                )
+            ),
         }
 
     threshold_comparison = build_threshold_comparison(profile_results)
+    exit_comparison = build_exit_comparison(profile_results)
 
     return {
         "experiment_id": experiment_id,
@@ -345,6 +450,7 @@ def run_experiment(
         "warnings": global_warnings,
         "profile_results": profile_results,
         "threshold_comparison": threshold_comparison,
+        "exit_comparison": exit_comparison,
     }
 
 
@@ -427,8 +533,17 @@ def main() -> None:
         for warning in payload["overfitting_warnings"]:
             print(f"    warning: {warning}")
 
-    comparison = results.get("threshold_comparison")
-    if comparison:
+    comparison = results.get("exit_comparison") or results.get("threshold_comparison")
+    if results.get("exit_comparison"):
+        print("\nExit comparison vs contrarian_v1_medium_signal_exit:")
+        for variant_id, summary in results["exit_comparison"].get("comparisons", {}).items():
+            print(
+                f"  {variant_id}: {summary['label']} | "
+                f"OOS return diff={summary['oos_return_difference_vs_baseline']:+.2f}% | "
+                f"OOS trades diff={summary['completed_trade_difference_vs_baseline']} | "
+                f"avg net/trade diff={summary['average_net_return_per_trade_difference_vs_baseline']}"
+            )
+    elif comparison:
         print("\nThreshold comparison vs contrarian_v1_test:")
         for variant_id, summary in comparison.get("comparisons", {}).items():
             print(

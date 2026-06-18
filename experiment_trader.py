@@ -9,11 +9,13 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from backtester import parse_timestamp
 from config import MARKET
+from exit_config import EXIT_TYPE_SIGNAL_EXIT
 from paper_trader import BUY_SIGNALS, SELL_SIGNALS, PaperTrader
 from profile_risk_rules import buy_block_reason, sell_block_reason
 from strategy_profiles import StrategyProfile
-from strategy_types import ExperimentRunState, ProfileTradeRecord, TradingLimits
+from strategy_types import ExperimentRunState, ProfileTradeRecord, StrategyExitResult, TradingLimits
 
 
 @dataclass
@@ -94,6 +96,43 @@ class ExperimentPaperTrader(PaperTrader):
         elif signal in SELL_SIGNALS:
             self._profile_sell(coin, price, timestamp, signal, now)
 
+    def process_position_exit(
+        self,
+        coin: str,
+        price: float,
+        timestamp: str,
+        now: float,
+        exit_result: StrategyExitResult,
+    ) -> None:
+        """Execute a position-aware exit (full close or signal-equivalent partial)."""
+        if exit_result.action != "SELL":
+            return
+
+        if exit_result.exit_type == EXIT_TYPE_SIGNAL_EXIT:
+            signal = exit_result.indicators.get("signal", "UP")
+            if signal in SELL_SIGNALS:
+                self._profile_sell(
+                    coin,
+                    price,
+                    timestamp,
+                    signal,
+                    now,
+                    exit_type=exit_result.exit_type,
+                    gross_return_pct=exit_result.gross_return_pct,
+                    estimated_net_return_pct=exit_result.estimated_net_return_pct,
+                )
+            return
+
+        self._profile_sell_full(
+            coin,
+            price,
+            timestamp,
+            exit_result.exit_type,
+            now,
+            gross_return_pct=exit_result.gross_return_pct,
+            estimated_net_return_pct=exit_result.estimated_net_return_pct,
+        )
+
     def _profile_buy(
         self,
         coin: str,
@@ -118,6 +157,8 @@ class ExperimentPaperTrader(PaperTrader):
         position.avg_entry_price = total_cost / position.quantity
         position.entry_count += 1
         position.last_buy_time = now
+        if position.opened_at is None:
+            position.opened_at = now
 
         buy_fee = self.buy_fee(self.limits.trade_size_usdc)
         slippage = self.slippage_cost("BUY", price, quantity)
@@ -151,6 +192,10 @@ class ExperimentPaperTrader(PaperTrader):
         timestamp: str,
         signal: str,
         now: float,
+        *,
+        exit_type: str | None = None,
+        gross_return_pct: float | None = None,
+        estimated_net_return_pct: float | None = None,
     ) -> None:
         assert self.limits is not None
         position = self._get_position(coin)
@@ -193,6 +238,7 @@ class ExperimentPaperTrader(PaperTrader):
             position.avg_entry_price = 0.0
             position.entry_count = 0
             position.last_buy_time = None
+            position.opened_at = None
 
         self._record_holding_time(coin, now, quantity)
 
@@ -209,6 +255,71 @@ class ExperimentPaperTrader(PaperTrader):
             slippage=slippage,
             realized_pnl=trade_realized_pnl,
             entry_count=entry_count,
+            exit_type=exit_type,
+            gross_return_pct=gross_return_pct,
+            estimated_net_return_pct=estimated_net_return_pct,
+        )
+        self.successful_trades_this_session += 1
+
+    def _profile_sell_full(
+        self,
+        coin: str,
+        price: float,
+        timestamp: str,
+        exit_type: str,
+        now: float,
+        *,
+        gross_return_pct: float | None = None,
+        estimated_net_return_pct: float | None = None,
+    ) -> None:
+        """Sell the entire open position (used for TP / SL / max-hold exits)."""
+        assert self.limits is not None
+        position = self._get_position(coin)
+
+        if not position.is_open:
+            return
+
+        block_reason = sell_block_reason(self, coin, self.limits)
+        if block_reason is not None:
+            return
+
+        execution_price = self.execution_price("SELL", price)
+        quantity = position.quantity
+        trade_value = quantity * execution_price
+        entry_count = position.entry_count
+
+        trade_realized_pnl = (execution_price - position.avg_entry_price) * quantity
+        sell_fee = self.sell_fee(trade_value)
+        slippage = self.slippage_cost("SELL", price, quantity)
+        self.total_slippage_cost += slippage
+        self.realized_pnl += trade_realized_pnl
+        self.cash_balance += trade_value - sell_fee
+
+        self._record_holding_time(coin, now, quantity)
+
+        position.quantity = 0.0
+        position.avg_entry_price = 0.0
+        position.entry_count = 0
+        position.last_buy_time = None
+        position.opened_at = None
+        self.run_state.open_position_ticks.pop(coin, None)
+
+        self._append_trade(
+            timestamp=timestamp,
+            coin=coin,
+            action="SELL",
+            signal=exit_type,
+            mid_price=price,
+            execution_price=execution_price,
+            quantity=quantity,
+            trade_value=trade_value,
+            fee=sell_fee,
+            slippage=slippage,
+            realized_pnl=trade_realized_pnl,
+            entry_count=entry_count,
+            exit_type=exit_type,
+            gross_return_pct=gross_return_pct,
+            estimated_net_return_pct=estimated_net_return_pct,
         )
         self.successful_trades_this_session += 1
 
@@ -240,6 +351,9 @@ class ExperimentPaperTrader(PaperTrader):
         slippage: float,
         realized_pnl: float,
         entry_count: int,
+        exit_type: str | None = None,
+        gross_return_pct: float | None = None,
+        estimated_net_return_pct: float | None = None,
     ) -> None:
         current_prices = {coin: mid_price}
         self.trade_log.append(
@@ -259,6 +373,9 @@ class ExperimentPaperTrader(PaperTrader):
                 cash_balance=self.cash_balance,
                 open_exposure=self.total_open_exposure(),
                 equity=self.total_equity(current_prices),
+                exit_type=exit_type,
+                gross_return_pct=gross_return_pct,
+                estimated_net_return_pct=estimated_net_return_pct,
             )
         )
 
@@ -274,10 +391,10 @@ class ExperimentPaperTrader(PaperTrader):
             if price is None:
                 continue
 
-            self._force_sell_full_position(coin, price, timestamp)
+            self._force_sell_full_position(coin, price, timestamp, parse_timestamp(timestamp))
 
     def _force_sell_full_position(
-        self, coin: str, price: float, timestamp: str
+        self, coin: str, price: float, timestamp: str, now: float
     ) -> None:
         assert self.limits is not None
         position = self._get_position(coin)
@@ -295,12 +412,13 @@ class ExperimentPaperTrader(PaperTrader):
         self.realized_pnl += trade_realized_pnl
         self.cash_balance += trade_value - sell_fee
 
-        self._record_holding_time(coin, 0.0, quantity)
+        self._record_holding_time(coin, now, quantity)
 
         position.quantity = 0.0
         position.avg_entry_price = 0.0
         position.entry_count = 0
         position.last_buy_time = None
+        position.opened_at = None
 
         self._append_trade(
             timestamp=timestamp,

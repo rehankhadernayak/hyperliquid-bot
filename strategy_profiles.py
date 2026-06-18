@@ -11,6 +11,7 @@ from dataclasses import asdict, dataclass
 from typing import Any
 
 from config import PAPER_TRADING, SIGNAL, SignalThresholds
+from exit_config import ExitConfig, SIGNAL_EXIT_V1
 from market_analyzer import WINDOW_1M_SECONDS
 from profile_validation import validate_profile_fields, validate_thresholds
 from strategy_types import TradingLimits
@@ -36,11 +37,16 @@ class StrategyProfile:
     max_successful_trades_per_session: int
     min_equity_before_pause_usdc: float
     close_positions_at_end: bool = True
+    exit_config: ExitConfig | None = None
 
     def to_dict(self) -> dict[str, Any]:
         """Return a JSON-serializable profile snapshot."""
         payload = asdict(self)
         payload["thresholds"] = asdict(self.thresholds)
+        if self.exit_config is not None:
+            payload["exit_config"] = self.exit_config.to_dict()
+        else:
+            payload["exit_config"] = None
         return payload
 
     def trading_limits(self) -> TradingLimits:
@@ -142,6 +148,84 @@ STRATEGY_PROFILES: dict[str, StrategyProfile] = {
         close_positions_at_end=True,
     ),
 }
+
+_MEDIUM_ENTRY_THRESHOLDS = SignalThresholds(
+    strong_up_pct=SIGNAL.test_mode.strong_up_pct,
+    up_pct=SIGNAL.test_mode.up_pct,
+    strong_down_pct=-0.25,
+    down_pct=-0.15,
+)
+
+_EXIT_PROFILE_LIMITS = _base_limits()
+
+STRATEGY_PROFILES.update(
+    {
+        "contrarian_v1_medium_signal_exit": StrategyProfile(
+            profile_id="contrarian_v1_medium_signal_exit",
+            strategy_name="contrarian_v1",
+            strategy_version="1.0.0",
+            thresholds=_MEDIUM_ENTRY_THRESHOLDS,
+            exit_config=SIGNAL_EXIT_V1,
+            **_EXIT_PROFILE_LIMITS,
+        ),
+        "contrarian_v1_medium_tp25_sl25": StrategyProfile(
+            profile_id="contrarian_v1_medium_tp25_sl25",
+            strategy_name="contrarian_v1",
+            strategy_version="1.0.0",
+            thresholds=_MEDIUM_ENTRY_THRESHOLDS,
+            exit_config=ExitConfig(
+                exit_mode="cost_aware",
+                take_profit_pct=0.25,
+                stop_loss_pct=0.25,
+                max_hold_seconds=None,
+                signal_exit_enabled=False,
+            ),
+            **_EXIT_PROFILE_LIMITS,
+        ),
+        "contrarian_v1_medium_tp35_sl25": StrategyProfile(
+            profile_id="contrarian_v1_medium_tp35_sl25",
+            strategy_name="contrarian_v1",
+            strategy_version="1.0.0",
+            thresholds=_MEDIUM_ENTRY_THRESHOLDS,
+            exit_config=ExitConfig(
+                exit_mode="cost_aware",
+                take_profit_pct=0.35,
+                stop_loss_pct=0.25,
+                max_hold_seconds=None,
+                signal_exit_enabled=False,
+            ),
+            **_EXIT_PROFILE_LIMITS,
+        ),
+        "contrarian_v1_medium_tp50_sl30": StrategyProfile(
+            profile_id="contrarian_v1_medium_tp50_sl30",
+            strategy_name="contrarian_v1",
+            strategy_version="1.0.0",
+            thresholds=_MEDIUM_ENTRY_THRESHOLDS,
+            exit_config=ExitConfig(
+                exit_mode="cost_aware",
+                take_profit_pct=0.50,
+                stop_loss_pct=0.30,
+                max_hold_seconds=None,
+                signal_exit_enabled=False,
+            ),
+            **_EXIT_PROFILE_LIMITS,
+        ),
+        "contrarian_v1_medium_tp35_sl25_maxhold": StrategyProfile(
+            profile_id="contrarian_v1_medium_tp35_sl25_maxhold",
+            strategy_name="contrarian_v1",
+            strategy_version="1.0.0",
+            thresholds=_MEDIUM_ENTRY_THRESHOLDS,
+            exit_config=ExitConfig(
+                exit_mode="cost_aware",
+                take_profit_pct=0.35,
+                stop_loss_pct=0.25,
+                max_hold_seconds=1800,
+                signal_exit_enabled=False,
+            ),
+            **_EXIT_PROFILE_LIMITS,
+        ),
+    }
+)
 
 
 def get_profile(profile_id: str) -> StrategyProfile:

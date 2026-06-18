@@ -7,6 +7,8 @@ from typing import Any
 
 from config import SignalThresholds
 
+from exit_config import ExitConfig, validate_exit_config
+
 
 def validate_thresholds(thresholds: SignalThresholds) -> None:
     """
@@ -71,3 +73,6 @@ def validate_profile_fields(profile: Any) -> None:
             raise ValueError(
                 f"Profile field {name!r} must be an integer, got {type(value).__name__}"
             )
+
+    if profile.exit_config is not None:
+        validate_exit_config(profile.exit_config)
