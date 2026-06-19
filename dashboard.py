@@ -52,6 +52,78 @@ def load_recommendations() -> dict | None:
     return dashboard_data.load_recommendations()
 
 
+@st.cache_data(ttl=30)
+def load_recorder_status() -> dict | None:
+    return dashboard_data.load_recorder_status()
+
+
+@st.cache_data(ttl=30)
+def load_market_stream_sizes() -> dict[str, int]:
+    return dashboard_data.market_stream_file_sizes()
+
+
+def _render_market_data_recorder() -> None:
+    st.subheader("Market Data Recorder")
+    st.caption(
+        "Read-only public market data. No orders or wallet actions."
+    )
+
+    status = load_recorder_status()
+    sizes = load_market_stream_sizes()
+
+    if status is None:
+        st.info(
+            "No recorder session found. Run "
+            "`python3 websocket_recorder.py --coins BTC ETH SOL` to start collecting."
+        )
+        return
+
+    running = status.get("running", False)
+    conn_state = status.get("connection_state", "—")
+    conn_label = "Connected" if conn_state == "CONNECTED" and running else (
+        "Disconnected" if not running else conn_state
+    )
+
+    cols = st.columns(4)
+    cols[0].metric("Status", conn_label)
+    cols[1].metric("Uptime", f"{status.get('uptime_seconds', 0):.0f}s")
+    cols[2].metric("Reconnects", status.get("reconnect_count", 0))
+    cols[3].metric("Msgs/sec", f"{status.get('messages_per_second', 0):.2f}")
+
+    cols2 = st.columns(4)
+    cols2[0].metric("Latency p50", f"{status.get('latency_p50_ms', '—')} ms")
+    cols2[1].metric("Latency p95", f"{status.get('latency_p95_ms', '—')} ms")
+    cols2[2].metric("Latency p99", f"{status.get('latency_p99_ms', '—')} ms")
+    hb = status.get("heartbeat", {})
+    cols2[3].metric("Heartbeat RTT", f"{hb.get('last_round_trip_ms', '—')} ms")
+
+    cols3 = st.columns(4)
+    cols3[0].metric("Malformed", status.get("malformed_count", 0))
+    cols3[1].metric("Duplicates", status.get("duplicate_count", 0))
+    cols3[2].metric("Gaps", status.get("gap_count", 0))
+    cols3[3].metric(
+        "Active Subs",
+        status.get("active_subscriptions", 0),
+    )
+
+    raw_mb = sizes.get("raw_bytes", 0) / (1024 * 1024)
+    norm_mb = sizes.get("normalized_bytes", 0) / (1024 * 1024)
+    st.caption(
+        f"Session: `{status.get('recorder_session_id', '—')}` | "
+        f"Coins: {', '.join(status.get('coins', []))} | "
+        f"Last event: {status.get('last_message_at_ms', '—')} | "
+        f"Raw: {raw_mb:.2f} MB | Normalized: {norm_mb:.2f} MB"
+    )
+
+    channel_counts = status.get("channel_message_counts", {})
+    if channel_counts:
+        st.markdown("**Channel counts:**")
+        channel_df = pd.DataFrame(
+            [{"channel": k, "count": v} for k, v in sorted(channel_counts.items())]
+        )
+        st.dataframe(channel_df, use_container_width=True, hide_index=True)
+
+
 def _format_money(value: float | None) -> str:
     if value is None:
         return "—"
@@ -545,6 +617,55 @@ def _exit_summary_row(profile_id: str, payload: dict) -> dict:
     }
 
 
+def _trend_filter_profiles(profile_results: dict) -> list[str]:
+    """Return trend-filter experiment profiles present in an experiment."""
+    known = (
+        "contrarian_v1_entry_medium",
+        "contrarian_v1_medium_no_trend_filter",
+        "contrarian_v1_medium_trend30",
+        "contrarian_v1_medium_trend50",
+        "contrarian_v1_medium_worsening",
+        "contrarian_v1_medium_combined",
+        "hold_baseline",
+    )
+    return [profile_id for profile_id in known if profile_id in profile_results]
+
+
+def _trend_filter_summary_row(profile_id: str, payload: dict) -> dict:
+    profile = payload.get("profile", {})
+    trend_filter = profile.get("trend_filter") or {}
+    oos = payload.get("out_of_sample", {})
+    dev = payload.get("development", {})
+    combined = payload.get("combined", {})
+    comparison_label = payload.get("trend_comparison_label", "—")
+    warnings = payload.get("overfitting_warnings", [])
+    return {
+        "Profile": profile_id,
+        "Filter type": trend_filter.get("filter_type", "NONE"),
+        "Filter threshold (%)": trend_filter.get("five_minute_block_threshold_pct"),
+        "Worsening rule": trend_filter.get("worsening_momentum_rule", "—")[:80] + "…"
+        if trend_filter.get("worsening_momentum_rule")
+        else "—",
+        "Entry signals": oos.get("total_entry_signals"),
+        "Entries executed": oos.get("entries_executed"),
+        "Entries filtered": int(oos.get("entries_blocked_by_trend_filter", 0))
+        + int(oos.get("entries_blocked_insufficient_history", 0)),
+        "Filter (%)": oos.get("entry_filter_percentage"),
+        "Dev return (%)": dev.get("net_return_pct"),
+        "OOS return (%)": oos.get("net_return_pct"),
+        "Combined return (%)": combined.get("net_return_pct"),
+        "Completed trades": oos.get("completed_trades"),
+        "Avg net return/trade": oos.get("average_net_return_per_trade"),
+        "Profit factor": oos.get("profit_factor"),
+        "Drawdown (%)": oos.get("maximum_drawdown_pct"),
+        "Fees": oos.get("fees_paid"),
+        "Slippage": oos.get("slippage_cost"),
+        "Evidence": payload.get("evidence_assessment", "—"),
+        "Comparison label": comparison_label,
+        "Warnings": "; ".join(warnings) if warnings else "—",
+    }
+
+
 def _contrarian_threshold_profiles(profile_results: dict) -> list[str]:
     """Return contrarian entry-threshold profiles present in an experiment."""
     known = (
@@ -681,6 +802,66 @@ def _render_experiment_analysis() -> None:
                 )
             st.dataframe(
                 pd.DataFrame(exit_comparison_rows),
+                width="stretch",
+                hide_index=True,
+            )
+
+    trend_profiles = _trend_filter_profiles(profile_results)
+    trend_comparison = experiment.get("trend_comparison")
+    if trend_profiles:
+        st.markdown("**Trend Filter Comparison**")
+        st.caption(
+            "Trend filters may avoid some falling markets, but they can also block "
+            "valid rebounds."
+        )
+        if trend_comparison:
+            for variant_id, summary in trend_comparison.get("comparisons", {}).items():
+                if variant_id in profile_results:
+                    profile_results[variant_id]["trend_comparison_label"] = summary.get(
+                        "label", "—"
+                    )
+        trend_rows = [
+            _trend_filter_summary_row(profile_id, profile_results[profile_id])
+            for profile_id in trend_profiles
+        ]
+        st.dataframe(pd.DataFrame(trend_rows), width="stretch", hide_index=True)
+
+        if trend_comparison:
+            st.caption(
+                f"Baseline: {trend_comparison.get('baseline_profile')} — "
+                "labels are descriptive only."
+            )
+            trend_comparison_rows = []
+            for variant_id, summary in trend_comparison.get("comparisons", {}).items():
+                trend_comparison_rows.append(
+                    {
+                        "Variant": variant_id,
+                        "Label": summary.get("label"),
+                        "OOS return diff (%)": summary.get(
+                            "oos_return_difference_vs_baseline"
+                        ),
+                        "Trade diff": summary.get(
+                            "completed_trade_difference_vs_baseline"
+                        ),
+                        "Blocked entries diff": summary.get(
+                            "blocked_entry_count_vs_baseline"
+                        ),
+                        "Filter pct diff": summary.get("filter_percentage_vs_baseline"),
+                        "Avg net/trade diff": summary.get(
+                            "average_net_return_per_trade_difference_vs_baseline"
+                        ),
+                        "Profit factor diff": summary.get(
+                            "profit_factor_difference_vs_baseline"
+                        ),
+                        "Drawdown diff (%)": summary.get(
+                            "maximum_drawdown_difference_vs_baseline"
+                        ),
+                        "Fee diff": summary.get("fee_difference_vs_baseline"),
+                        "Slippage diff": summary.get("slippage_difference_vs_baseline"),
+                    }
+                )
+            st.dataframe(
+                pd.DataFrame(trend_comparison_rows),
                 width="stretch",
                 hide_index=True,
             )
@@ -971,6 +1152,9 @@ def _render_dashboard() -> None:
             end_date,
             current_session,
         )
+
+    st.divider()
+    _render_market_data_recorder()
 
     st.divider()
     prices = load_price_log()

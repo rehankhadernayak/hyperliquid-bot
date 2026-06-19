@@ -131,6 +131,56 @@ def load_recommendations() -> dict | None:
         return json.load(handle)
 
 
+MARKET_STREAM_DIR = DATA.data_dir / "market_stream"
+
+
+def load_recorder_status() -> dict | None:
+    """Load market data recorder status, if available."""
+    status_path = MARKET_STREAM_DIR / "recorder_status.json"
+    if not status_path.exists():
+        return None
+
+    import json
+
+    with status_path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
+def load_recorder_manifests() -> list[dict]:
+    """Load all recorder session manifests."""
+    manifests_dir = MARKET_STREAM_DIR / "manifests"
+    if not manifests_dir.exists():
+        return []
+
+    import json
+
+    manifests = []
+    for path in sorted(manifests_dir.glob("*.json")):
+        with path.open(encoding="utf-8") as handle:
+            manifests.append(json.load(handle))
+    return manifests
+
+
+def market_stream_file_sizes() -> dict[str, int]:
+    """Return byte sizes of raw and normalized market stream files."""
+    sizes = {"raw_bytes": 0, "normalized_bytes": 0}
+    stream_dir = MARKET_STREAM_DIR
+    if not stream_dir.exists():
+        return sizes
+
+    raw_dir = stream_dir / "raw"
+    norm_dir = stream_dir / "normalized"
+    if raw_dir.exists():
+        for f in raw_dir.rglob("*"):
+            if f.is_file():
+                sizes["raw_bytes"] += f.stat().st_size
+    if norm_dir.exists():
+        for f in norm_dir.rglob("*"):
+            if f.is_file():
+                sizes["normalized_bytes"] += f.stat().st_size
+    return sizes
+
+
 def normalize_paper_trades(df: pd.DataFrame) -> pd.DataFrame:
     """Normalize legacy and current paper trade CSV formats."""
     normalized = df.copy()

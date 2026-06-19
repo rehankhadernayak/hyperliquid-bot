@@ -1,0 +1,92 @@
+{
+  "trade": {
+    "channel": "trades",
+    "data": [
+      {
+        "coin": "BTC",
+        "side": "B",
+        "px": "63747.5",
+        "sz": "0.1",
+        "time": 1718000000000,
+        "hash": "0xabc123",
+        "tid": 12345,
+        "extra_field": "preserved"
+      }
+    ]
+  },
+  "bbo": {
+    "channel": "bbo",
+    "data": {
+      "coin": "BTC",
+      "time": 1718000000000,
+      "bbo": [
+        {"px": "63747.0", "sz": "1.5", "n": 5},
+        {"px": "63748.0", "sz": "0.8", "n": 3}
+      ],
+      "unknown_field": true
+    }
+  },
+  "l2_book": {
+    "channel": "l2Book",
+    "data": {
+      "coin": "ETH",
+      "time": 1718000000000,
+      "levels": [
+        [{"px": "3500.0", "sz": "10.0", "n": 5}, {"px": "3499.5", "sz": "5.0", "n": 3}],
+        [{"px": "3500.5", "sz": "8.0", "n": 4}, {"px": "3501.0", "sz": "3.0", "n": 2}]
+      ]
+    }
+  },
+  "candle": {
+    "channel": "candle",
+    "data": {
+      "t": 1718000000000,
+      "T": 1718000059999,
+      "s": "SOL",
+      "i": "1m",
+      "o": "150.0",
+      "h": "151.0",
+      "l": "149.5",
+      "c": "150.5",
+      "v": "1000.0",
+      "n": 250
+    }
+  },
+  "active_asset_ctx": {
+    "channel": "activeAssetCtx",
+    "data": {
+      "coin": "BTC",
+      "ctx": {
+        "funding": "0.0001",
+        "openInterest": "5000000.0",
+        "prevDayPx": "63000.0",
+        "dayNtlVlm": "5000000000.0",
+        "markPx": "63747.5",
+        "midPx": "63747.5",
+        "oraclePx": "63746.0",
+        "extra_ctx_field": "kept"
+      }
+    }
+  },
+  "all_mids": {
+    "channel": "allMids",
+    "data": {
+      "mids": {
+        "BTC": "63747.5",
+        "ETH": "3500.0",
+        "SOL": "150.5"
+      }
+    }
+  },
+  "subscription_response": {
+    "channel": "subscriptionResponse",
+    "data": {
+      "method": "subscribe",
+      "subscription": {"type": "trades", "coin": "BTC"}
+    }
+  },
+  "pong": {
+    "channel": "pong",
+    "data": null
+  }
+}
