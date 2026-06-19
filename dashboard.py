@@ -72,6 +72,16 @@ def load_quality_report(session_id: str) -> dict | None:
     return dashboard_data.load_quality_report(session_id)
 
 
+@st.cache_data(ttl=30)
+def load_replay_reports() -> list[dict]:
+    return dashboard_data.load_replay_reports()
+
+
+@st.cache_data(ttl=30)
+def load_replay_report(replay_session_id: str) -> dict | None:
+    return dashboard_data.load_replay_report(replay_session_id)
+
+
 def _render_market_data_recorder() -> None:
     st.subheader("Market Data Recorder")
     st.caption(
@@ -217,6 +227,65 @@ def _render_quality_report_section() -> None:
 
     json_path = f"data/market_stream/quality_reports/{session_id}.json"
     md_path = f"data/market_stream/quality_reports/{session_id}.md"
+    st.caption(f"Reports: `{json_path}` | `{md_path}`")
+
+    _render_replay_reports_section()
+
+
+def _render_replay_reports_section() -> None:
+    reports = load_replay_reports()
+    if not reports:
+        st.caption(
+            "No replay reports yet. Run "
+            "`python3 market_data_replay.py --session-id <ID> --dry-run` after a recorder session."
+        )
+        return
+
+    st.markdown("**Replay reports**")
+    report_options = {
+        f"{r['replay_session_id'][:8]}… ({r.get('total_events', 0)} events)": r["replay_session_id"]
+        for r in reports
+    }
+    labels = list(report_options.keys())
+    selected_label = st.selectbox("Latest replay reports", labels, index=0, key="replay_report_selector")
+    replay_id = report_options[selected_label]
+    report = load_replay_report(replay_id)
+    if report is None:
+        st.warning("Replay report file not found.")
+        return
+
+    rcols = st.columns(4)
+    rcols[0].metric("Replay session", f"{replay_id[:12]}…")
+    rcols[1].metric("Source session", f"{(report.get('source_recorder_session_id') or '—')[:12]}…")
+    rcols[2].metric("Total events", report.get("total_events", 0))
+    rcols[3].metric("Dry run", "Yes" if report.get("dry_run") else "No")
+
+    rcols2 = st.columns(4)
+    rcols2[0].metric("Quality label", report.get("quality_label", "—"))
+    ordering_warnings = report.get("ordering_warnings") or []
+    inherited = report.get("data_quality_warnings_inherited") or []
+    rcols2[1].metric("Warnings", len(ordering_warnings) + len(inherited))
+    rcols2[2].metric("Speed", report.get("speed", 1.0))
+    rcols2[3].metric("Stream hash", f"{(report.get('stream_hash') or '—')[:12]}…")
+
+    by_channel = report.get("event_counts_by_channel") or {}
+    if by_channel:
+        st.markdown("**Counts by channel:**")
+        ch_df = pd.DataFrame(
+            [{"channel": k, "count": v} for k, v in sorted(by_channel.items())]
+        )
+        st.dataframe(ch_df, use_container_width=True, hide_index=True)
+
+    by_coin = report.get("event_counts_by_coin") or {}
+    if by_coin:
+        st.markdown("**Counts by coin:**")
+        coin_df = pd.DataFrame(
+            [{"coin": k, "count": v} for k, v in sorted(by_coin.items())]
+        )
+        st.dataframe(coin_df, use_container_width=True, hide_index=True)
+
+    json_path = report.get("json_path") or f"data/market_stream/replays/{replay_id}.json"
+    md_path = report.get("markdown_path") or f"data/market_stream/replays/{replay_id}.md"
     st.caption(f"Reports: `{json_path}` | `{md_path}`")
 
 

@@ -42,6 +42,7 @@ Use this project to **observe**, **paper trade**, and **backtest** — not to ex
 - **Health check** — `python3 health_check.py` verifies setup, imports, tests, and safety constraints.
 - **WebSocket market data recorder** — read-only public WebSocket capture to JSONL (raw) and Parquet (normalized) under `data/market_stream/`.
 - **Market data quality reports** — `python3 market_data_quality_report.py` validates recorder sessions for research usability.
+- **Market data replay** — `python3 market_data_replay.py` deterministically replays recorded WebSocket sessions (read-only, paper-only).
 
 ---
 
@@ -110,6 +111,7 @@ Hyperliquid Info API
 | `websocket_recorder.py` | Read-only WebSocket market data recorder CLI |
 | `market_data/` | Recorder, normalizer, gap/latency tracking, quality reports |
 | `market_data_quality_report.py` | Session data-quality validator (read-only) |
+| `market_data_replay.py` | Deterministic WebSocket session replay (read-only) |
 
 ---
 
@@ -257,6 +259,47 @@ Negative latency values are **not** clamped; they indicate clock-quality warning
 #### Important disclaimer
 
 Quality reports assess **data integrity only**. They do **not** prove strategy profitability or authorize live trading.
+
+### Market data replay
+
+Deterministically replay a recorded WebSocket session from normalized Parquet files. Reads manifest and quality report; writes separate replay reports under `data/market_stream/replays/`. Does **not** modify raw, normalized, or session files. Does **not** connect to paper trading or execution.
+
+```bash
+python3 market_data_replay.py --session-id <RECORDER_SESSION_ID>
+python3 market_data_replay.py --latest
+python3 market_data_replay.py --session-id <ID> --dry-run
+python3 market_data_replay.py --session-id <ID> --coins BTC ETH SOL
+python3 market_data_replay.py --session-id <ID> --channels trades bbo l2Book candle activeAssetCtx allMids
+python3 market_data_replay.py --session-id <ID> --speed 1.0
+python3 market_data_replay.py --session-id <ID> --speed 0
+python3 market_data_replay.py --session-id <ID> --max-events 1000
+python3 market_data_replay.py --session-id <ID> --output-dir data/market_stream/replays
+```
+
+#### Dry-run (default)
+
+Dry-run validates the session, applies filters, sorts deterministically, computes counts and a stream hash, and writes a replay report — without sleeping or emitting events to consumers. This is the safest validation mode.
+
+#### Speed control
+
+- `--speed 1.0` — replay using recorded timing between events
+- `--speed 10.0` — replay 10× faster
+- `--speed 0` — emit as fast as possible (no sleeping)
+- Use `--emit` to stream events to a consumer (disables dry-run)
+
+#### Filtering
+
+Filter by coin (`--coins`), channel (`--channels`), time range (`--start-timestamp-ms`, `--end-timestamp-ms`), or event count (`--max-events`). Filters do not modify source data.
+
+#### Deterministic ordering
+
+Events are sorted by: (1) exchange timestamp when available and safe, otherwise received timestamp; (2) received timestamp tie-breaker; (3) original local sequence; (4) channel priority; (5) coin alphabetical order; (6) source file path; (7) source row index. Running replay twice with the same data and filters produces the same stream hash.
+
+#### Important disclaimers
+
+- Replay is **read-only** and **paper-only** — no wallets, signing, orders, or execution.
+- Replay is **separate from trading execution** — output is not connected to `paper_trader.py`.
+- Replay does **not** prove strategy profitability — it only reconstructs historical market data in deterministic order.
 
 ### Backtester
 

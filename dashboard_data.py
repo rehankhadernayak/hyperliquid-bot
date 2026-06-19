@@ -181,6 +181,26 @@ def load_quality_report(session_id: str) -> dict | None:
         return json.load(handle)
 
 
+def load_replay_reports() -> list[dict]:
+    """Load metadata for all replay reports, newest first."""
+    from market_data.replay_report import list_replay_reports
+
+    replays_dir = MARKET_STREAM_DIR / "replays"
+    return list_replay_reports(replays_dir)
+
+
+def load_replay_report(replay_session_id: str) -> dict | None:
+    """Load one replay report JSON by replay session id."""
+    path = MARKET_STREAM_DIR / "replays" / f"{replay_session_id}.json"
+    if not path.exists():
+        return None
+
+    import json
+
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def market_stream_file_sizes() -> dict[str, int]:
     """Return byte sizes of raw and normalized market stream files."""
     sizes = {"raw_bytes": 0, "normalized_bytes": 0}
