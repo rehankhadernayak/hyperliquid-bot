@@ -40,6 +40,8 @@ Use this project to **observe**, **paper trade**, and **backtest** — not to ex
 - **Capital readiness assessment** — conservative descriptive assessment via `python3 capital_readiness.py` (never authorizes real trading).
 - **Release review check** — `python3 review_check.py` verifies version, safety, tests, package generation, and checksums.
 - **Health check** — `python3 health_check.py` verifies setup, imports, tests, and safety constraints.
+- **WebSocket market data recorder** — read-only public WebSocket capture to JSONL (raw) and Parquet (normalized) under `data/market_stream/`.
+- **Market data quality reports** — `python3 market_data_quality_report.py` validates recorder sessions for research usability.
 
 ---
 
@@ -105,6 +107,9 @@ Hyperliquid Info API
 | `backtester.py` | Historical replay and comparison |
 | `dashboard.py` | Streamlit read-only UI |
 | `config.py` | All tunable settings, evidence rules, and `VERSION` |
+| `websocket_recorder.py` | Read-only WebSocket market data recorder CLI |
+| `market_data/` | Recorder, normalizer, gap/latency tracking, quality reports |
+| `market_data_quality_report.py` | Session data-quality validator (read-only) |
 
 ---
 
@@ -193,6 +198,65 @@ python3 session_report.py <session_id>
 ```
 
 Reports are saved to `data/session_reports/<session_id>.json`. The analyzer also writes a report on graceful shutdown (`Ctrl+C`).
+
+### WebSocket market data recorder
+
+Collect read-only public market data over WebSocket. No wallets, signing, or order execution.
+
+```bash
+python3 websocket_recorder.py --coins BTC ETH SOL
+python3 websocket_recorder.py --duration-seconds 300
+python3 websocket_recorder.py --status
+```
+
+Output layout:
+
+- `data/market_stream/raw/YYYY-MM-DD/events-HH.jsonl` — append-only raw JSONL (source of truth)
+- `data/market_stream/normalized/...` — partitioned Parquet (derived, for analysis)
+- `data/market_stream/manifests/<session_id>.json` — session manifest
+
+Channels: `allMids`, `trades`, `bbo`, `l2Book`, `candle`, `activeAssetCtx`.
+
+### Market data quality report
+
+Validate whether a recorder session is reliable enough for research and future backtesting. Reads manifest and listed files only; writes separate reports under `data/market_stream/quality_reports/`. Does **not** modify raw, normalized, or session files.
+
+```bash
+python3 market_data_quality_report.py --session-id <RECORDER_SESSION_ID>
+python3 market_data_quality_report.py --latest
+python3 market_data_quality_report.py --session-id <ID> --format json
+python3 market_data_quality_report.py --session-id <ID> --format markdown
+```
+
+#### Quality labels
+
+| Label | Meaning |
+|-------|---------|
+| `GOOD_FOR_RESEARCH` | Manifest exists, raw files readable, adequate channel coverage, acceptable reconnect/gap profile |
+| `USABLE_WITH_WARNINGS` | Minor gaps, duplicate timestamps, latency warnings, or partial channel completeness — raw data preserved |
+| `DEGRADED` | Missing normalized files, high malformed rate, stale channels, timestamp issues, or count mismatches |
+| `UNUSABLE` | Missing manifest/raw files, unreadable records, corrupt data, or no usable market data |
+
+Thresholds are defined in `market_data/quality_models.py`.
+
+#### Raw data is the source of truth
+
+Quality reports always inspect raw JSONL first. Normalized Parquet is derived (deduplicated, expanded for `allMids` and batched trades). Count mismatches between raw and normalized are expected when one raw message expands into many rows.
+
+#### Latency by channel
+
+Latency (`received_timestamp_ms - exchange_timestamp_ms`) is computed separately per channel:
+
+- **trades, bbo, l2Book** — suitable for exchange-to-receive latency research
+- **allMids** — latency unavailable (no exchange send timestamp)
+- **candle** — informational only (timestamps are candle open/close, not message send time)
+- **activeAssetCtx** — contextual; not comparable to trade timestamps
+
+Negative latency values are **not** clamped; they indicate clock-quality warnings.
+
+#### Important disclaimer
+
+Quality reports assess **data integrity only**. They do **not** prove strategy profitability or authorize live trading.
 
 ### Backtester
 

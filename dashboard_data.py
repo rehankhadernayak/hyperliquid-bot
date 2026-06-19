@@ -161,6 +161,26 @@ def load_recorder_manifests() -> list[dict]:
     return manifests
 
 
+def load_quality_reports() -> list[dict]:
+    """Load metadata for all quality reports, newest first."""
+    from market_data.replay_manifest import list_quality_reports
+
+    reports_dir = MARKET_STREAM_DIR / "quality_reports"
+    return list_quality_reports(reports_dir)
+
+
+def load_quality_report(session_id: str) -> dict | None:
+    """Load one quality report JSON by session id."""
+    path = MARKET_STREAM_DIR / "quality_reports" / f"{session_id}.json"
+    if not path.exists():
+        return None
+
+    import json
+
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def market_stream_file_sizes() -> dict[str, int]:
     """Return byte sizes of raw and normalized market stream files."""
     sizes = {"raw_bytes": 0, "normalized_bytes": 0}

@@ -62,6 +62,16 @@ def load_market_stream_sizes() -> dict[str, int]:
     return dashboard_data.market_stream_file_sizes()
 
 
+@st.cache_data(ttl=30)
+def load_quality_reports() -> list[dict]:
+    return dashboard_data.load_quality_reports()
+
+
+@st.cache_data(ttl=30)
+def load_quality_report(session_id: str) -> dict | None:
+    return dashboard_data.load_quality_report(session_id)
+
+
 def _render_market_data_recorder() -> None:
     st.subheader("Market Data Recorder")
     st.caption(
@@ -122,6 +132,92 @@ def _render_market_data_recorder() -> None:
             [{"channel": k, "count": v} for k, v in sorted(channel_counts.items())]
         )
         st.dataframe(channel_df, use_container_width=True, hide_index=True)
+
+    _render_quality_report_section()
+
+
+def _render_quality_report_section() -> None:
+    reports = load_quality_reports()
+    if not reports:
+        st.caption(
+            "No quality reports yet. Run "
+            "`python3 market_data_quality_report.py --latest` after a recorder session."
+        )
+        return
+
+    st.markdown("**Data quality report**")
+    report_options = {
+        f"{r['session_id'][:8]}… ({r.get('quality_label', '—')})": r["session_id"]
+        for r in reports
+    }
+    labels = list(report_options.keys())
+    selected_label = st.selectbox("Latest quality reports", labels, index=0)
+    session_id = report_options[selected_label]
+    report = load_quality_report(session_id)
+    if report is None:
+        st.warning("Quality report file not found.")
+        return
+
+    qcols = st.columns(4)
+    qcols[0].metric("Quality label", report.get("quality_label", "—"))
+    qcols[1].metric("Warnings", report.get("warning_count", 0))
+    gap_summary = report.get("gap_summary") or {}
+    qcols[2].metric("Gaps", gap_summary.get("total_gaps", 0))
+    qcols[3].metric("Generated", (report.get("generated_at") or "—")[:19])
+
+    channel_labels = report.get("channel_quality_labels") or {}
+    if channel_labels:
+        st.markdown("**Channel quality labels:**")
+        ch_label_df = pd.DataFrame(
+            [{"channel": k, "quality_label": v} for k, v in sorted(channel_labels.items())]
+        )
+        st.dataframe(ch_label_df, use_container_width=True, hide_index=True)
+
+    latency = report.get("latency_summaries") or {}
+    if latency:
+        st.markdown("**Latency by channel (ms):**")
+        lat_rows = []
+        for ch, stats in sorted(latency.items()):
+            if not stats.get("latency_available", True):
+                lat_rows.append(
+                    {
+                        "channel": ch,
+                        "count": "—",
+                        "median": "—",
+                        "p95": "—",
+                        "note": stats.get("note", "unavailable"),
+                    }
+                )
+            else:
+                lat_rows.append(
+                    {
+                        "channel": ch,
+                        "count": stats.get("count", 0),
+                        "median": stats.get("median_ms"),
+                        "p95": stats.get("p95_ms"),
+                        "note": stats.get("note") or (
+                            "informational" if stats.get("informational_only") else ""
+                        ),
+                    }
+                )
+        st.dataframe(pd.DataFrame(lat_rows), use_container_width=True, hide_index=True)
+
+    usability = report.get("usability_flags") or {}
+    if usability:
+        st.markdown("**Usability flags:**")
+        flag_rows = [
+            {
+                "flag": name,
+                "usable": flag.get("usable"),
+                "reason": flag.get("reason"),
+            }
+            for name, flag in sorted(usability.items())
+        ]
+        st.dataframe(pd.DataFrame(flag_rows), use_container_width=True, hide_index=True)
+
+    json_path = f"data/market_stream/quality_reports/{session_id}.json"
+    md_path = f"data/market_stream/quality_reports/{session_id}.md"
+    st.caption(f"Reports: `{json_path}` | `{md_path}`")
 
 
 def _format_money(value: float | None) -> str:
