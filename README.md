@@ -43,6 +43,7 @@ Use this project to **observe**, **paper trade**, and **backtest** — not to ex
 - **WebSocket market data recorder** — read-only public WebSocket capture to JSONL (raw) and Parquet (normalized) under `data/market_stream/`.
 - **Market data quality reports** — `python3 market_data_quality_report.py` validates recorder sessions for research usability.
 - **Market data replay** — `python3 market_data_replay.py` deterministically replays recorded WebSocket sessions (read-only, paper-only).
+- **Event-driven backtester** — `python3 event_backtest.py` simulates strategy decisions on replayed trades and BBO with bid/ask-aware fills (read-only, paper-only, research-only).
 
 ---
 
@@ -300,6 +301,53 @@ Events are sorted by: (1) exchange timestamp when available and safe, otherwise 
 - Replay is **read-only** and **paper-only** — no wallets, signing, orders, or execution.
 - Replay is **separate from trading execution** — output is not connected to `paper_trader.py`.
 - Replay does **not** prove strategy profitability — it only reconstructs historical market data in deterministic order.
+
+### Event-driven backtesting
+
+Event-driven backtesting answers: *“Can the strategy be tested fairly on recorded event data with bid/ask-aware fills, costs, risk limits, and no future leakage?”*
+
+It differs from **row-based experiments** (`experiment_runner.py`):
+
+| | Row-based experiments | Event-driven backtests |
+| --- | --- | --- |
+| Input | `data/price_log.csv` timestamp rows | Recorded WebSocket replay (trades + BBO) |
+| Timing | One row per polling timestamp | One event at a time from replay cursor |
+| Fill model | Midpoint/last price + slippage | Best bid (sell) / best ask (buy) + slippage |
+| Output | `data/experiments/` | `data/event_backtests/` |
+
+Pipeline:
+
+```text
+recorded WebSocket data → quality report → deterministic replay → event-driven backtester
+```
+
+```bash
+python3 event_backtest.py --replay-session-id <REPLAY_ID>
+python3 event_backtest.py --source-recorder-session-id <RECORDER_ID>
+python3 event_backtest.py --latest-replay
+python3 event_backtest.py --replay-session-id <ID> --coins BTC ETH SOL
+python3 event_backtest.py --replay-session-id <ID> --channels trades bbo
+python3 event_backtest.py --strategy contrarian_v1_medium_no_trend_filter
+python3 event_backtest.py --starting-equity 1000
+python3 event_backtest.py --output-dir data/event_backtests
+python3 event_backtest.py --max-events 10000
+python3 event_backtest.py --replay-session-id <ID> --dry-run
+```
+
+#### Why bid/ask fills matter
+
+Row-based backtests fill at midpoint or last trade price. Event backtests fill at the **best ask** for buys and **best bid** for sells (plus configured slippage and fees). This is more realistic for contrarian strategies that react to trades but would execute against the current book.
+
+#### Limitations
+
+- v1 supports **trades** and **bbo** channels only (not l2Book, candle, activeAssetCtx, allMids).
+- A **~300-second smoke dataset** produces few completed trades — expect `INSUFFICIENT_EVENT_DATA` evidence labels.
+- Results between row-based and event-based frameworks are **not expected to match exactly**.
+- Neither framework is claimed more correct without further evidence.
+
+#### Safety disclaimer
+
+Event backtesting is **paper-only research**. It does not authorize live trading, connect to execution, or modify recorder/replay/experiment files. Reports are written only under `data/event_backtests/`.
 
 ### Backtester
 

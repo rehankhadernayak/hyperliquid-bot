@@ -82,6 +82,16 @@ def load_replay_report(replay_session_id: str) -> dict | None:
     return dashboard_data.load_replay_report(replay_session_id)
 
 
+@st.cache_data(ttl=30)
+def load_event_backtest_reports() -> list[dict]:
+    return dashboard_data.load_event_backtest_reports()
+
+
+@st.cache_data(ttl=30)
+def load_event_backtest_report(event_backtest_id: str) -> dict | None:
+    return dashboard_data.load_event_backtest_report(event_backtest_id)
+
+
 def _render_market_data_recorder() -> None:
     st.subheader("Market Data Recorder")
     st.caption(
@@ -286,6 +296,70 @@ def _render_replay_reports_section() -> None:
 
     json_path = report.get("json_path") or f"data/market_stream/replays/{replay_id}.json"
     md_path = report.get("markdown_path") or f"data/market_stream/replays/{replay_id}.md"
+    st.caption(f"Reports: `{json_path}` | `{md_path}`")
+
+    _render_event_backtests_section()
+
+
+def _render_event_backtests_section() -> None:
+    reports = load_event_backtest_reports()
+    if not reports:
+        st.caption(
+            "No event backtest reports yet. Run "
+            "`python3 event_backtest.py --replay-session-id <ID> --coins BTC ETH SOL "
+            "--channels trades bbo --strategy contrarian_v1_medium_no_trend_filter`."
+        )
+        return
+
+    st.markdown("**Event Backtests**")
+    report_options = {
+        f"{r['event_backtest_id'][:8]}… ({r.get('completed_trades', 0)} trades)": r[
+            "event_backtest_id"
+        ]
+        for r in reports
+    }
+    labels = list(report_options.keys())
+    selected_label = st.selectbox(
+        "Latest event backtests", labels, index=0, key="event_backtest_selector"
+    )
+    backtest_id = report_options[selected_label]
+    report = load_event_backtest_report(backtest_id)
+    if report is None:
+        st.warning("Event backtest report file not found.")
+        return
+
+    ecols = st.columns(4)
+    ecols[0].metric("Strategy", report.get("strategy_name", "—"))
+    ecols[1].metric("Profile", (report.get("profile_name") or "—")[:20])
+    ecols[2].metric("Replay session", f"{(report.get('replay_session_id') or '—')[:12]}…")
+    ecols[3].metric("Recorder session", f"{(report.get('source_recorder_session_id') or '—')[:12]}…")
+
+    ecols2 = st.columns(4)
+    ecols2[0].metric("Starting equity", _format_money(report.get("starting_equity")))
+    ecols2[1].metric("Ending equity", _format_money(report.get("ending_equity")))
+    ecols2[2].metric("Net return", _format_pct(report.get("net_return_pct")))
+    ecols2[3].metric("Completed trades", report.get("completed_trades", 0))
+
+    ecols3 = st.columns(4)
+    ecols3[0].metric("Fees", _format_money(report.get("total_fees")))
+    ecols3[1].metric("Slippage", _format_money(report.get("total_slippage_cost")))
+    ecols3[2].metric("Max drawdown", _format_pct(report.get("maximum_drawdown_pct")))
+    pf = report.get("profit_factor")
+    ecols3[3].metric("Profit factor", f"{pf:.2f}" if pf is not None else "—")
+
+    ecols4 = st.columns(3)
+    ecols4[0].metric("BBO availability", _format_pct(report.get("bbo_availability_pct")))
+    ecols4[1].metric("Evidence label", report.get("evidence_label", "—"))
+    warnings = report.get("warnings") or []
+    ecols4[2].metric("Warnings", len(warnings))
+
+    if warnings:
+        st.markdown("**Warnings:**")
+        for warning in warnings[:10]:
+            st.caption(f"- {warning}")
+
+    json_path = report.get("json_path") or f"data/event_backtests/{backtest_id}.json"
+    md_path = report.get("markdown_path") or f"data/event_backtests/{backtest_id}.md"
     st.caption(f"Reports: `{json_path}` | `{md_path}`")
 
 

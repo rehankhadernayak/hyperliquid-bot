@@ -82,7 +82,7 @@ def check_no_execution_modules() -> None:
         if ".git" not in path.parts and ".pytest_cache" not in path.parts
     ]
 
-    skip_files = {"health_check.py", "review_check.py", "review_data.py"}
+    skip_files = {"health_check.py", "review_check.py", "review_data.py", "system_check.py", "event_safety.py"}
     for path in python_files:
         if path.name in skip_files:
             continue

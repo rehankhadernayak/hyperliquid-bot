@@ -201,6 +201,28 @@ def load_replay_report(replay_session_id: str) -> dict | None:
         return json.load(handle)
 
 
+EVENT_BACKTESTS_DIR = DATA.data_dir / "event_backtests"
+
+
+def load_event_backtest_reports() -> list[dict]:
+    """Load metadata for all event backtest reports, newest first."""
+    from event_backtester.event_report import list_event_backtest_reports
+
+    return list_event_backtest_reports(EVENT_BACKTESTS_DIR)
+
+
+def load_event_backtest_report(event_backtest_id: str) -> dict | None:
+    """Load one event backtest report JSON by id."""
+    path = EVENT_BACKTESTS_DIR / f"{event_backtest_id}.json"
+    if not path.exists():
+        return None
+
+    import json
+
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def market_stream_file_sizes() -> dict[str, int]:
     """Return byte sizes of raw and normalized market stream files."""
     sizes = {"raw_bytes": 0, "normalized_bytes": 0}
