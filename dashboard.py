@@ -92,6 +92,16 @@ def load_event_backtest_report(event_backtest_id: str) -> dict | None:
     return dashboard_data.load_event_backtest_report(event_backtest_id)
 
 
+@st.cache_data(ttl=30)
+def load_feature_research_reports() -> list[dict]:
+    return dashboard_data.load_feature_research_reports()
+
+
+@st.cache_data(ttl=30)
+def load_feature_research_report(feature_research_id: str) -> dict | None:
+    return dashboard_data.load_feature_research_report(feature_research_id)
+
+
 def _render_market_data_recorder() -> None:
     st.subheader("Market Data Recorder")
     st.caption(
@@ -299,6 +309,7 @@ def _render_replay_reports_section() -> None:
     st.caption(f"Reports: `{json_path}` | `{md_path}`")
 
     _render_event_backtests_section()
+    _render_feature_research_section()
 
 
 def _render_event_backtests_section() -> None:
@@ -360,6 +371,78 @@ def _render_event_backtests_section() -> None:
 
     json_path = report.get("json_path") or f"data/event_backtests/{backtest_id}.json"
     md_path = report.get("markdown_path") or f"data/event_backtests/{backtest_id}.md"
+    st.caption(f"Reports: `{json_path}` | `{md_path}`")
+
+
+def _render_feature_research_section() -> None:
+    reports = load_feature_research_reports()
+    if not reports:
+        st.caption(
+            "No feature research reports yet. Run "
+            "`python3 feature_research.py --replay-session-id <ID> --coins BTC ETH SOL "
+            "--channels trades bbo --horizons-seconds 10 30 60 300`."
+        )
+        return
+
+    st.markdown("**Feature Research**")
+    report_options = {
+        f"{r['feature_research_id'][:8]}… ({r.get('row_count', 0)} rows)": r[
+            "feature_research_id"
+        ]
+        for r in reports
+    }
+    labels = list(report_options.keys())
+    selected_label = st.selectbox(
+        "Latest feature research", labels, index=0, key="feature_research_selector"
+    )
+    research_id = report_options[selected_label]
+    report = load_feature_research_report(research_id)
+    if report is None:
+        st.warning("Feature research report file not found.")
+        return
+
+    fcols = st.columns(4)
+    fcols[0].metric("Replay session", f"{(report.get('replay_session_id') or '—')[:12]}…")
+    fcols[1].metric("Recorder session", f"{(report.get('source_recorder_session_id') or '—')[:12]}…")
+    fcols[2].metric("Row count", report.get("row_count", 0))
+    fcols[3].metric("Horizons", len(report.get("horizons") or []))
+
+    fcols2 = st.columns(4)
+    missing = report.get("missing_data_summary") or {}
+    total_rows = missing.get("total_rows") or report.get("row_count") or 0
+    feature_missing = missing.get("features") or {}
+    missing_rates = [info.get("missing_rate", 0) for info in feature_missing.values()]
+    avg_missing = (sum(missing_rates) / len(missing_rates) * 100) if missing_rates else 0.0
+    leakage = report.get("leakage_check") or {}
+    possible = report.get("top_possible_signals") or []
+    rejected = report.get("rejected_signals") or []
+
+    fcols2[0].metric("Missing-data rate", f"{avg_missing:.1f}%")
+    fcols2[1].metric("Leakage check", "PASS" if leakage.get("passed") else "FAIL")
+    fcols2[2].metric("Possible signals", len(possible))
+    fcols2[3].metric("Rejected signals", len(rejected))
+
+    hash_val = report.get("deterministic_dataset_hash") or "—"
+    st.caption(f"Deterministic hash: `{hash_val[:16]}…`" if len(hash_val) > 16 else f"Deterministic hash: `{hash_val}`")
+
+    if possible:
+        st.markdown("**Top possible signals:**")
+        for sig in possible[:5]:
+            st.caption(
+                f"- {sig.get('feature')} @ {sig.get('horizon_seconds')}s — "
+                f"corr={sig.get('correlation')}, {sig.get('reason')}"
+            )
+
+    if rejected:
+        st.markdown("**Rejected / unstable signals:**")
+        for sig in rejected[:5]:
+            st.caption(
+                f"- {sig.get('feature')} @ {sig.get('horizon_seconds')}s — "
+                f"{sig.get('candidate_signal')}"
+            )
+
+    json_path = report.get("json_path") or f"data/feature_research/{research_id}.json"
+    md_path = report.get("markdown_path") or f"data/feature_research/{research_id}.md"
     st.caption(f"Reports: `{json_path}` | `{md_path}`")
 
 

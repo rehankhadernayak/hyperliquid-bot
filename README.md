@@ -44,6 +44,7 @@ Use this project to **observe**, **paper trade**, and **backtest** — not to ex
 - **Market data quality reports** — `python3 market_data_quality_report.py` validates recorder sessions for research usability.
 - **Market data replay** — `python3 market_data_replay.py` deterministically replays recorded WebSocket sessions (read-only, paper-only).
 - **Event-driven backtester** — `python3 event_backtest.py` simulates strategy decisions on replayed trades and BBO with bid/ask-aware fills (read-only, paper-only, research-only).
+- **Feature research engine** — `python3 feature_research.py` tests whether market features predict future price movement after fees and slippage on deterministic replay data (read-only, paper-only, research-only).
 
 ---
 
@@ -348,6 +349,52 @@ Row-based backtests fill at midpoint or last trade price. Event backtests fill a
 #### Safety disclaimer
 
 Event backtesting is **paper-only research**. It does not authorize live trading, connect to execution, or modify recorder/replay/experiment files. Reports are written only under `data/event_backtests/`.
+
+### Feature research
+
+Feature research answers: *“Which features have predictive value before we build more advanced strategies?”*
+
+It consumes the same deterministic replay pipeline as event backtesting:
+
+```text
+recorded WebSocket data → quality report → deterministic replay → feature research engine
+```
+
+```bash
+python3 feature_research.py --replay-session-id <REPLAY_ID>
+python3 feature_research.py --latest-replay
+python3 feature_research.py --coins BTC ETH SOL
+python3 feature_research.py --channels trades bbo
+python3 feature_research.py --horizons-seconds 10 30 60 300
+python3 feature_research.py --output-dir data/feature_research
+python3 feature_research.py --max-events 50000
+python3 feature_research.py --replay-session-id <ID> --dry-run
+```
+
+#### Features vs labels
+
+- **Features** use only current and past market data (returns, volatility, spread, BBO imbalance, trade flow, momentum, cross-coin). They are computed at trade decision points when BBO is available and not stale.
+- **Labels** use future data (future returns, cost-aware direction, max favorable/adverse movement). Labels are created **after** feature rows are frozen in a separate pass — features never see future prices.
+
+This separation prevents future leakage: changing future prices changes labels but not features.
+
+#### Candidate signal labels
+
+The engine assigns conservative labels to each feature–horizon pair:
+
+| Label | Meaning |
+| --- | --- |
+| `NO_SIGNAL` | No measurable predictive value |
+| `WEAK_SIGNAL` | Small hint, needs more data |
+| `POSSIBLE_SIGNAL_NEEDS_MORE_DATA` | Consistent direction across horizons, above noise — still not proof |
+| `UNSTABLE_SIGNAL` | Dominated by one coin or non-monotonic buckets |
+| `REJECT` | Too much missing data or below thresholds |
+
+Feature research **does not prove profitability**. It prioritizes hypotheses for controlled event backtests.
+
+#### Safety disclaimer
+
+Feature research is **read-only** and **paper-only**. It does not connect to live trading, wallets, signing, or execution. Output is written only under `data/feature_research/`. Tests use fixtures and temporary directories — never live data files.
 
 ### Backtester
 

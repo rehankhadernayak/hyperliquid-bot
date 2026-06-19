@@ -223,6 +223,28 @@ def load_event_backtest_report(event_backtest_id: str) -> dict | None:
         return json.load(handle)
 
 
+FEATURE_RESEARCH_DIR = DATA.data_dir / "feature_research"
+
+
+def load_feature_research_reports() -> list[dict]:
+    """Load metadata for all feature research reports, newest first."""
+    from feature_research.feature_report import list_feature_research_reports
+
+    return list_feature_research_reports(FEATURE_RESEARCH_DIR)
+
+
+def load_feature_research_report(feature_research_id: str) -> dict | None:
+    """Load one feature research report JSON by id."""
+    path = FEATURE_RESEARCH_DIR / f"{feature_research_id}.json"
+    if not path.exists():
+        return None
+
+    import json
+
+    with path.open(encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def market_stream_file_sizes() -> dict[str, int]:
     """Return byte sizes of raw and normalized market stream files."""
     sizes = {"raw_bytes": 0, "normalized_bytes": 0}

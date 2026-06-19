@@ -39,7 +39,7 @@ FORBIDDEN_SOURCE_PATTERNS = frozenset(
     }
 )
 
-SCAN_PACKAGES = ("market_data", "event_backtester")
+SCAN_PACKAGES = ("market_data", "event_backtester", "feature_research")
 
 
 def _run_script(script: str) -> None:
@@ -70,6 +70,11 @@ def check_market_data_imports() -> None:
 def check_event_backtester_imports() -> None:
     import event_backtester  # noqa: F401
     import event_backtester.event_backtest_engine  # noqa: F401
+
+
+def check_feature_research_imports() -> None:
+    import feature_research  # noqa: F401
+    import feature_research.feature_engine  # noqa: F401
 
 
 def check_latest_recorder_manifest() -> None:
@@ -106,12 +111,13 @@ def check_latest_replay_report() -> None:
 
 
 def check_no_execution_flags_in_reports() -> None:
-    from dashboard_data import load_event_backtest_reports, load_replay_reports, load_quality_reports
+    from dashboard_data import load_event_backtest_reports, load_feature_research_reports, load_replay_reports, load_quality_reports
 
     for loader, id_key in (
         (load_quality_reports, "recorder_session_id"),
         (load_replay_reports, "replay_session_id"),
         (load_event_backtest_reports, "event_backtest_id"),
+        (load_feature_research_reports, "feature_research_id"),
     ):
         for meta in loader():
             report_id = meta.get(id_key) or meta.get("session_id")
@@ -125,7 +131,7 @@ def check_no_wallet_signing_in_packages() -> None:
         if not pkg_dir.exists():
             continue
         for path in pkg_dir.rglob("*.py"):
-            if path.name in {"event_safety.py"}:
+            if path.name in {"event_safety.py", "feature_safety.py"}:
                 continue
             stem = path.stem
             if stem in FORBIDDEN_MODULE_NAMES:
@@ -166,6 +172,7 @@ def check_dashboard_loaders() -> None:
     dashboard_data.load_quality_reports()
     dashboard_data.load_replay_reports()
     dashboard_data.load_event_backtest_reports()
+    dashboard_data.load_feature_research_reports()
     dashboard_data.load_recorder_manifests()
     dashboard_data.load_recorder_status()
 
@@ -176,6 +183,7 @@ def main() -> int:
         ("review_check.py", check_review_check),
         ("market_data imports", check_market_data_imports),
         ("event_backtester imports", check_event_backtester_imports),
+        ("feature_research imports", check_feature_research_imports),
         ("latest recorder manifest", check_latest_recorder_manifest),
         ("latest quality report", check_latest_quality_report),
         ("latest replay report", check_latest_replay_report),
