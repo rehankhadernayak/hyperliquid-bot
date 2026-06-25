@@ -6,13 +6,16 @@ paper trade results, and backtest summaries from local CSV/JSON files.
 No wallet, signing, or real exchange access.
 """
 
-from datetime import date
+from datetime import date, datetime, timezone
 
 import pandas as pd
 import streamlit as st
 
 from config import DATA, MARKET, PAPER_TRADING, VERSION
 import dashboard_data
+import dashboard_live
+import dashboard_charts
+import dashboard_market_archive
 import dashboard_review
 import session
 
@@ -102,6 +105,797 @@ def load_feature_research_report(feature_research_id: str) -> dict | None:
     return dashboard_data.load_feature_research_report(feature_research_id)
 
 
+@st.cache_data(ttl=5)
+def load_live_market_dashboard() -> dict:
+    return dashboard_data.load_live_market_dashboard_bundle()
+
+
+def _format_timestamp_ms(timestamp_ms: int | float | None) -> str:
+    if timestamp_ms is None:
+        return "—"
+    try:
+        dt = datetime.fromtimestamp(int(timestamp_ms) / 1000, tz=timezone.utc)
+        return dt.strftime("%Y-%m-%d %H:%M:%S UTC")
+    except (TypeError, ValueError, OSError):
+        return str(timestamp_ms)
+
+
+def _apply_chart_auto_refresh(*, enabled: bool, interval_seconds: int) -> tuple[bool, str | None]:
+    """Trigger non-blocking Streamlit reruns when optional dependency is available."""
+    if not enabled:
+        return False, None
+    try:
+        from streamlit_autorefresh import st_autorefresh
+
+        st_autorefresh(interval=max(1, interval_seconds) * 1000, key="live_chart_autorefresh")
+        return True, None
+    except ImportError:
+        return False, dashboard_live.auto_refresh_status_message(
+            enabled=True,
+            dependency_available=False,
+        )
+
+
+def _render_dashboard_state_diagnostics(
+    bundle: dict | None,
+    *,
+    chart_data: dict | None = None,
+) -> None:
+    """Collapsed read-only state diagnostics for chart/source debugging."""
+    ws = (bundle or {}).get("websocket_status") or {}
+    context = (bundle or {}).get("context") or {}
+    chart_data = chart_data or {}
+    with st.expander("Dashboard State Diagnostics", expanded=False):
+        st.write(f"websocket_status: **{ws.get('display_connection_status') or ws.get('connection_state') or '—'}**")
+        st.write(
+            f"latest_session_id: **"
+            f"{dashboard_live.resolve_latest_recorder_session_id(context=context, archive_index=chart_data.get('archive_index')) or '—'}"
+            f"**"
+        )
+        st.write(f"selected_chart_range: **{chart_data.get('selected_chart_range') or '—'}**")
+        st.write(f"chart_data_source: **{chart_data.get('chart_data_source', 'none')}**")
+        st.write(f"chart_rows_loaded: **{chart_data.get('chart_rows_loaded', 0)}**")
+        st.write(f"chart_empty_reason: **{chart_data.get('chart_empty_reason') or '—'}**")
+        st.write(f"normalized_available: **{chart_data.get('normalized_data_available', False)}**")
+        st.write(f"raw_preview_available: **{chart_data.get('raw_preview_available', False)}**")
+        st.write(f"archive_available: **{chart_data.get('archive_available', False)}**")
+        st.write(
+            f"latest_local_timestamp: **{_format_timestamp_ms(chart_data.get('latest_local_timestamp_ms'))}**"
+        )
+        st.write(
+            f"earliest_local_timestamp: **{_format_timestamp_ms(chart_data.get('earliest_local_timestamp_ms'))}**"
+        )
+        st.write(f"fallback_used: **{chart_data.get('fallback_used', False)}**")
+        review_loaded = st.session_state.get("review_mode_loaded")
+        st.write(f"review_mode_loaded: **{review_loaded if review_loaded is not None else '—'}**")
+
+
+def _render_live_dashboard_debug_expander(
+    bundle: dict | None,
+    *,
+    chart_data: dict | None = None,
+    bundle_loaded: bool = False,
+    auto_refresh_enabled: bool | None = None,
+    refresh_interval_seconds: int | None = None,
+) -> None:
+    """Read-only debug panel — collapsed by default, schema-safe."""
+    try:
+        snapshot = dashboard_live.live_dashboard_debug_snapshot(
+            bundle,
+            chart_data=chart_data,
+            bundle_loaded=bundle_loaded,
+            auto_refresh_enabled=auto_refresh_enabled,
+            refresh_interval_seconds=refresh_interval_seconds,
+        )
+    except Exception as error:
+        with st.expander("Debug (internal)", expanded=False):
+            st.error("Debug snapshot failed to build")
+            st.exception(error)
+        return
+
+    with st.expander("Debug (internal)", expanded=False):
+        st.caption("Raw paths, bundle keys, and internal diagnostics — expand only when needed.")
+        st.write(f"bundle loaded: **{snapshot.get('bundle_loaded', False)}**")
+        st.write(f"auto_refresh_enabled: **{snapshot.get('auto_refresh_enabled')}**")
+        st.write(f"refresh_interval_seconds: **{snapshot.get('refresh_interval_seconds')}**")
+        st.write(f"selected_chart_range: **{snapshot.get('selected_chart_range') or '—'}**")
+        st.write(f"WebSocket status state: **{snapshot.get('websocket_state', '—')}**")
+        st.write(f"market rows count: **{snapshot.get('market_rows_count', 0)}**")
+        st.write(f"candle rows count: **{snapshot.get('candle_rows_count', 0)}**")
+        st.write(f"chart rows loaded: **{snapshot.get('chart_rows_loaded')}**")
+        st.write(f"chart rows displayed: **{snapshot.get('chart_rows_displayed')}**")
+        st.write(
+            f"decision timeline rows count: **{snapshot.get('decision_timeline_rows_count', 0)}**"
+        )
+        st.write(f"historical fallback: **{snapshot.get('historical_fallback', False)}**")
+        st.write(
+            f"normalized data available: **{snapshot.get('normalized_data_available', False)}**"
+        )
+        st.write(f"raw preview available: **{snapshot.get('raw_preview_available', False)}**")
+        st.write(f"raw preview rows: **{snapshot.get('raw_preview_rows', 0)}**")
+        st.write(f"normalized rows: **{snapshot.get('normalized_rows')}**")
+        st.write(f"archive rows: **{snapshot.get('archive_rows')}**")
+        st.write(f"raw preview session id: **{snapshot.get('raw_preview_session_id') or '—'}**")
+        st.write(f"chart data source: **{snapshot.get('chart_data_source', 'none')}**")
+        st.write(
+            f"earliest local timestamp: **{_format_timestamp_ms(snapshot.get('earliest_local_timestamp'))}**"
+        )
+        st.write(
+            f"latest local timestamp: **{_format_timestamp_ms(snapshot.get('latest_local_timestamp'))}**"
+        )
+        st.write(
+            f"requested range start: **{_format_timestamp_ms(snapshot.get('requested_range_start'))}**"
+        )
+        st.write(
+            f"requested range end: **{_format_timestamp_ms(snapshot.get('requested_range_end'))}**"
+        )
+        st.write(f"local coverage percent: **{snapshot.get('local_coverage_percent')}**")
+        st.write(
+            f"missing history warning: **{snapshot.get('missing_history_warning') or '—'}**"
+        )
+        raw_files = snapshot.get("raw_preview_files_read") or []
+        if raw_files:
+            st.write(f"raw preview files read: `{raw_files}`")
+        raw_channels = snapshot.get("raw_preview_channels_used") or []
+        if raw_channels:
+            st.write(f"raw preview channels used: **{raw_channels}**")
+        raw_warnings = snapshot.get("raw_preview_warnings") or []
+        if raw_warnings:
+            st.caption(f"raw preview warnings: {raw_warnings}")
+        latest_path = snapshot.get("latest_data_path")
+        if latest_path:
+            st.write(f"latest data path: `{latest_path}`")
+        load_error = snapshot.get("load_error")
+        if load_error:
+            st.caption(f"load error: {load_error}")
+        st.write(f"normalization queue count: **{snapshot.get('normalization_queue_count', 0)}**")
+        st.write(
+            f"newest unprocessed session id: **{snapshot.get('newest_unprocessed_session_id') or '—'}**"
+        )
+        st.write(
+            f"normalization sessions scanned: **{snapshot.get('normalization_sessions_scanned', 0)}**"
+        )
+        queue_warnings = snapshot.get("normalization_queue_warnings") or []
+        if queue_warnings:
+            st.caption(f"normalization queue warnings: {queue_warnings}")
+
+        if bundle:
+            with st.expander("Internal bundle keys", expanded=False):
+                st.json({key: type(value).__name__ for key, value in bundle.items()})
+            with st.expander("Raw JSON diagnostics", expanded=False):
+                st.json(
+                    {
+                        "context": bundle.get("context"),
+                        "load_error": bundle.get("load_error"),
+                        "websocket_status_keys": list(
+                            (bundle.get("websocket_status") or {}).keys()
+                        ),
+                    }
+                )
+
+
+def _render_live_market_charts(bundle: dict, context: dict) -> dict:
+    """Read-only price charts (visualization only, no paper-trade dependency)."""
+    st.markdown("#### Live Charts")
+    st.caption(dashboard_live.DATA_QUALITY_EXPLANATION)
+
+    ws = bundle.get("websocket_status") or {}
+    default_auto_refresh = dashboard_live.default_auto_refresh_enabled(ws)
+    refresh_interval = dashboard_live.DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS
+
+    if "live_chart_auto_refresh" not in st.session_state:
+        st.session_state["live_chart_auto_refresh"] = default_auto_refresh
+
+    control_cols = st.columns(8)
+    coin_options = ["All"] + list(dashboard_charts.CHART_COINS)
+    coin_sel = control_cols[0].selectbox("Coin", coin_options, key="live_chart_coin")
+    range_options = list(dashboard_charts.CHART_RANGE_KEYS)
+    default_range_index = range_options.index(dashboard_charts.DEFAULT_CHART_RANGE)
+    range_sel = control_cols[1].selectbox(
+        "Chart range",
+        range_options,
+        index=default_range_index,
+        key="live_chart_range",
+    )
+    resolution_sel = control_cols[2].selectbox(
+        "Resolution",
+        list(dashboard_charts.RESOLUTION_SECONDS.keys()),
+        key="live_chart_resolution",
+    )
+    chart_mode = control_cols[3].selectbox("Chart mode", ["line", "candles"], key="live_chart_mode")
+    show_markers = control_cols[4].checkbox("Paper signal markers", value=False, key="live_chart_markers")
+    show_risk_lines = control_cols[5].checkbox("Paper TP/SL lines", value=False, key="live_chart_risk_lines")
+    auto_refresh = control_cols[6].checkbox(
+        "Auto-refresh live charts",
+        value=st.session_state.get("live_chart_auto_refresh", default_auto_refresh),
+        key="live_chart_auto_refresh",
+    )
+    show_latest_fallback = control_cols[7].checkbox(
+        "Show latest available data when selected range is empty",
+        value=st.session_state.get("live_chart_latest_fallback", True),
+        key="live_chart_latest_fallback",
+    )
+
+    dependency_available, auto_refresh_message = _apply_chart_auto_refresh(
+        enabled=auto_refresh,
+        interval_seconds=refresh_interval,
+    )
+
+    data_mode = context.get("data_mode")
+    historical = data_mode == "historical"
+    session_id = context.get("recorder_session_id")
+    ws = bundle.get("websocket_status") or {}
+    recorder_running = bool(ws.get("running"))
+    archive_index = dashboard_market_archive.build_market_archive_index()
+
+    chart_data = dashboard_charts.build_chart_data(
+        session_id=session_id,
+        historical=historical or context.get("data_mode") == "missing",
+        range_key=range_sel,
+        resolution_key=resolution_sel,
+        recommendations=bundle.get("recommendations") if show_markers else None,
+        timeline=bundle.get("decision_timeline") if show_markers else None,
+        paper_trades=None,
+        archive_index=archive_index,
+        show_latest_fallback=show_latest_fallback,
+        recorder_running=recorder_running,
+    )
+
+    chart_source = chart_data.get("chart_data_source", "none")
+
+    if auto_refresh_message:
+        st.info(auto_refresh_message)
+    elif auto_refresh and dependency_available:
+        st.caption(f"Auto-refresh enabled ({refresh_interval}s). Read-only local data reload only.")
+
+    if data_mode == "missing" and chart_source == "none":
+        st.info("No live recorder data found.")
+    elif historical and chart_data.get("is_live_range"):
+        st.caption("Recorder not running — showing latest locally collected data for the selected range.")
+
+    if chart_data.get("is_all_local"):
+        st.info(dashboard_market_archive.ALL_LOCAL_LABEL)
+
+    if chart_data.get("missing_history_warning"):
+        st.warning(chart_data.get("missing_history_warning"))
+
+    if (
+        data_mode != "missing"
+        and not chart_data.get("normalized_data_available")
+        and not chart_data.get("raw_preview_available")
+        and chart_source == "none"
+    ):
+        st.info("No market data found for the selected range.")
+
+    if chart_data.get("chart_data_source") == "raw_preview":
+        st.warning(dashboard_charts.RAW_PREVIEW_MODE_LABEL)
+
+    mode_label = chart_data.get("data_mode_label", "")
+    coins_to_render = (
+        list(dashboard_charts.CHART_COINS)
+        if coin_sel == "All"
+        else [coin_sel]
+    )
+
+    for coin in coins_to_render:
+        coin_data = (chart_data.get("coins") or {}).get(coin) or {}
+        if not coin_data.get("has_data") and not coin_data.get("has_candles"):
+            st.info(dashboard_charts.format_coin_chart_empty_message(coin, chart_data))
+            continue
+
+        chart_col, side_col = st.columns([3, 1])
+        with chart_col:
+            fig = dashboard_charts.create_price_chart_figure(
+                coin,
+                coin_data,
+                chart_mode=chart_mode,
+                show_markers=show_markers,
+                show_risk_lines=show_risk_lines,
+                data_mode_label=mode_label,
+            )
+            st.plotly_chart(fig, use_container_width=True)
+
+        with side_col:
+            st.markdown(f"**{coin}**")
+            latest = coin_data.get("latest_price")
+            st.metric("Latest price", f"{latest:.4f}" if latest is not None else "—")
+            spread = coin_data.get("spread_bps")
+            if spread is not None:
+                st.caption(f"Spread: {spread} bps")
+
+    return chart_data
+
+
+def _render_header_status_row(
+    bundle: dict,
+    chart_data: dict | None,
+) -> None:
+    """Section A: compact header status row."""
+    header = dashboard_live.meeting_header_cards(bundle)
+    ws = bundle.get("websocket_status") or {}
+    ws_status = ws.get("display_connection_status") or header.get("websocket", "—")
+    ws_color = (
+        "#2ecc71"
+        if ws_status == "CONNECTED"
+        else "#f39c12"
+        if ws_status == "STALE"
+        else "#e74c3c"
+    )
+    bot_color = "#2ecc71" if header.get("paper_bot") == "RUNNING" else "#f39c12"
+    chart_source = (chart_data or {}).get("chart_data_source") or "none"
+    seconds_since = (chart_data or {}).get("seconds_since_latest_market_update")
+    if seconds_since is None:
+        hb_age = ws.get("heartbeat_age_seconds")
+        if hb_age is not None:
+            seconds_since = hb_age
+
+    card_cols = st.columns(5)
+    card_cols[0].markdown(
+        f"**WebSocket**  \n"
+        f"<span style='font-size:1.4rem;font-weight:700;color:{ws_color};'>"
+        f"{ws_status}</span>",
+        unsafe_allow_html=True,
+    )
+    card_cols[1].markdown(
+        f"**Paper Bot**  \n"
+        f"<span style='font-size:1.4rem;font-weight:700;color:{bot_color};'>"
+        f"{header.get('paper_bot', '—')}</span>",
+        unsafe_allow_html=True,
+    )
+    card_cols[2].markdown(
+        "**Safety**  \n"
+        "<span style='font-size:1.4rem;font-weight:700;color:#3498db;'>"
+        f"{header.get('safety', 'PAPER ONLY')}</span>",
+        unsafe_allow_html=True,
+    )
+    card_cols[3].metric(
+        "Market update age",
+        f"{seconds_since:.0f}s" if seconds_since is not None else "—",
+    )
+    card_cols[4].metric("Chart data source", chart_source)
+
+
+def _render_recorder_reliability_panel(bundle: dict, context: dict) -> None:
+    """Section C: compact recorder reliability panel."""
+    st.markdown("#### Recorder Reliability")
+    ws = bundle.get("websocket_status") or {}
+    session_id = dashboard_live.resolve_latest_recorder_session_id(
+        context=context,
+    )
+    manifest = dashboard_live.resolve_latest_recorder_manifest(
+        context=context,
+        session_id=session_id,
+    )
+    checkpoint = (
+        dashboard_data.load_recorder_checkpoint(session_id)
+        if session_id
+        else None
+    )
+    quality_report = (
+        dashboard_data.load_quality_report(session_id)
+        if session_id
+        else None
+    )
+    summary = dashboard_live.build_recorder_reliability_summary(
+        ws,
+        context=context,
+        checkpoint=checkpoint,
+        manifest=manifest,
+        quality_report=quality_report,
+    )
+
+    if ws.get("stale"):
+        st.warning(
+            "Stale WebSocket status — recorder process may have crashed. "
+            "Run `python3 websocket_recorder.py --recover-latest`."
+        )
+    if summary.get("state_mismatch_warning"):
+        st.warning(summary["state_mismatch_warning"])
+
+    rcols = st.columns(5)
+    rcols[0].metric("Session ID", f"{(summary.get('session_id') or '—')[:12]}…")
+    rcols[1].metric("State", summary.get("state", "—"))
+    rcols[2].metric("Raw events", summary.get("raw_events", "—"))
+    rcols[3].metric("Dropped raw", summary.get("dropped_raw", 0))
+    rcols[4].metric("Reconnects", summary.get("reconnects", 0))
+
+    rcols2 = st.columns(5)
+    rcols2[0].metric("Gaps", summary.get("gaps", 0))
+    rcols2[1].metric("Degraded", "Yes" if summary.get("degraded") else "No")
+    rcols2[2].metric("Shutdown reason", summary.get("shutdown_reason") or "—")
+    rcols2[3].metric("Manifest", summary.get("manifest_consistency", "—"))
+    rcols2[4].metric("Quality", summary.get("quality_label", "—"))
+
+    if summary.get("checkpoint_age"):
+        st.caption(f"Latest checkpoint: {summary['checkpoint_age']}")
+    if manifest and summary.get("manifest_state"):
+        st.caption(f"Latest manifest state: {summary.get('manifest_state')}")
+
+
+def _render_data_coverage_section(archive_index: dict) -> None:
+    """Section D: per-coin data coverage table."""
+    st.markdown("#### Data Coverage")
+    rows = dashboard_live.build_data_coverage_rows(archive_index)
+    display_rows = []
+    for row in rows:
+        display_rows.append(
+            {
+                "Coin": row.get("coin"),
+                "Earliest local": _format_timestamp_ms(row.get("earliest_local_timestamp")),
+                "Latest local": _format_timestamp_ms(row.get("latest_local_timestamp")),
+                "Trades": "Yes" if row.get("trades_available") else "No",
+                "BBO": "Yes" if row.get("bbo_available") else "No",
+                "Candles": "Yes" if row.get("candles_available") else "No",
+                "Normalized": "Yes" if row.get("normalized_available") else "No",
+                "Raw": "Yes" if row.get("raw_available") else "No",
+                "Note": row.get("local_coverage_note", "—"),
+            }
+        )
+    st.dataframe(pd.DataFrame(display_rows), use_container_width=True, hide_index=True)
+
+
+def _render_research_readiness_section(
+    archive_index: dict,
+    *,
+    session_id: str | None,
+) -> None:
+    """Section E: research pipeline readiness labels."""
+    st.markdown("#### Research Readiness")
+    try:
+        replay_count = len(load_replay_reports())
+        feature_count = len(load_feature_research_reports())
+        backtest_count = len(load_event_backtest_reports())
+    except Exception:
+        replay_count = feature_count = backtest_count = 0
+
+    readiness = dashboard_live.build_research_readiness(
+        archive_index,
+        session_id=session_id,
+        replay_count=replay_count,
+        feature_count=feature_count,
+        backtest_count=backtest_count,
+    )
+
+    for label, ready in readiness.get("labels", {}).items():
+        if ready:
+            st.success(f"**{label}**")
+        else:
+            st.info(f"**{label}** — not ready")
+
+    st.caption(readiness.get("explanation", dashboard_live.DATA_QUALITY_EXPLANATION))
+    for key, text in (readiness.get("data_quality_labels") or {}).items():
+        st.caption(f"- {text}")
+
+    next_cmd = readiness.get("next_recommended_command")
+    if next_cmd:
+        st.code(next_cmd, language="bash")
+
+
+def _normalization_queue_display_rows(rows: list[dict]) -> list[dict]:
+    display_rows = []
+    for row in rows:
+        display_rows.append(
+            {
+                "Session ID": row.get("session_id"),
+                "Start": _format_timestamp_ms(row.get("start_time_ms")),
+                "End": _format_timestamp_ms(row.get("end_time_ms")),
+                "Duration": row.get("duration_label", "—"),
+                "Raw events": row.get("raw_events"),
+                "Quality": row.get("quality_label", "unknown"),
+                "Shutdown reason": row.get("shutdown_reason", "—"),
+                "Normalized": "Yes" if row.get("normalized_exists") else "No",
+                "Manifest": row.get("manifest_consistency", "—"),
+                "Channels": row.get("recommended_channels", "—"),
+                "Recommended command": row.get("recommended_command", "—"),
+                "Next step": row.get("next_step", "—"),
+            }
+        )
+    return display_rows
+
+
+def _render_normalization_queue_section() -> None:
+    """Section F: raw-only sessions awaiting offline normalization (display-only commands)."""
+    st.markdown("#### Normalization Queue")
+    st.caption(
+        "Raw-only recorder sessions that can be normalized offline. "
+        "Commands are display-only — the dashboard never runs normalization."
+    )
+    show_processed = st.checkbox(
+        "Show processed sessions",
+        value=False,
+        key="normalization_queue_show_processed",
+    )
+    queue = dashboard_live.build_normalization_queue(show_processed=show_processed)
+    rows = queue.get("rows") or []
+    visible_rows = queue.get("visible_rows") or rows[: dashboard_live.DEFAULT_NORMALIZATION_QUEUE_VISIBLE]
+    older_rows = queue.get("older_rows") or rows[dashboard_live.DEFAULT_NORMALIZATION_QUEUE_VISIBLE :]
+
+    warnings = queue.get("normalization_queue_warnings") or []
+    for warning in warnings[:5]:
+        st.caption(f"Queue warning: {warning}")
+
+    if not rows:
+        st.info("No raw-usable sessions waiting for offline normalization.")
+        return
+
+    st.dataframe(
+        pd.DataFrame(_normalization_queue_display_rows(visible_rows)),
+        use_container_width=True,
+        hide_index=True,
+    )
+
+    if older_rows:
+        with st.expander(f"Older sessions ({len(older_rows)})", expanded=False):
+            st.dataframe(
+                pd.DataFrame(_normalization_queue_display_rows(older_rows)),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+    newest = queue.get("newest_unprocessed_session_id")
+    if newest and not show_processed:
+        st.caption(
+            f"Newest unprocessed session: `{newest}`. "
+            f"Queue count: {queue.get('normalization_queue_count', 0)}."
+        )
+
+
+def _render_strategy_research_summary() -> None:
+    """Section F: compact strategy research summary from event backtests."""
+    st.markdown("#### Strategy Research")
+    try:
+        reports = load_event_backtest_reports()
+    except Exception as error:
+        st.warning("Event backtest reports unavailable.")
+        st.caption(str(error))
+        return
+
+    if not reports:
+        st.info(
+            "No event backtest reports yet. Run "
+            "`python3 event_backtest.py --latest-replay --coins BTC ETH SOL "
+            "--strategy contrarian_bbo_confirmation_v1` after replay validation."
+        )
+        return
+
+    latest = reports[0]
+    scols = st.columns(5)
+    scols[0].metric("Strategy", latest.get("strategy_name", "—"))
+    scols[1].metric("Profile", (latest.get("profile_name") or "—")[:20])
+    scols[2].metric("Mode", latest.get("run_mode", latest.get("mode", "—")))
+    scols[3].metric("Evidence", latest.get("evidence_label", "—"))
+    scols[4].metric("Completed trades", latest.get("completed_trades", 0))
+
+    scols2 = st.columns(3)
+    scols2[0].metric("Net return", _format_pct(latest.get("net_return_pct")))
+    scols2[1].metric("Max drawdown", _format_pct(latest.get("maximum_drawdown_pct")))
+    blocked = latest.get("blocked_signals")
+    scols2[2].metric("Blocked signals", blocked if blocked is not None else "—")
+
+    blocked_reasons = latest.get("blocked_reasons") or latest.get("top_blocked_reasons") or []
+    if blocked_reasons:
+        with st.expander("Blocked reasons", expanded=False):
+            for reason in blocked_reasons[:10]:
+                st.caption(f"- {reason}")
+
+    with st.expander("All event backtest reports", expanded=False):
+        summary_rows = [
+            {
+                "ID": (r.get("event_backtest_id") or "—")[:8],
+                "Strategy": r.get("strategy_name"),
+                "Profile": r.get("profile_name"),
+                "Trades": r.get("completed_trades"),
+                "Net return (%)": r.get("net_return_pct"),
+                "Evidence": r.get("evidence_label"),
+            }
+            for r in reports[:10]
+        ]
+        st.dataframe(pd.DataFrame(summary_rows), use_container_width=True, hide_index=True)
+
+
+def _render_paper_portfolio_section(bundle: dict) -> None:
+    """Section G: paper portfolio/risk with detailed tables behind expanders."""
+    st.markdown("#### Paper Portfolio / Risk")
+    portfolio = bundle.get("paper_portfolio") or {}
+    if not portfolio:
+        st.info("No paper portfolio data found. Run `python3 main.py` to populate paper metrics.")
+        return
+
+    pcols1 = st.columns(4)
+    pcols1[0].metric("Paper equity", _format_money(portfolio.get("paper_equity")))
+    pcols1[1].metric("Open positions", portfolio.get("open_paper_positions", 0))
+    pcols1[2].metric("Exposure", _format_money(portfolio.get("exposure")))
+    pcols1[3].metric("Capital readiness", portfolio.get("capital_readiness_label", "—"))
+
+    pcols2 = st.columns(4)
+    pcols2[0].metric("Fees", _format_money(portfolio.get("fees")))
+    pcols2[1].metric("Slippage", _format_money(portfolio.get("slippage")))
+    pcols2[2].metric("Max drawdown", _format_pct(portfolio.get("max_drawdown_pct")))
+    pcols2[3].metric("Session trades", portfolio.get("session_trade_count", 0))
+
+    blocked_reasons = portfolio.get("blocked_reasons") or []
+    if blocked_reasons:
+        with st.expander("Blocked reasons", expanded=False):
+            for reason in blocked_reasons[:10]:
+                st.caption(f"- {reason}")
+
+    with st.expander("Per-second market data (raw table)", expanded=False):
+        per_second = bundle.get("per_second_market") or []
+        has_market_values = any(
+            row.get("latest_price") is not None or row.get("best_bid") is not None
+            for row in per_second
+        )
+        if per_second and has_market_values:
+            ps_rows = [
+                {
+                    "Coin": row.get("coin"),
+                    "Latest price": row.get("latest_price"),
+                    "Best bid": row.get("best_bid"),
+                    "Best ask": row.get("best_ask"),
+                    "Spread bps": row.get("spread_bps"),
+                    "Trades/s": row.get("trades_per_second"),
+                    "Last update": row.get("last_update_time"),
+                }
+                for row in per_second
+            ]
+            st.dataframe(pd.DataFrame(ps_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No normalized market data found yet.")
+
+    with st.expander("Live bot decisions (paper-only)", expanded=False):
+        decisions = bundle.get("live_bot_decisions") or []
+        if decisions:
+            dec_rows = [
+                {
+                    "Coin": item.get("coin"),
+                    "Decision": item.get("decision"),
+                    "Reason": item.get("reason"),
+                    "Signal strength": item.get("signal_strength"),
+                }
+                for item in decisions
+            ]
+            st.dataframe(pd.DataFrame(dec_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("Run `python3 main.py` to populate paper-only bot decisions.")
+
+    with st.expander("Decision timeline (paper-only)", expanded=False):
+        timeline = bundle.get("decision_timeline") or []
+        if timeline:
+            tl_rows = [
+                {
+                    "Timestamp": item.get("timestamp"),
+                    "Coin": item.get("coin"),
+                    "Decision": item.get("decision"),
+                    "Reason": item.get("reason"),
+                    "Price": item.get("price"),
+                }
+                for item in timeline
+            ]
+            st.dataframe(pd.DataFrame(tl_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No paper decision timeline found.")
+
+    with st.expander("Feature signals (research indicators)", expanded=False):
+        features = bundle.get("feature_signals") or []
+        if features:
+            feat_rows = [
+                {
+                    "Coin": item.get("coin"),
+                    "BBO imbalance": item.get("bbo_imbalance"),
+                    "Return 5s (%)": item.get("return_5s"),
+                    "Spread bps": item.get("spread_bps"),
+                }
+                for item in features
+            ]
+            st.dataframe(pd.DataFrame(feat_rows), use_container_width=True, hide_index=True)
+        else:
+            st.info("No normalized market data found yet.")
+
+
+def _render_live_market_dashboard() -> None:
+    st.subheader("Live Market Dashboard")
+    st.caption("Read-only public market data. Paper-only decisions. No orders or wallet actions.")
+
+    bundle: dict | None = None
+    chart_data: dict | None = None
+    bundle_loaded = False
+    archive_index: dict = {}
+
+    try:
+        bundle = load_live_market_dashboard()
+        bundle_loaded = True
+        load_error = bundle.get("load_error")
+        if load_error:
+            st.warning(f"Live dashboard partial load: {load_error}")
+
+        context = bundle.get("context") or {}
+        session_id = context.get("recorder_session_id")
+
+        try:
+            archive_index = dashboard_market_archive.build_market_archive_index()
+        except Exception as error:
+            st.warning("Data coverage index unavailable.")
+            st.caption(str(error))
+            archive_index = {}
+
+        st.divider()
+
+        try:
+            chart_data = _render_live_market_charts(bundle, context)
+        except Exception as error:
+            st.error("Live charts failed to load")
+            st.exception(error)
+            chart_data = chart_data or {}
+
+        try:
+            _render_header_status_row(bundle, chart_data)
+        except Exception as error:
+            st.warning("Header status row unavailable.")
+            st.caption(str(error))
+
+        st.divider()
+
+        try:
+            _render_recorder_reliability_panel(bundle, context)
+        except Exception as error:
+            st.warning("Recorder reliability panel unavailable.")
+            st.caption(str(error))
+
+        st.divider()
+
+        try:
+            _render_data_coverage_section(archive_index)
+        except Exception as error:
+            st.warning("Data coverage section unavailable.")
+            st.caption(str(error))
+
+        st.divider()
+
+        try:
+            _render_research_readiness_section(archive_index, session_id=session_id)
+        except Exception as error:
+            st.warning("Research readiness section unavailable.")
+            st.caption(str(error))
+
+        st.divider()
+
+        try:
+            _render_normalization_queue_section()
+        except Exception as error:
+            st.warning("Normalization queue section unavailable.")
+            st.caption(str(error))
+
+        st.divider()
+
+        try:
+            _render_strategy_research_summary()
+        except Exception as error:
+            st.warning("Strategy research section unavailable.")
+            st.caption(str(error))
+
+        st.divider()
+
+        try:
+            _render_paper_portfolio_section(bundle)
+        except Exception as error:
+            st.warning("Paper portfolio section unavailable.")
+            st.caption(str(error))
+
+    except Exception as error:
+        st.error("Live Market Dashboard failed to load")
+        st.exception(error)
+    finally:
+        auto_refresh_enabled = st.session_state.get("live_chart_auto_refresh")
+        _render_dashboard_state_diagnostics(bundle, chart_data=chart_data)
+        _render_live_dashboard_debug_expander(
+            bundle,
+            chart_data=chart_data,
+            bundle_loaded=bundle_loaded,
+            auto_refresh_enabled=auto_refresh_enabled,
+            refresh_interval_seconds=dashboard_live.DEFAULT_AUTO_REFRESH_INTERVAL_SECONDS,
+        )
+
+
 def _render_market_data_recorder() -> None:
     st.subheader("Market Data Recorder")
     st.caption(
@@ -114,28 +908,36 @@ def _render_market_data_recorder() -> None:
     if status is None:
         st.info(
             "No recorder session found. Run "
-            "`python3 websocket_recorder.py --coins BTC ETH SOL` to start collecting."
+            "`python3 websocket_recorder.py --long-run --coins BTC ETH SOL` to start collecting."
         )
         return
 
     running = status.get("running", False)
+    state = status.get("state", "STOPPED")
     conn_state = status.get("connection_state", "—")
+
+    if state == "STALE_STATUS":
+        st.warning(
+            "Stale status — recorder process may have crashed. "
+            "Run `python3 websocket_recorder.py --recover-latest`"
+        )
+
     conn_label = "Connected" if conn_state == "CONNECTED" and running else (
         "Disconnected" if not running else conn_state
     )
 
     cols = st.columns(4)
-    cols[0].metric("Status", conn_label)
-    cols[1].metric("Uptime", f"{status.get('uptime_seconds', 0):.0f}s")
+    cols[0].metric("Status", conn_label if running else state)
+    cols[1].metric("PID alive", "Yes" if status.get("pid_alive") else "No")
     cols[2].metric("Reconnects", status.get("reconnect_count", 0))
     cols[3].metric("Msgs/sec", f"{status.get('messages_per_second', 0):.2f}")
 
+    hb_age = status.get("heartbeat_age_seconds")
     cols2 = st.columns(4)
-    cols2[0].metric("Latency p50", f"{status.get('latency_p50_ms', '—')} ms")
-    cols2[1].metric("Latency p95", f"{status.get('latency_p95_ms', '—')} ms")
-    cols2[2].metric("Latency p99", f"{status.get('latency_p99_ms', '—')} ms")
-    hb = status.get("heartbeat", {})
-    cols2[3].metric("Heartbeat RTT", f"{hb.get('last_round_trip_ms', '—')} ms")
+    cols2[0].metric("Heartbeat age", f"{hb_age:.0f}s" if hb_age is not None else "—")
+    cols2[1].metric("Long-run", "Yes" if status.get("long_run") else "No")
+    cols2[2].metric("Live norm", "On" if status.get("live_normalization") else "Off")
+    cols2[3].metric("Dropped norm", status.get("normalized_dropped_count", 0))
 
     cols3 = st.columns(4)
     cols3[0].metric("Malformed", status.get("malformed_count", 0))
@@ -143,17 +945,37 @@ def _render_market_data_recorder() -> None:
     cols3[2].metric("Gaps", status.get("gap_count", 0))
     cols3[3].metric(
         "Active Subs",
-        status.get("active_subscriptions", 0),
+        f"{status.get('active_subscriptions', 0)}/{status.get('requested_subscriptions', '—')}",
     )
 
+    session_id = status.get("recorder_session_id", "—")
     raw_mb = sizes.get("raw_bytes", 0) / (1024 * 1024)
     norm_mb = sizes.get("normalized_bytes", 0) / (1024 * 1024)
     st.caption(
-        f"Session: `{status.get('recorder_session_id', '—')}` | "
+        f"Session: `{session_id}` | "
         f"Coins: {', '.join(status.get('coins', []))} | "
         f"Last event: {status.get('last_message_at_ms', '—')} | "
-        f"Raw: {raw_mb:.2f} MB | Normalized: {norm_mb:.2f} MB"
+        f"Raw: {raw_mb:.2f} MB | Normalized: {norm_mb:.2f} MB | "
+        f"Degraded: {status.get('degraded', False)}"
     )
+
+    if session_id and session_id != "—":
+        checkpoint = dashboard_data.load_recorder_checkpoint(session_id)
+        if checkpoint:
+            st.caption(
+                f"Latest checkpoint: {checkpoint.get('generated_at', '—')} | "
+                f"Duration: {checkpoint.get('session_duration_seconds', 0):.0f}s"
+            )
+        if dashboard_data.load_recovery_report(session_id):
+            recovery = dashboard_data.load_recovery_report(session_id)
+            report_paths = (recovery or {}).get("report_paths", {})
+            path_hint = report_paths.get("json") or f"data/market_stream/recovery_reports/{session_id}.json"
+            st.caption(f"Recovery report: `{path_hint}`")
+        norm_report = dashboard_data.load_normalization_report(session_id)
+        if norm_report:
+            st.caption(
+                f"Normalization: {norm_report.get('events_written', 0)} events written"
+            )
 
     channel_counts = status.get("channel_message_counts", {})
     if channel_counts:
@@ -177,10 +999,14 @@ def _render_quality_report_section() -> None:
 
     st.markdown("**Data quality report**")
     report_options = {
-        f"{r['session_id'][:8]}… ({r.get('quality_label', '—')})": r["session_id"]
+        f"{r.get('session_id', 'unknown')[:8]}… ({r.get('quality_label', '—')})": r.get("session_id")
         for r in reports
+        if r.get("session_id")
     }
     labels = list(report_options.keys())
+    if not labels:
+        st.warning("Quality reports found but missing session IDs.")
+        return
     selected_label = st.selectbox("Latest quality reports", labels, index=0)
     session_id = report_options[selected_label]
     report = load_quality_report(session_id)
@@ -317,8 +1143,9 @@ def _render_event_backtests_section() -> None:
     if not reports:
         st.caption(
             "No event backtest reports yet. Run "
-            "`python3 event_backtest.py --replay-session-id <ID> --coins BTC ETH SOL "
-            "--channels trades bbo --strategy contrarian_v1_medium_no_trend_filter`."
+            "`python3 event_backtest.py --latest-replay --coins BTC ETH SOL "
+            "--channels trades bbo --strategy contrarian_bbo_medium` "
+            "(or `--strategy contrarian_bbo_confirmation_v1` for default medium profile)."
         )
         return
 
@@ -368,6 +1195,24 @@ def _render_event_backtests_section() -> None:
         st.markdown("**Warnings:**")
         for warning in warnings[:10]:
             st.caption(f"- {warning}")
+
+    strategy_name = report.get("strategy_name", "")
+    if strategy_name == "contrarian_bbo_confirmation_v1":
+        st.markdown("**BBO confirmation research strategy**")
+        bbo_cols = st.columns(3)
+        bbo_cols[0].caption(
+            "Profiles: `contrarian_bbo_light`, `contrarian_bbo_medium`, "
+            "`contrarian_bbo_strong`, `contrarian_bbo_rebound`"
+        )
+        blocked_count = report.get("blocked_signals", 0)
+        blocked_reasons = report.get("blocked_reasons") or {}
+        bbo_cols[1].caption(f"BBO blocked signals: {blocked_count}")
+        if blocked_reasons:
+            top_reason = max(blocked_reasons.items(), key=lambda x: x[1])
+            bbo_cols[2].caption(f"Top blocked reason: {top_reason[0]} ({top_reason[1]})")
+        adapter_notes = report.get("adapter_notes") or []
+        for note in adapter_notes[:3]:
+            st.caption(f"- {note}")
 
     json_path = report.get("json_path") or f"data/event_backtests/{backtest_id}.json"
     md_path = report.get("markdown_path") or f"data/event_backtests/{backtest_id}.md"
@@ -582,8 +1427,8 @@ def _render_session_summary(snapshot: dict | None) -> None:
 
 
 def _render_recommendation_card(decision: dict) -> None:
-    coin = decision["coin"]
-    recommendation = decision["recommendation"]
+    coin = decision.get("coin", "—")
+    recommendation = decision.get("recommendation", "—")
     color = _recommendation_color(recommendation)
 
     st.markdown(
@@ -593,12 +1438,15 @@ def _render_recommendation_card(decision: dict) -> None:
         unsafe_allow_html=True,
     )
 
-    st.markdown(f"**Signal:** {decision['signal']} ({decision['signal_strength']})")
-    st.markdown(f"**Risk:** {decision['risk_status']}")
-    st.markdown(f"**Reason:** {decision['primary_reason']}")
+    st.markdown(
+        f"**Signal:** {decision.get('signal', '—')} "
+        f"({decision.get('signal_strength', '—')})"
+    )
+    st.markdown(f"**Risk:** {decision.get('risk_status', '—')}")
+    st.markdown(f"**Reason:** {decision.get('primary_reason', '—')}")
     st.markdown(f"**Supporting:** {_supporting_reason(decision)}")
     st.markdown(
-        f"**Confidence:** {decision['confidence']} "
+        f"**Confidence:** {decision.get('confidence', '—')} "
         f"(signal strength only — not a profit probability)"
     )
 
@@ -627,7 +1475,9 @@ def _render_current_recommendations(snapshot: dict | None) -> None:
         return
 
     decisions = snapshot.get("decisions", [])
-    decisions_by_coin = {item["coin"]: item for item in decisions}
+    decisions_by_coin = {
+        item.get("coin"): item for item in decisions if item.get("coin")
+    }
 
     card_cols = st.columns(len(MARKET.watchlist))
     for col, coin in zip(card_cols, MARKET.watchlist):
@@ -1355,32 +2205,40 @@ def _render_backtest_results() -> None:
         st.info("Run python3 backtester.py to generate backtest results.")
         return
 
-    test_block = results["test_mode"]["after_forced_close"]
-    production_block = results["production_mode"]["after_forced_close"]
+    test_mode = results.get("test_mode") or {}
+    production_mode = results.get("production_mode") or {}
+    test_block = test_mode.get("after_forced_close") or {}
+    production_block = production_mode.get("after_forced_close") or {}
 
+    if not test_block or not production_block:
+        st.warning("Backtest results file is missing expected mode blocks.")
+        return
+
+    test_dd = test_block.get("maximum_drawdown_pct")
+    prod_dd = production_block.get("maximum_drawdown_pct")
     max_drawdown = max(
-        test_block["maximum_drawdown_pct"],
-        production_block["maximum_drawdown_pct"],
+        test_dd if test_dd is not None else 0.0,
+        prod_dd if prod_dd is not None else 0.0,
     )
 
     summary_cols = st.columns(5)
     summary_cols[0].metric(
         "Test-Mode Return",
-        _format_pct(test_block["total_return_pct"]),
+        _format_pct(test_block.get("total_return_pct")),
     )
     summary_cols[1].metric(
         "Production Return",
-        _format_pct(production_block["total_return_pct"]),
+        _format_pct(production_block.get("total_return_pct")),
     )
     summary_cols[2].metric("Maximum Drawdown", _format_pct(max_drawdown))
     summary_cols[3].metric(
         "Fees Paid (Test)",
-        _format_money(test_block["total_fees_paid"]),
+        _format_money(test_block.get("total_fees_paid")),
         help="Test-mode simulation fees. See details for production.",
     )
     summary_cols[4].metric(
         "Completed Trades (Test)",
-        str(test_block["completed_trades"]),
+        str(test_block.get("completed_trades", 0)),
         help="Test-mode completed round trips. See details for production.",
     )
 
@@ -1427,17 +2285,20 @@ def main() -> None:
 
     tab_dashboard, tab_review = st.tabs(["Dashboard", "Review Mode"])
 
+    with tab_dashboard:
+        _render_dashboard()
+
     with tab_review:
         dashboard_review.render_review_mode(
             load_experiment=load_experiment,
             list_experiments_fn=list_experiments,
         )
 
-    with tab_dashboard:
-        _render_dashboard()
-
 
 def _render_dashboard() -> None:
+    _render_live_market_dashboard()
+    st.divider()
+
     snapshot = load_recommendations()
 
     _render_session_summary(snapshot)
