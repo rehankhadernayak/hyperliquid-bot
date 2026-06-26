@@ -74,12 +74,131 @@ flowchart LR
   D --> F[bid_ask_resampler 15s/1m]
 ```
 
+## Required Local Tools
+
+Manual historical backfill (Phase 2 download/decompress) depends on external CLI
+tools installed on your machine. The aws CLI is needed for manual S3 copy; lz4 is
+needed for decompression. The repo does **not** install or download anything
+automatically — no automatic installs and no automatic downloads.
+
+| Tool | Required? | Purpose |
+| --- | --- | --- |
+| `aws` CLI | **Yes** (manual download) | AWS CLI for requester-pays S3 copy from `hyperliquid-archive` |
+| `lz4` | **Yes** (manual download) | Decompress `.lz4` archive files to JSONL |
+| `brew` | Optional (macOS) | One possible install method for `aws` and `lz4`; not required |
+
+Check what is available locally:
+
+```bash
+python3 historical_backfill_tool_check.py
+```
+
+The diagnostic uses `shutil.which` only — no subprocess execution, no network calls,
+and no automatic installs. If `aws` or `lz4` is missing, `ready_for_manual_download`
+is false; you can still capture bid/ask CSV rows via the local BBO recorder workflow.
+
+## Manual Phase 2 Workflow
+
+Phase 2 adds a manual-first guide (`historical_backfill_manual_guide.py`) that prints
+commands for the user to run locally. **Nothing is downloaded, decompressed, or
+executed automatically.**
+
+### Why manual first
+
+- Archive files are large and requester-pays; bulk downloads are easy to misconfigure
+- One coin + one hour is enough to validate parsing, schema compatibility, and coverage
+- Keeps the workflow read-only and safe until coverage metrics look acceptable
+- Avoids accidental network/subprocess automation in research tooling
+
+### Inspect path
+
+Confirm the expected object before downloading:
+
+```bash
+python3 historical_l2_importer.py inspect-path --date 20230916 --hour 9 --coin SOL
+```
+
+Or print the full manual plan (commands only, no execution):
+
+```bash
+python3 historical_backfill_manual_guide.py --date 20230916 --hour 9 --coin SOL
+```
+
+### Download one hour manually
+
+Run the printed `aws s3 cp --no-sign-request ...` command in your shell. Example:
+
+```bash
+aws s3 cp --no-sign-request \
+  s3://hyperliquid-archive/market_data/20230916/9/l2Book/SOL.lz4 \
+  ./downloads/hyperliquid/20230916/9/SOL.lz4
+```
+
+Download **one hour for one coin** first. Do not bulk-fetch months of data until a
+sample import validates cleanly.
+
+### Decompress one hour manually
+
+```bash
+lz4 -d ./downloads/hyperliquid/20230916/9/SOL.lz4 \
+  ./downloads/hyperliquid/20230916/9/SOL.jsonl
+```
+
+Use local `lz4` or `unlz4`. The importer reads the decompressed JSONL file only.
+
+### Import local decompressed file
+
+```bash
+python3 historical_l2_importer.py import-local \
+  --input ./downloads/hyperliquid/20230916/9/SOL.jsonl \
+  --coin SOL
+```
+
+Output CSV lands under `data/bid_ask_csv/historical_1s/` with:
+
+- `source_session_id = historical_archive`
+- `source_channel = historical_l2Book`
+
+### Validate
+
+Historical L2-derived bid/ask is stored separately from live WebSocket BBO. Use the
+historical summarize CLI (not `bid_ask_data_pipeline.py validate`, which targets live
+recorder output):
+
+```bash
+python3 historical_l2_importer.py summarize \
+  --csv data/bid_ask_csv/historical_1s/SOL_1s.csv
+```
+
+Review the JSON report under `data/bid_ask_csv/reports/` for row counts, missing
+seconds, duplicates, and invalid quotes.
+
+### Avoid huge downloads
+
+- Start with a single `(date, hour, coin)` tuple
+- Check archive availability with `inspect-path` before paying for S3 transfer
+- Expand hour-by-hour only after coverage reports look acceptable
+- Do not claim all-time 1-second BBO without validating each imported segment
+
+### Label historical vs live BBO
+
+| Source | CSV location | Session / channel labels |
+| --- | --- | --- |
+| Live WebSocket BBO | `data/bid_ask_csv/1s/` (via recorder) | recorder session IDs, live channels |
+| Historical archive L2 | `data/bid_ask_csv/historical_1s/` | `historical_archive`, `historical_l2Book` |
+
+Keep historical and live CSVs in separate directories. Do not merge them without an
+explicit deduplication and provenance policy.
+
 ## Module Overview
 
 | File | Purpose |
 | --- | --- |
+| `historical_backfill_tool_check.py` | PATH diagnostic for `brew`/`aws`/`lz4` (shutil.which only) |
+| `historical_backfill_manual_guide.py` | Manual download/decompress/import command strings and step plan |
 | `historical_backfill_research.py` | Research constants, facts, and summary helpers |
 | `historical_l2_importer.py` | Path builder, parser, local importer, coverage summary, CLI |
+| `tests/test_historical_backfill_manual_guide.py` | Offline tests for manual guide commands and safety |
 | `tests/test_historical_l2_importer.py` | Offline tests with fake L2 lines |
 | `docs/historical_backfill_plan.md` | This document |
 
@@ -146,6 +265,18 @@ Import a local decompressed file:
 
 ```bash
 python3 historical_l2_importer.py import-local --input /path/to/decompressed/SOL --coin SOL
+```
+
+Summarize a local historical CSV (coverage only, no download):
+
+```bash
+python3 historical_l2_importer.py summarize --csv data/bid_ask_csv/historical_1s/SOL_1s.csv
+```
+
+Or resolve the default historical CSV path by coin:
+
+```bash
+python3 historical_l2_importer.py summarize --coin SOL
 ```
 
 Optional output path:
