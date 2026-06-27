@@ -22,7 +22,24 @@ from bid_ask_decision_logger import (
     summarize_decision_log,
     write_decision_log,
 )
+from bid_ask_model_io import build_artifact_payload, save_model_artifact
 from bid_ask_train import FEATURE_COLUMNS, create_labels, create_features
+
+
+class FakeModel:
+    def __init__(self, prediction: str = "DOWN"):
+        self.prediction = prediction
+
+    def predict(self, X):
+        return [self.prediction] * len(X)
+
+    def predict_proba(self, X):
+        return [[0.1, 0.2, 0.7]] * len(X)
+
+
+class FakeScaler:
+    def transform(self, X):
+        return X
 
 LOGGER_FILE = Path(__file__).resolve().parent.parent / "bid_ask_decision_logger.py"
 
@@ -73,6 +90,35 @@ def _write_resampled_csv(path: Path, rows: list[dict]) -> None:
     pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS)).to_csv(path, index=False)
 
 
+def _write_model_artifact(
+    models_dir: Path,
+    *,
+    coin: str = "BTC",
+    interval: str = "15s",
+    prediction: str = "DOWN",
+    feature_names: list[str] | None = None,
+    artifact_id: str = "testartifact",
+    trained_at: str = "2024-06-01T00:00:00+00:00",
+) -> Path:
+    models_dir.mkdir(parents=True, exist_ok=True)
+    payload = build_artifact_payload(
+        model=FakeModel(prediction),
+        scaler=FakeScaler(),
+        feature_names=feature_names or list(FEATURE_COLUMNS),
+        coin=coin,
+        interval=interval,
+        horizon=1,
+        threshold_bps=1.0,
+        train_rows=28,
+        test_rows=12,
+        baseline_accuracy=0.4,
+        model_accuracy=0.6,
+        model_type="FakeModel",
+        trained_at=trained_at,
+    )
+    return save_model_artifact(payload, models_dir=models_dir, artifact_id=artifact_id)
+
+
 def _write_training_report(
     reports_dir: Path,
     *,
@@ -106,6 +152,11 @@ def _write_training_report(
 @pytest.fixture
 def data_root(tmp_path: Path) -> Path:
     return tmp_path / "bid_ask_csv"
+
+
+@pytest.fixture
+def models_dir(tmp_path: Path) -> Path:
+    return tmp_path / "models" / "bid_ask"
 
 
 @pytest.fixture
@@ -233,12 +284,12 @@ class TestGeneratePaperDecisions:
         data_root: Path,
         training_csv: Path,
         training_reports_dir: Path,
+        models_dir: Path,
     ) -> None:
         _write_training_report(
             training_reports_dir,
             generated_at="2024-06-01T00:00:00+00:00",
             baseline_majority_class="DOWN",
-            model_path="models/missing.joblib",
         )
         decisions, warnings = generate_paper_decisions(
             "BTC",
@@ -246,16 +297,21 @@ class TestGeneratePaperDecisions:
             max_rows=5,
             data_root=data_root,
             training_reports_dir=training_reports_dir,
+            models_dir=models_dir,
         )
         assert len(decisions) == 5
         assert all(decision["model_signal"] == "baseline_fallback" for decision in decisions)
-        assert any("artifact missing" in warning for warning in warnings)
+        assert all(
+            decision["notes"] == "baseline_fallback_no_model_artifact"
+            for decision in decisions
+        )
 
     def test_missing_model_artifact_handled_safely(
         self,
         data_root: Path,
         training_csv: Path,
         training_reports_dir: Path,
+        models_dir: Path,
     ) -> None:
         decisions, warnings = generate_paper_decisions(
             "BTC",
@@ -263,10 +319,86 @@ class TestGeneratePaperDecisions:
             max_rows=3,
             data_root=data_root,
             training_reports_dir=training_reports_dir,
+            models_dir=models_dir,
         )
         assert len(decisions) == 3
         assert all(decision["model_signal"] == "baseline_fallback" for decision in decisions)
+        assert all(
+            decision["notes"] == "baseline_fallback_no_model_artifact"
+            for decision in decisions
+        )
         assert any("No training report" in warning for warning in warnings)
+
+    def test_uses_model_predict_when_artifact_exists(
+        self,
+        data_root: Path,
+        training_csv: Path,
+        training_reports_dir: Path,
+        models_dir: Path,
+    ) -> None:
+        _write_training_report(
+            training_reports_dir,
+            generated_at="2024-06-01T00:00:00+00:00",
+            baseline_majority_class="UP",
+        )
+        _write_model_artifact(models_dir, prediction="DOWN")
+        decisions, _ = generate_paper_decisions(
+            "BTC",
+            interval="15s",
+            max_rows=5,
+            data_root=data_root,
+            training_reports_dir=training_reports_dir,
+            models_dir=models_dir,
+        )
+        assert len(decisions) == 5
+        assert all(decision["model_signal"] == "DOWN" for decision in decisions)
+        assert all(decision["notes"] == "model_artifact_used" for decision in decisions)
+        assert all(decision["baseline_signal"] == "UP" for decision in decisions)
+
+    def test_confidence_from_predict_proba(
+        self,
+        data_root: Path,
+        training_csv: Path,
+        training_reports_dir: Path,
+        models_dir: Path,
+    ) -> None:
+        _write_model_artifact(models_dir, prediction="DOWN")
+        decisions, _ = generate_paper_decisions(
+            "BTC",
+            interval="15s",
+            max_rows=3,
+            data_root=data_root,
+            training_reports_dir=training_reports_dir,
+            models_dir=models_dir,
+        )
+        assert all(decision["confidence"] == pytest.approx(0.7) for decision in decisions)
+
+    def test_feature_mismatch_baseline_fallback(
+        self,
+        data_root: Path,
+        training_csv: Path,
+        training_reports_dir: Path,
+        models_dir: Path,
+    ) -> None:
+        _write_model_artifact(
+            models_dir,
+            feature_names=["avg_spread_bps", "mid_return_1"],
+        )
+        decisions, warnings = generate_paper_decisions(
+            "BTC",
+            interval="15s",
+            max_rows=3,
+            data_root=data_root,
+            training_reports_dir=training_reports_dir,
+            models_dir=models_dir,
+        )
+        assert len(decisions) == 3
+        assert all(decision["model_signal"] == "baseline_fallback" for decision in decisions)
+        assert all(
+            decision["notes"] == "model_feature_mismatch_baseline_fallback"
+            for decision in decisions
+        )
+        assert any("feature_names mismatch" in warning for warning in warnings)
 
 
 class TestWriteDecisionLog:

@@ -12,13 +12,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
-from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
-from bid_ask_schema import (
-    EXECUTION_ENABLED,
-    FORBIDDEN_MODULE_NAMES,
-    FORBIDDEN_SOURCE_PATTERNS,
-    PAPER_ONLY,
+from bid_ask_model_io import (
+    DEFAULT_MODELS_DIR as MODEL_IO_DEFAULT_MODELS_DIR,
+    build_artifact_payload,
+    save_model_artifact,
 )
+from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
+from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY
 
 SAFETY_STATEMENT = (
     "Bid/ask movement training is read-only, paper-trading only, and research-only. "
@@ -29,7 +29,7 @@ SAFETY_STATEMENT = (
 
 DEFAULT_DATA_ROOT = Path("data/bid_ask_csv")
 DEFAULT_REPORTS_DIR = Path("reports/bid_ask_training")
-DEFAULT_MODELS_DIR = Path("models/bid_ask")
+DEFAULT_MODELS_DIR = MODEL_IO_DEFAULT_MODELS_DIR
 
 SUPPORTED_INTERVALS = frozenset({"15s", "1m"})
 LABELS = ("UP", "DOWN", "FLAT")
@@ -346,34 +346,28 @@ def save_training_report(
     *,
     sklearn_result: dict[str, Any] | None = None,
     models_dir: Path = DEFAULT_MODELS_DIR,
+    artifact_payload: dict[str, Any] | None = None,
 ) -> Path:
     """Persist JSON training report; optionally save sklearn model artifact."""
     reports_dir.mkdir(parents=True, exist_ok=True)
     report_id = report.get("report_id") or uuid.uuid4().hex
     report["report_id"] = report_id
 
-    model_path: str | None = None
-    if sklearn_result and sklearn_result.get("model") is not None:
+    if artifact_payload is not None and sklearn_result and sklearn_result.get("model") is not None:
         try:
-            import joblib
-        except ImportError:
+            artifact_path = save_model_artifact(
+                artifact_payload,
+                models_dir=models_dir,
+                artifact_id=report_id,
+            )
+        except Exception as exc:
             report.setdefault("warnings", []).append(
-                "sklearn model trained but joblib unavailable; model not saved"
+                f"Failed to save model artifact: {exc}"
             )
         else:
-            models_dir.mkdir(parents=True, exist_ok=True)
-            artifact_path = models_dir / f"{report_id}.joblib"
-            joblib.dump(
-                {
-                    "model": sklearn_result["model"],
-                    "scaler": sklearn_result.get("scaler"),
-                    "model_type": sklearn_result.get("model_type"),
-                    "features": list(FEATURE_COLUMNS),
-                },
-                artifact_path,
-            )
-            model_path = str(artifact_path)
-            report["model_path"] = model_path
+            artifact_str = str(artifact_path)
+            report["model_artifact_path"] = artifact_str
+            report["model_path"] = artifact_str
 
     output_path = reports_dir / f"{report_id}.json"
     with output_path.open("w", encoding="utf-8") as handle:
@@ -394,6 +388,17 @@ def build_training_report(
     sklearn_result: dict[str, Any],
     model_used: str,
 ) -> dict[str, Any]:
+    model_accuracy = float(evaluation.get("accuracy", 0.0))
+    baseline_accuracy = float(evaluation.get("baseline_accuracy", 0.0))
+    model_edge_vs_baseline = model_accuracy - baseline_accuracy
+
+    warnings: list[str] = list(evaluation.get("warnings", []))
+    if sklearn_result.get("model") is not None and model_accuracy <= baseline_accuracy:
+        warnings.append(
+            f"Model accuracy ({model_accuracy:.4f}) does not exceed "
+            f"baseline ({baseline_accuracy:.4f})"
+        )
+
     return {
         "coin": coin,
         "interval": interval,
@@ -403,11 +408,16 @@ def build_training_report(
         "source_path": source_path,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "model_used": model_used,
+        "model_accuracy": model_accuracy,
+        "baseline_accuracy": baseline_accuracy,
+        "model_edge_vs_baseline": model_edge_vs_baseline,
+        "model_artifact_path": None,
         "baseline_majority_class": baseline.get("majority_class"),
         "sklearn_available": sklearn_result.get("available", False),
         "sklearn_model_type": sklearn_result.get("model_type"),
         "sklearn_message": sklearn_result.get("message"),
         "evaluation": evaluation,
+        "warnings": warnings,
         "paper_only": PAPER_ONLY,
         "execution_enabled": EXECUTION_ENABLED,
         "safety_statement": SAFETY_STATEMENT,
@@ -468,6 +478,23 @@ def run_training_pipeline(
         model_used=model_used,
     )
 
+    artifact_payload: dict[str, Any] | None = None
+    if sklearn_result.get("model") is not None:
+        artifact_payload = build_artifact_payload(
+            model=sklearn_result["model"],
+            scaler=sklearn_result.get("scaler"),
+            feature_names=FEATURE_COLUMNS,
+            coin=coin,
+            interval=interval,
+            horizon=horizon,
+            threshold_bps=threshold_bps,
+            train_rows=evaluation["train_rows"],
+            test_rows=evaluation["test_rows"],
+            baseline_accuracy=evaluation["baseline_accuracy"],
+            model_accuracy=evaluation["accuracy"],
+            model_type=str(sklearn_result.get("model_type") or model_used),
+        )
+
     report_path: Path | None = None
     if save_report:
         report_path = save_training_report(
@@ -475,6 +502,7 @@ def run_training_pipeline(
             reports_dir=reports_dir,
             sklearn_result=sklearn_result,
             models_dir=models_dir,
+            artifact_payload=artifact_payload,
         )
         report["report_path"] = str(report_path)
 
@@ -553,7 +581,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"coin={args.coin.upper()} interval={args.interval} horizon={args.horizon}")
     print(f"train_rows={evaluation['train_rows']} test_rows={evaluation['test_rows']}")
     print(f"accuracy={evaluation['accuracy']:.4f} baseline_accuracy={evaluation['baseline_accuracy']:.4f}")
+    print(f"model_edge_vs_baseline={result['report']['model_edge_vs_baseline']:.4f}")
     print(f"model_used={result['report']['model_used']}")
+    if result["report"].get("model_artifact_path"):
+        print(f"model_artifact_path={result['report']['model_artifact_path']}")
     if result["sklearn_result"].get("message"):
         print(result["sklearn_result"]["message"])
     if result["report_path"] is not None:

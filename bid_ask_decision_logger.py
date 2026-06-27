@@ -11,13 +11,18 @@ from typing import Any
 
 import pandas as pd
 
+from bid_ask_model_io import (
+    DEFAULT_MODELS_DIR,
+    feature_names_compatible,
+    find_latest_model_artifact,
+    predict_with_artifact,
+)
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT
 from bid_ask_train import (
     FEATURE_COLUMNS,
     MID_PRICE_COLUMN,
     MajorityClassBaseline,
-    RuleBaseline,
     create_features,
     create_labels,
 )
@@ -62,8 +67,10 @@ DECISION_COLUMNS = (
 def load_latest_training_report(
     coin: str,
     training_reports_dir: Path = DEFAULT_TRAINING_REPORTS_DIR,
+    *,
+    interval: str | None = None,
 ) -> dict[str, Any] | None:
-    """Load the newest training JSON report for a coin."""
+    """Load the newest training JSON report for a coin (optionally matching interval)."""
     if not training_reports_dir.is_dir():
         return None
 
@@ -74,6 +81,8 @@ def load_latest_training_report(
         except (json.JSONDecodeError, OSError):
             continue
         if payload.get("coin") != coin.upper():
+            continue
+        if interval is not None and payload.get("interval") != interval:
             continue
         generated_at = payload.get("generated_at") or ""
         candidates.append((generated_at, path))
@@ -120,46 +129,19 @@ def _feature_matrix_row(row: pd.Series) -> pd.DataFrame:
     return matrix.astype(float)
 
 
-def _load_sklearn_artifact(model_path: str | None) -> dict[str, Any] | None:
-    if not model_path:
-        return None
-    path = Path(model_path)
-    if not path.is_file():
-        return None
-    try:
-        import joblib
-    except ImportError:
-        return None
-    try:
-        artifact = joblib.load(path)
-    except Exception:
-        return None
-    if not isinstance(artifact, dict):
-        return None
-    if artifact.get("model") is None or artifact.get("scaler") is None:
-        return None
-    return artifact
-
-
-def _predict_with_artifact(
-    artifact: dict[str, Any],
-    row: pd.Series,
-) -> tuple[str, float]:
-    model = artifact["model"]
-    scaler = artifact["scaler"]
-    features = _feature_matrix_row(row)
-    scaled = scaler.transform(features)
-    prediction = model.predict(scaled)[0]
-    confidence = 0.0
-    if hasattr(model, "predict_proba"):
-        proba = model.predict_proba(scaled)[0]
-        confidence = float(max(proba))
-    return str(prediction), confidence
-
-
 def _rows_ready_for_decisions(df: pd.DataFrame) -> pd.DataFrame:
     required = list(FEATURE_COLUMNS) + ["label", "future_return_bps", MID_PRICE_COLUMN]
     return df.dropna(subset=required).reset_index(drop=True)
+
+
+def _row_has_artifact_features(row: pd.Series, artifact: dict[str, Any]) -> bool:
+    feature_names = artifact.get("feature_names") or []
+    for name in feature_names:
+        if name not in row.index:
+            return False
+        if pd.isna(row[name]):
+            return False
+    return True
 
 
 def generate_paper_decisions(
@@ -170,6 +152,7 @@ def generate_paper_decisions(
     *,
     data_root: Path = DEFAULT_DATA_ROOT,
     training_reports_dir: Path = DEFAULT_TRAINING_REPORTS_DIR,
+    models_dir: Path = DEFAULT_MODELS_DIR,
     threshold_bps: float | None = None,
 ) -> tuple[list[dict[str, Any]], list[str]]:
     """Generate paper-only model decisions for eligible historical rows."""
@@ -178,12 +161,12 @@ def generate_paper_decisions(
         "Research-only decision log; does not prove predictive power or profitability"
     ]
 
-    report = load_latest_training_report(coin, training_reports_dir=training_reports_dir)
+    report = load_latest_training_report(
+        coin, training_reports_dir=training_reports_dir, interval=interval
+    )
     report_horizon = horizon
     report_threshold = threshold_bps if threshold_bps is not None else 1.0
     baseline_majority = "FLAT"
-    model_used = "none"
-    artifact: dict[str, Any] | None = None
 
     if report is None:
         warnings.append(f"No training report found for {coin}; using default baseline only")
@@ -193,22 +176,20 @@ def generate_paper_decisions(
             threshold_bps if threshold_bps is not None else report.get("threshold_bps", 1.0)
         )
         baseline_majority = str(report.get("baseline_majority_class") or "FLAT")
-        model_used = str(report.get("model_used") or "none")
-        if report.get("interval") != interval:
-            warnings.append(
-                f"Latest training report interval {report.get('interval')!r} "
-                f"does not match requested {interval!r}"
-            )
-        artifact = _load_sklearn_artifact(report.get("model_path"))
-        if report.get("model_path") and artifact is None:
-            warnings.append(
-                "Model artifact missing or unreadable; model_signal will use baseline_fallback"
-            )
 
     if report_horizon != horizon:
         warnings.append(
             f"Using horizon={report_horizon} from training report "
             f"(CLI requested horizon={horizon})"
+        )
+
+    artifact = find_latest_model_artifact(coin, interval, models_dir=models_dir)
+    artifact_compatible = (
+        artifact is not None and feature_names_compatible(artifact, FEATURE_COLUMNS)
+    )
+    if artifact is not None and not artifact_compatible:
+        warnings.append(
+            "Model artifact feature_names mismatch; falling back to baseline"
         )
 
     source_path = resampled_csv_path(coin, interval, data_root)
@@ -227,7 +208,6 @@ def generate_paper_decisions(
 
     selected_df = ready_df.iloc[-max_rows:].copy()
     majority_baseline = MajorityClassBaseline(baseline_majority)
-    rule_baseline = RuleBaseline()
 
     decisions: list[dict[str, Any]] = []
     generated_at = datetime.now(timezone.utc).isoformat()
@@ -235,18 +215,19 @@ def generate_paper_decisions(
     for _, row in selected_df.iterrows():
         baseline_predictions = majority_baseline.predict(_feature_matrix_row(row))
         baseline_signal = baseline_predictions[0]
-        rule_signal = rule_baseline.predict(_feature_matrix_row(row))[0]
 
-        notes_parts: list[str] = []
-        if artifact is not None:
-            model_signal, confidence = _predict_with_artifact(artifact, row)
-            notes_parts.append(f"model_used={model_used}")
+        notes: str
+        if artifact_compatible and _row_has_artifact_features(row, artifact):
+            model_signal, confidence = predict_with_artifact(artifact, row)
+            notes = "model_artifact_used"
+        elif artifact is not None:
+            model_signal = "baseline_fallback"
+            confidence = 1.0 / len(LABELS)
+            notes = "model_feature_mismatch_baseline_fallback"
         else:
             model_signal = "baseline_fallback"
             confidence = 1.0 / len(LABELS)
-            notes_parts.append(
-                f"baseline_fallback={baseline_majority}; rule_signal={rule_signal}"
-            )
+            notes = "baseline_fallback_no_model_artifact"
 
         actual_label = str(row["label"])
         future_return = float(row["future_return_bps"])
@@ -255,6 +236,7 @@ def generate_paper_decisions(
             for column in FEATURE_COLUMNS
         }
 
+        using_model = notes == "model_artifact_used"
         decisions.append(
             {
                 "decision_id": uuid.uuid4().hex,
@@ -276,13 +258,13 @@ def generate_paper_decisions(
                 "future_return_bps": future_return,
                 "actual_label": actual_label,
                 "signal_correct": model_signal == actual_label
-                if model_signal != "baseline_fallback"
+                if using_model
                 else baseline_signal == actual_label,
                 "baseline_correct": baseline_signal == actual_label,
                 "features_json": json.dumps(feature_payload, sort_keys=True),
                 "paper_only": PAPER_ONLY,
                 "execution_enabled": EXECUTION_ENABLED,
-                "notes": "; ".join(notes_parts),
+                "notes": notes,
             }
         )
 
@@ -336,6 +318,8 @@ def summarize_decision_log(path: Path) -> dict[str, Any]:
         warnings.append("Unexpected paper_only=false in decision log")
     if df["execution_enabled"].astype(str).str.lower().eq("true").any():
         warnings.append("Unexpected execution_enabled=true in decision log")
+    if (df["notes"] == "baseline_fallback_no_model_artifact").any():
+        warnings.append("Some decisions used baseline_fallback_no_model_artifact")
     if (df["model_signal"] == "baseline_fallback").any():
         warnings.append("Some decisions used baseline_fallback for model_signal")
 
@@ -360,6 +344,7 @@ def run_decision_logging(
     *,
     data_root: Path = DEFAULT_DATA_ROOT,
     training_reports_dir: Path = DEFAULT_TRAINING_REPORTS_DIR,
+    models_dir: Path = DEFAULT_MODELS_DIR,
     output_dir: Path = DEFAULT_DECISIONS_DIR,
 ) -> dict[str, Any]:
     """Generate and write paper decisions for multiple coins."""
@@ -375,6 +360,7 @@ def run_decision_logging(
             max_rows=max_rows,
             data_root=data_root,
             training_reports_dir=training_reports_dir,
+            models_dir=models_dir,
         )
         per_coin_counts[coin.upper()] = len(decisions)
         all_decisions.extend(decisions)
@@ -435,6 +421,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Directory containing JSON training reports",
     )
     parser.add_argument(
+        "--models-dir",
+        type=Path,
+        default=DEFAULT_MODELS_DIR,
+        help="Directory containing saved model artifacts",
+    )
+    parser.add_argument(
         "--output-dir",
         type=Path,
         default=DEFAULT_DECISIONS_DIR,
@@ -452,6 +444,7 @@ def main(argv: list[str] | None = None) -> int:
         max_rows=args.max_rows,
         data_root=args.data_root,
         training_reports_dir=args.training_reports_dir,
+        models_dir=args.models_dir,
         output_dir=args.output_dir,
     )
 

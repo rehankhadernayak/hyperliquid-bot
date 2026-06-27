@@ -11,6 +11,7 @@ import pytest
 
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS
+from bid_ask_model_io import build_artifact_payload, load_model_artifact, save_model_artifact
 from bid_ask_train import (
     EXECUTION_ENABLED,
     FEATURE_COLUMNS,
@@ -18,6 +19,7 @@ from bid_ask_train import (
     MajorityClassBaseline,
     RuleBaseline,
     _build_arg_parser,
+    build_training_report,
     chronological_train_test_split,
     create_features,
     create_labels,
@@ -29,6 +31,24 @@ from bid_ask_train import (
     train_baseline_model,
     train_optional_sklearn_model,
 )
+
+
+class FakeModel:
+    def predict(self, X):
+        return ["UP"] * len(X)
+
+    def predict_proba(self, X):
+        return [[0.2, 0.3, 0.5]] * len(X)
+
+
+class FakeScaler:
+    def fit_transform(self, X):
+        return X
+
+    def transform(self, X):
+        return X
+
+
 TRAIN_FILE = Path(__file__).resolve().parent.parent / "bid_ask_train.py"
 
 BASE_MS = 1_718_000_040_000
@@ -295,6 +315,92 @@ class TestReportCreation:
         assert loaded["coin"] == "BTC"
         assert "report_id" in loaded
 
+    def test_save_training_report_with_fake_model_artifact(self, tmp_path: Path) -> None:
+        models_dir = tmp_path / "models"
+        reports_dir = tmp_path / "reports"
+        sklearn_result = {
+            "available": True,
+            "model": FakeModel(),
+            "scaler": FakeScaler(),
+            "model_type": "FakeModel",
+        }
+        artifact_payload = build_artifact_payload(
+            model=sklearn_result["model"],
+            scaler=sklearn_result["scaler"],
+            feature_names=FEATURE_COLUMNS,
+            coin="BTC",
+            interval="15s",
+            horizon=1,
+            threshold_bps=1.0,
+            train_rows=28,
+            test_rows=12,
+            baseline_accuracy=0.4,
+            model_accuracy=0.6,
+            model_type="FakeModel",
+        )
+        report = {"coin": "BTC", "interval": "15s"}
+        path = save_training_report(
+            report,
+            reports_dir=reports_dir,
+            sklearn_result=sklearn_result,
+            models_dir=models_dir,
+            artifact_payload=artifact_payload,
+        )
+        loaded = json.loads(path.read_text(encoding="utf-8"))
+        assert "model_artifact_path" in loaded
+        assert Path(loaded["model_artifact_path"]).is_file()
+        artifact = load_model_artifact(loaded["model_artifact_path"])
+        assert artifact is not None
+        assert artifact["paper_only"] is True
+        assert artifact["execution_enabled"] is False
+
+    def test_model_edge_vs_baseline_in_report(self) -> None:
+        evaluation = {
+            "accuracy": 0.6,
+            "baseline_accuracy": 0.4,
+            "warnings": ["Research-only evaluation; does not prove profitability"],
+            "train_rows": 28,
+            "test_rows": 12,
+        }
+        report = build_training_report(
+            coin="BTC",
+            interval="15s",
+            horizon=1,
+            threshold_bps=1.0,
+            train_fraction=0.7,
+            source_path="data/test.csv",
+            evaluation=evaluation,
+            baseline={"majority_class": "UP"},
+            sklearn_result={"available": True, "model": FakeModel(), "model_type": "FakeModel"},
+            model_used="FakeModel",
+        )
+        assert report["model_edge_vs_baseline"] == pytest.approx(0.2)
+        assert report["model_accuracy"] == pytest.approx(0.6)
+        assert report["baseline_accuracy"] == pytest.approx(0.4)
+        assert report["model_artifact_path"] is None
+
+    def test_model_not_beating_baseline_warning(self) -> None:
+        evaluation = {
+            "accuracy": 0.3,
+            "baseline_accuracy": 0.5,
+            "warnings": [],
+            "train_rows": 28,
+            "test_rows": 12,
+        }
+        report = build_training_report(
+            coin="BTC",
+            interval="15s",
+            horizon=1,
+            threshold_bps=1.0,
+            train_fraction=0.7,
+            source_path="data/test.csv",
+            evaluation=evaluation,
+            baseline={"majority_class": "UP"},
+            sklearn_result={"available": True, "model": FakeModel(), "model_type": "FakeModel"},
+            model_used="FakeModel",
+        )
+        assert any("does not exceed baseline" in warning for warning in report["warnings"])
+
     def test_run_training_pipeline(self, data_root: Path, tmp_path: Path) -> None:
         path = resampled_csv_path("BTC", "15s", data_root)
         _write_resampled_csv(path, _make_resampled_rows(count=40))
@@ -310,6 +416,10 @@ class TestReportCreation:
         assert result["evaluation"]["test_rows"] > 0
         assert result["report_path"] is not None
         assert result["report_path"].is_file()
+        assert "model_edge_vs_baseline" in result["report"]
+        loaded = json.loads(result["report_path"].read_text(encoding="utf-8"))
+        if loaded.get("model_artifact_path"):
+            assert Path(loaded["model_artifact_path"]).is_file()
 
 
 class TestSklearnOptional:
