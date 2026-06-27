@@ -431,6 +431,7 @@ def run_training_pipeline(
     horizon: int = 1,
     threshold_bps: float = 1.0,
     train_fraction: float = 0.70,
+    max_rows: int | None = None,
     data_root: Path = DEFAULT_DATA_ROOT,
     reports_dir: Path = DEFAULT_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
@@ -438,6 +439,8 @@ def run_training_pipeline(
 ) -> dict[str, Any]:
     """End-to-end training pipeline for CLI and tests."""
     raw_df = load_training_data(coin, interval, data_root)
+    if max_rows is not None and max_rows > 0:
+        raw_df = raw_df.iloc[:max_rows].copy()
     featured_df = create_features(raw_df)
     labeled_df = create_labels(featured_df, horizon=horizon, threshold_bps=threshold_bps)
     model_df = _rows_ready_for_model(labeled_df)
