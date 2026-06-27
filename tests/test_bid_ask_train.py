@@ -15,6 +15,7 @@ from bid_ask_model_io import build_artifact_payload, load_model_artifact, save_m
 from bid_ask_train import (
     EXECUTION_ENABLED,
     FEATURE_COLUMNS,
+    LABELS,
     PAPER_ONLY,
     MajorityClassBaseline,
     RuleBaseline,
@@ -299,6 +300,173 @@ class TestWarnings:
             baseline_predictions=predictions,
         )
         assert any("Class imbalance" in warning for warning in evaluation["warnings"])
+
+
+class TestLabelDistributionReporting:
+    @staticmethod
+    def _labeled_split(
+        data_root: Path,
+        *,
+        rows: list[dict],
+        train_fraction: float = 0.70,
+    ) -> tuple[pd.DataFrame, pd.DataFrame]:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, rows)
+        df = create_labels(
+            create_features(load_training_data("BTC", "15s", data_root)),
+            horizon=1,
+            threshold_bps=1.0,
+        ).dropna(subset=list(FEATURE_COLUMNS) + ["label"])
+        return chronological_train_test_split(df, train_fraction=train_fraction)
+
+    @staticmethod
+    def _build_report_from_split(
+        train_df: pd.DataFrame,
+        test_df: pd.DataFrame,
+    ) -> dict:
+        baseline = train_baseline_model(train_df)
+        predictions = baseline["majority_model"].predict(test_df)
+        evaluation = evaluate_predictions(
+            train_df=train_df,
+            test_df=test_df,
+            predictions=predictions,
+            baseline_predictions=predictions,
+        )
+        return build_training_report(
+            coin="BTC",
+            interval="15s",
+            horizon=1,
+            threshold_bps=1.0,
+            train_fraction=0.7,
+            source_path="data/test.csv",
+            evaluation=evaluation,
+            baseline=baseline,
+            sklearn_result={"available": False, "model": None},
+            model_used="majority_class",
+        )
+
+    def test_label_counts_exists(self, data_root: Path) -> None:
+        train_df, test_df = self._labeled_split(
+            data_root, rows=_make_resampled_rows(count=40)
+        )
+        report = self._build_report_from_split(train_df, test_df)
+        assert set(report["label_counts"]) == {"UP", "DOWN", "FLAT"}
+        assert sum(report["label_counts"].values()) == len(train_df) + len(test_df)
+
+    def test_label_percentages_exists(self, data_root: Path) -> None:
+        train_df, test_df = self._labeled_split(
+            data_root, rows=_make_resampled_rows(count=40)
+        )
+        report = self._build_report_from_split(train_df, test_df)
+        assert set(report["label_percentages"]) == {"UP", "DOWN", "FLAT"}
+        assert sum(report["label_percentages"].values()) == pytest.approx(1.0)
+
+    def test_train_test_label_counts_exist(self, data_root: Path) -> None:
+        train_df, test_df = self._labeled_split(
+            data_root, rows=_make_resampled_rows(count=40)
+        )
+        report = self._build_report_from_split(train_df, test_df)
+        assert set(report["train_label_counts"]) == {"UP", "DOWN", "FLAT"}
+        assert set(report["test_label_counts"]) == {"UP", "DOWN", "FLAT"}
+        assert sum(report["train_label_counts"].values()) == len(train_df)
+        assert sum(report["test_label_counts"].values()) == len(test_df)
+
+    def test_missing_class_appears_as_zero(self, data_root: Path) -> None:
+        rows: list[dict] = []
+        for index in range(30):
+            mid = 100.0 if index < 27 else 100.0 + (index - 26) * 5.0
+            rows.append(_make_resampled_rows(count=1, mid_start=mid, mid_step=0.0)[0])
+            rows[-1]["start_timestamp_ms"] = BASE_MS + index * 15_000
+            rows[-1]["end_timestamp_ms"] = rows[-1]["start_timestamp_ms"] + 14_999
+        train_df, test_df = self._labeled_split(data_root, rows=rows)
+        report = self._build_report_from_split(train_df, test_df)
+        for field in (
+            "label_counts",
+            "label_percentages",
+            "train_label_counts",
+            "test_label_counts",
+            "train_label_percentages",
+            "test_label_percentages",
+        ):
+            assert set(report[field]) == {"UP", "DOWN", "FLAT"}
+            assert all(isinstance(report[field][label], (int, float)) for label in LABELS)
+
+    def test_under_10_percent_warning(self, data_root: Path) -> None:
+        rows: list[dict] = []
+        for index in range(30):
+            mid = 100.0 if index < 27 else 100.0 + (index - 26) * 5.0
+            rows.append(_make_resampled_rows(count=1, mid_start=mid, mid_step=0.0)[0])
+            rows[-1]["start_timestamp_ms"] = BASE_MS + index * 15_000
+            rows[-1]["end_timestamp_ms"] = rows[-1]["start_timestamp_ms"] + 14_999
+        train_df, test_df = self._labeled_split(data_root, rows=rows)
+        report = self._build_report_from_split(train_df, test_df)
+        assert any(
+            "Class imbalance in train" in warning and "under 10%" in warning
+            for warning in report["warnings"]
+        )
+
+    def test_over_70_percent_warning(self, data_root: Path) -> None:
+        rows = _make_resampled_rows(count=30, mid_start=100.0, mid_step=0.0)
+        train_df, test_df = self._labeled_split(data_root, rows=rows)
+        report = self._build_report_from_split(train_df, test_df)
+        assert any(
+            "Class dominance in train" in warning and "over 70%" in warning
+            for warning in report["warnings"]
+        )
+
+    def test_existing_accuracy_and_artifact_fields_still_exist(
+        self, data_root: Path, tmp_path: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=40))
+        result = run_training_pipeline(
+            coin="BTC",
+            interval="15s",
+            horizon=1,
+            data_root=data_root,
+            reports_dir=tmp_path / "reports",
+            models_dir=tmp_path / "models",
+        )
+        report = result["report"]
+        assert "model_accuracy" in report
+        assert "baseline_accuracy" in report
+        assert "model_edge_vs_baseline" in report
+        assert "model_artifact_path" in report
+        assert "model_used" in report
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+
+    def test_no_order_execution_wallet_code(self) -> None:
+        source = TRAIN_FILE.read_text(encoding="utf-8")
+        tree = ast.parse(source)
+        lowered = source.lower()
+        for pattern in FORBIDDEN_SOURCE_PATTERNS:
+            assert pattern not in lowered
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Import):
+                for alias in node.names:
+                    assert alias.name.split(".", 1)[0] not in FORBIDDEN_MODULE_NAMES
+            elif isinstance(node, ast.ImportFrom) and node.module:
+                assert node.module.split(".", 1)[0] not in FORBIDDEN_MODULE_NAMES
+
+    def test_no_network_calls(self) -> None:
+        source = TRAIN_FILE.read_text(encoding="utf-8").lower()
+        forbidden = (
+            "requests.get",
+            "requests.post",
+            "urllib.request",
+            "http.client",
+            "aiohttp",
+            "websocket",
+        )
+        for pattern in forbidden:
+            assert pattern not in source
+
+    def test_no_subprocess_calls(self) -> None:
+        source = TRAIN_FILE.read_text(encoding="utf-8").lower()
+        forbidden = ("subprocess", "os.system", "popen")
+        for pattern in forbidden:
+            assert pattern not in source
 
 
 class TestReportCreation:

@@ -49,6 +49,7 @@ MID_PRICE_COLUMN = "close_mid"
 
 MIN_ROWS_WARNING = 50
 MIN_CLASS_FRACTION = 0.10
+MAX_CLASS_FRACTION = 0.70
 
 _SKLEARN_AVAILABLE = False
 try:
@@ -292,6 +293,29 @@ def _label_counts(labels: list[str]) -> dict[str, int]:
     return counts
 
 
+def _normalize_label_counts(counts: dict[str, int] | None) -> dict[str, int]:
+    if counts is None:
+        return {label: 0 for label in LABELS}
+    return {label: int(counts.get(label, 0)) for label in LABELS}
+
+
+def _label_percentages(counts: dict[str, int]) -> dict[str, float]:
+    total = sum(counts.values())
+    if total == 0:
+        return {label: 0.0 for label in LABELS}
+    return {label: counts[label] / total for label in LABELS}
+
+
+def _combined_label_counts(
+    train_counts: dict[str, int],
+    test_counts: dict[str, int],
+) -> dict[str, int]:
+    return {
+        label: train_counts[label] + test_counts[label]
+        for label in LABELS
+    }
+
+
 def evaluate_predictions(
     *,
     train_df: pd.DataFrame,
@@ -320,7 +344,13 @@ def evaluate_predictions(
             fraction = count / split_total
             if fraction < MIN_CLASS_FRACTION:
                 warnings.append(
-                    f"Class imbalance in {split_name}: {label} is {fraction:.1%} of rows"
+                    f"Class imbalance in {split_name}: {label} is {fraction:.1%} of rows "
+                    f"(under {MIN_CLASS_FRACTION:.0%})"
+                )
+            if fraction > MAX_CLASS_FRACTION:
+                warnings.append(
+                    f"Class dominance in {split_name}: {label} is {fraction:.1%} of rows "
+                    f"(over {MAX_CLASS_FRACTION:.0%})"
                 )
 
     warnings.append("Research-only evaluation; does not prove profitability")
@@ -399,6 +429,11 @@ def build_training_report(
             f"baseline ({baseline_accuracy:.4f})"
         )
 
+    label_counts_data = evaluation.get("label_counts", {})
+    train_label_counts = _normalize_label_counts(label_counts_data.get("train"))
+    test_label_counts = _normalize_label_counts(label_counts_data.get("test"))
+    overall_label_counts = _combined_label_counts(train_label_counts, test_label_counts)
+
     return {
         "coin": coin,
         "interval": interval,
@@ -411,6 +446,12 @@ def build_training_report(
         "model_accuracy": model_accuracy,
         "baseline_accuracy": baseline_accuracy,
         "model_edge_vs_baseline": model_edge_vs_baseline,
+        "label_counts": overall_label_counts,
+        "label_percentages": _label_percentages(overall_label_counts),
+        "train_label_counts": train_label_counts,
+        "test_label_counts": test_label_counts,
+        "train_label_percentages": _label_percentages(train_label_counts),
+        "test_label_percentages": _label_percentages(test_label_counts),
         "model_artifact_path": None,
         "baseline_majority_class": baseline.get("majority_class"),
         "sklearn_available": sklearn_result.get("available", False),
