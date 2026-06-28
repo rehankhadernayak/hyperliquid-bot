@@ -124,6 +124,15 @@ Or print the full manual plan (commands only, no execution):
 python3 historical_backfill_manual_guide.py --date 20230916 --hour 9 --coin SOL
 ```
 
+For a manifest-driven batch of commands (still manual execution only):
+
+```bash
+python3 historical_l2_download_commands.py --latest --limit 3
+```
+
+Reports land under `reports/historical_l2_download_commands/` with mkdir, download,
+decompress, and import sections. Start with `--limit 3`, validate coverage, then expand.
+
 ### Download one hour manually
 
 Run the printed `aws s3 cp --no-sign-request ...` command in your shell. Example:
@@ -196,6 +205,7 @@ explicit deduplication and provenance policy.
 | --- | --- |
 | `historical_backfill_tool_check.py` | PATH diagnostic for `brew`/`aws`/`lz4` (shutil.which only) |
 | `historical_l2_backfill_planner.py` | Offline date-range manifest planner (S3 paths only, no download) |
+| `historical_l2_download_commands.py` | Manifest-driven batch command generator (mkdir/download/decompress/import) |
 | `historical_backfill_manual_guide.py` | Manual download/decompress/import command strings and step plan |
 | `historical_backfill_research.py` | Research constants, facts, and summary helpers |
 | `historical_l2_importer.py` | Path builder, parser, local importer, coverage summary, CLI |
