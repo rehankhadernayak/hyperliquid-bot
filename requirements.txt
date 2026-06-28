@@ -6,3 +6,6 @@ pytest
 websockets
 pyarrow
 certifi
+boto3
+botocore
+lz4

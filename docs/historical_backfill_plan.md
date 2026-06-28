@@ -9,7 +9,7 @@ by default.
 - Read-only, research-only, paper-only
 - No wallets, keys, signing, orders, or execution endpoints
 - No live trading, private APIs, or user account data
-- No automatic AWS/S3 downloads in this phase
+- No automatic bulk AWS/S3 downloads; optional tiny sample downloader with hard caps
 - Do not start `main.py` or `websocket_recorder.py` for backfill work
 
 ## Historical Facts
@@ -59,7 +59,7 @@ and missing hours before use in research or training.
 ## Best Path Forward
 
 1. **Inspect paths** — print expected S3 locations without downloading
-2. **Download manually** (future phase) — requester-pays S3 copy + local `unlz4`
+2. **Download sample** — manual `aws`/`lz4` CLI or Python-native tiny sample (`historical_l2_python_downloader.py`)
 3. **Import locally** — parse decompressed files with `historical_l2_importer.py`
 4. **Extract top of book** — best bid/ask and sizes from L2 `levels`
 5. **Validate coverage** — row counts, missing seconds, duplicates, invalid quotes
@@ -132,6 +132,36 @@ python3 historical_l2_download_commands.py --latest --limit 3
 
 Reports land under `reports/historical_l2_download_commands/` with mkdir, download,
 decompress, and import sections. Start with `--limit 3`, validate coverage, then expand.
+
+### Download a tiny sample with Python (no AWS/lz4 CLI)
+
+For a controlled one-file sample without the AWS or lz4 CLI:
+
+```bash
+python3 historical_l2_python_downloader.py --latest --max-files 1
+```
+
+Or point at a specific command plan:
+
+```bash
+python3 historical_l2_python_downloader.py \
+  --plan reports/historical_l2_download_commands/historical_l2_download_commands_20230916_20230916_BTC_ETH_SOL.json \
+  --max-files 1
+```
+
+Safety caps:
+
+- Default `--max-files` is **1**
+- Hard cap **3** without `--allow-more`
+- Hard cap **24** with `--allow-more` (still no all-time downloads)
+
+Outputs:
+
+- `downloads/hyperliquid/{date}/{hour}/{coin}.lz4` and `.jsonl`
+- Reports under `reports/historical_l2_python_downloads/`
+
+Uses unsigned public S3 access (`boto3` + `UNSIGNED` config) and Python `lz4.frame`
+decompression. No wallets, keys, or trading endpoints.
 
 ### Download one hour manually
 
@@ -206,6 +236,7 @@ explicit deduplication and provenance policy.
 | `historical_backfill_tool_check.py` | PATH diagnostic for `brew`/`aws`/`lz4` (shutil.which only) |
 | `historical_l2_backfill_planner.py` | Offline date-range manifest planner (S3 paths only, no download) |
 | `historical_l2_download_commands.py` | Manifest-driven batch command generator (mkdir/download/decompress/import) |
+| `historical_l2_python_downloader.py` | Python-native tiny sample downloader (unsigned S3 + lz4 library, hard-capped) |
 | `historical_backfill_manual_guide.py` | Manual download/decompress/import command strings and step plan |
 | `historical_backfill_research.py` | Research constants, facts, and summary helpers |
 | `historical_l2_importer.py` | Path builder, parser, local importer, coverage summary, CLI |
@@ -313,7 +344,7 @@ Historical CSV columns match `BID_ASK_CSV_COLUMNS` in `bid_ask_schema.py`.
 
 ## Future Work (Not in This Phase)
 
-- Requester-pays S3 downloader with explicit opt-in
+- Larger batch Python downloader beyond hard-capped sample limits
 - Hour-range batch import and deduplication across files
 - Integration hook in `bid_ask_data_pipeline.py` for `--source historical`
 - Gap-fill policy documentation (forward-fill vs leave missing)
