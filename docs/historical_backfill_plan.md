@@ -195,6 +195,7 @@ explicit deduplication and provenance policy.
 | File | Purpose |
 | --- | --- |
 | `historical_backfill_tool_check.py` | PATH diagnostic for `brew`/`aws`/`lz4` (shutil.which only) |
+| `historical_l2_backfill_planner.py` | Offline date-range manifest planner (S3 paths only, no download) |
 | `historical_backfill_manual_guide.py` | Manual download/decompress/import command strings and step plan |
 | `historical_backfill_research.py` | Research constants, facts, and summary helpers |
 | `historical_l2_importer.py` | Path builder, parser, local importer, coverage summary, CLI |
