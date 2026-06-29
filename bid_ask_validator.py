@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +12,11 @@ from typing import Any
 
 import pandas as pd
 
+from bid_ask_resampler import (
+    DEFAULT_DATA_ROOT,
+    normalize_source,
+    resolve_bid_ask_data_dir,
+)
 from bid_ask_schema import (
     BID_ASK_CSV_COLUMNS,
     BEST_ASK,
@@ -22,8 +29,8 @@ from bid_ask_schema import (
     TIMESTAMP_MS,
 )
 
-DEFAULT_DATA_ROOT = Path("data/bid_ask_csv")
 SUPPORTED_INTERVALS = frozenset({"1s", "15s", "1m"})
+SUPPORTED_SOURCES = frozenset({"local", "historical"})
 INTERVAL_SECONDS = {"1s": 1, "15s": 15, "1m": 60}
 
 RESAMPLED_COLUMNS = (
@@ -84,11 +91,14 @@ def bid_ask_csv_path(
     coin: str,
     interval: str,
     data_root: Path = DEFAULT_DATA_ROOT,
+    *,
+    source: str = "local",
 ) -> Path:
     _validate_interval(interval)
+    data_dir = resolve_bid_ask_data_dir(interval, source, data_root)
     if interval == "1s":
-        return data_root / "1s" / f"{coin}_1s.csv"
-    return data_root / interval / f"{coin}_{interval}.csv"
+        return data_dir / f"{coin}_1s.csv"
+    return data_dir / f"{coin}_{interval}.csv"
 
 
 def reports_dir(data_root: Path = DEFAULT_DATA_ROOT) -> Path:
@@ -99,10 +109,12 @@ def load_bid_ask_csv_for_validation(
     coin: str,
     interval: str,
     data_root: Path = DEFAULT_DATA_ROOT,
+    *,
+    source: str = "local",
 ) -> pd.DataFrame:
     """Load a bid/ask CSV for validation without modifying it."""
     _validate_interval(interval)
-    path = bid_ask_csv_path(coin, interval, data_root)
+    path = bid_ask_csv_path(coin, interval, data_root, source=source)
     if not path.is_file():
         raise FileNotFoundError(f"CSV not found: {path}")
 
@@ -178,7 +190,7 @@ def validate_bid_ask_dataframe(
 
     row_count = len(df)
     if row_count == 0:
-        warnings.append("CSV contains no rows")
+        warnings: list[str] = ["CSV contains no rows"]
         return ValidationReport(
             coin=coin,
             interval=interval,
@@ -362,10 +374,12 @@ def validate_coin_interval(
     interval: str,
     data_root: Path = DEFAULT_DATA_ROOT,
     extreme_spread_bps_threshold: float = EXTREME_SPREAD_BPS_THRESHOLD,
+    *,
+    source: str = "local",
 ) -> ValidationReport:
     """Load, validate, and persist a validation report for one coin/interval."""
-    input_path = bid_ask_csv_path(coin, interval, data_root)
-    df = load_bid_ask_csv_for_validation(coin, interval, data_root)
+    input_path = bid_ask_csv_path(coin, interval, data_root, source=source)
+    df = load_bid_ask_csv_for_validation(coin, interval, data_root, source=source)
     report = validate_bid_ask_dataframe(
         df,
         interval,
@@ -375,3 +389,66 @@ def validate_coin_interval(
     report.input_path = str(input_path)
     save_validation_report(report, data_root=data_root)
     return report
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Validate bid/ask CSV datasets (read-only, research-only, paper-only)."
+        )
+    )
+    parser.add_argument("--coins", nargs="+", required=True, help="Coin symbols, e.g. BTC ETH")
+    parser.add_argument(
+        "--interval",
+        required=True,
+        choices=sorted(SUPPORTED_INTERVALS),
+        help="CSV interval to validate (1s, 15s, or 1m)",
+    )
+    parser.add_argument(
+        "--source",
+        default="local",
+        choices=sorted(SUPPORTED_SOURCES),
+        help="Data source: local recorder CSVs or historical archive CSVs (default: local)",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help="Root directory for bid/ask CSV files (default: data/bid_ask_csv)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    source = normalize_source(args.source)
+    coins = [coin.strip().upper() for coin in args.coins if coin.strip()]
+    exit_code = 0
+
+    for coin in coins:
+        try:
+            report = validate_coin_interval(
+                coin,
+                args.interval,
+                data_root=args.data_root,
+                source=source,
+            )
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            print(f"coin={coin} interval={args.interval} source={source} error={exc}")
+            exit_code = 1
+            continue
+
+        print(f"coin={coin} interval={args.interval} source={source}")
+        print(f"data_dir={resolve_bid_ask_data_dir(args.interval, source, args.data_root)}")
+        print(f"input_path={report.input_path}")
+        print(f"report_path={report.report_path}")
+        print(f"passed={report.passed}")
+        print(f"row_count={report.row_count}")
+        for warning in report.warnings:
+            print(f"warning: {warning}")
+
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

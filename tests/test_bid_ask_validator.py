@@ -21,7 +21,7 @@ from bid_ask_schema import (
     TIMESTAMP_MS,
     build_bid_ask_row,
 )
-from bid_ask_resampler import RESAMPLED_COLUMNS, resample_bid_ask
+from bid_ask_resampler import RESAMPLED_COLUMNS, resample_bid_ask, resolve_bid_ask_data_dir
 from bid_ask_validator import (
     ValidationReport,
     bid_ask_csv_path,
@@ -94,6 +94,15 @@ class TestValid1sCsv:
         assert report.duplicate_timestamp_count == 0
         assert report.coverage_start == BASE_MS
         assert report.coverage_end == BASE_MS + 9_000
+
+    def test_historical_1s_csv_path(self, data_root: Path) -> None:
+        path = bid_ask_csv_path("ETH", "1s", data_root, source="historical")
+        assert path == data_root / "historical_1s" / "ETH_1s.csv"
+        _write_1s_csv(path, _make_rows(coin="ETH", count=5))
+        report = validate_coin_interval("ETH", "1s", data_root=data_root, source="historical")
+        assert report.passed is True
+        assert report.input_path == str(path)
+        assert resolve_bid_ask_data_dir("1s", "historical", data_root) == data_root / "historical_1s"
 
 
 class Test1sFailures:

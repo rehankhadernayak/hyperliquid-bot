@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -26,9 +28,12 @@ from bid_ask_schema import (
 )
 
 SUPPORTED_INTERVALS = frozenset({"15s", "1m"})
+SUPPORTED_INPUT_INTERVALS = frozenset({"1s"})
+SUPPORTED_SOURCES = frozenset({"local", "historical"})
 INTERVAL_SECONDS = {"15s": 15, "1m": 60}
 
 DEFAULT_DATA_ROOT = Path("data/bid_ask_csv")
+HISTORICAL_SOURCE_ALIASES = frozenset({"historical", "exchange", "all-time", "alltime"})
 
 RESAMPLED_COLUMNS = (
     "start_timestamp_ms",
@@ -57,25 +62,65 @@ def _validate_interval(interval: str) -> int:
     return INTERVAL_SECONDS[interval]
 
 
-def bid_ask_1s_path(coin: str, data_root: Path = DEFAULT_DATA_ROOT) -> Path:
-    return data_root / "1s" / f"{coin}_1s.csv"
+def normalize_source(source: str) -> str:
+    normalized = source.strip().lower()
+    if normalized in HISTORICAL_SOURCE_ALIASES:
+        return "historical"
+    if normalized == "local":
+        return "local"
+    supported = ", ".join(sorted(SUPPORTED_SOURCES))
+    raise ValueError(f"Unsupported source {source!r}; use one of: {supported}")
+
+
+def resolve_bid_ask_data_dir(
+    interval: str,
+    source: str = "local",
+    data_root: Path = DEFAULT_DATA_ROOT,
+) -> Path:
+    """Return the CSV directory for an interval and data source."""
+    if interval not in SUPPORTED_INPUT_INTERVALS | SUPPORTED_INTERVALS:
+        supported = ", ".join(sorted(SUPPORTED_INPUT_INTERVALS | SUPPORTED_INTERVALS))
+        raise ValueError(f"Unsupported interval {interval!r}; use one of: {supported}")
+
+    normalized_source = normalize_source(source)
+    if normalized_source == "local":
+        subdir = interval
+    else:
+        subdir = f"historical_{interval}"
+    return data_root / subdir
+
+
+def bid_ask_1s_path(
+    coin: str,
+    data_root: Path = DEFAULT_DATA_ROOT,
+    *,
+    source: str = "local",
+) -> Path:
+    return resolve_bid_ask_data_dir("1s", source, data_root) / f"{coin}_1s.csv"
 
 
 def resampled_csv_path(
     coin: str,
     interval: str,
     data_root: Path = DEFAULT_DATA_ROOT,
+    *,
+    source: str = "local",
 ) -> Path:
     _validate_interval(interval)
-    return data_root / interval / f"{coin}_{interval}.csv"
+    return resolve_bid_ask_data_dir(interval, source, data_root) / f"{coin}_{interval}.csv"
 
 
 def reports_dir(data_root: Path = DEFAULT_DATA_ROOT) -> Path:
     return data_root / "reports"
 
 
-def load_1s_csv(coin: str, data_root: Path = DEFAULT_DATA_ROOT) -> pd.DataFrame:
-    path = bid_ask_1s_path(coin, data_root)
+def load_1s_csv(
+    coin: str,
+    data_root: Path = DEFAULT_DATA_ROOT,
+    *,
+    source: str = "local",
+) -> pd.DataFrame:
+    path = bid_ask_1s_path(coin, data_root, source=source)
     if not path.is_file():
         raise FileNotFoundError(f"1s CSV not found: {path}")
 
@@ -136,8 +181,10 @@ def write_resampled_csv(
     coin: str,
     interval: str,
     data_root: Path = DEFAULT_DATA_ROOT,
+    *,
+    source: str = "local",
 ) -> Path:
-    path = resampled_csv_path(coin, interval, data_root)
+    path = resampled_csv_path(coin, interval, data_root, source=source)
     path.parent.mkdir(parents=True, exist_ok=True)
     df.to_csv(path, index=False)
     return path
@@ -153,6 +200,8 @@ def write_resampling_report(
     output_rows: int,
     total_missing_seconds: int,
     data_root: Path = DEFAULT_DATA_ROOT,
+    source: str = "local",
+    data_dir: Path | None = None,
 ) -> Path:
     report_dir = reports_dir(data_root)
     report_dir.mkdir(parents=True, exist_ok=True)
@@ -164,6 +213,8 @@ def write_resampling_report(
     report = {
         "coin": coin,
         "interval": interval,
+        "source": normalize_source(source),
+        "data_dir": str(data_dir or resolve_bid_ask_data_dir(interval, source, data_root)),
         "source_path": str(source_path),
         "output_path": str(output_path),
         "input_rows": input_rows,
@@ -181,14 +232,22 @@ def resample_coin(
     coin: str,
     intervals: tuple[str, ...] = ("15s", "1m"),
     data_root: Path = DEFAULT_DATA_ROOT,
+    *,
+    source: str = "local",
 ) -> dict[str, dict[str, Path]]:
-    source_df = load_1s_csv(coin, data_root)
-    source_path = bid_ask_1s_path(coin, data_root)
+    source_df = load_1s_csv(coin, data_root, source=source)
+    source_path = bid_ask_1s_path(coin, data_root, source=source)
 
     results: dict[str, dict[str, Path]] = {}
     for interval in intervals:
         resampled = resample_bid_ask(source_df, interval)
-        output_path = write_resampled_csv(resampled, coin, interval, data_root)
+        output_path = write_resampled_csv(
+            resampled,
+            coin,
+            interval,
+            data_root,
+            source=source,
+        )
         total_missing = (
             int(resampled["missing_seconds"].sum()) if not resampled.empty else 0
         )
@@ -201,9 +260,93 @@ def resample_coin(
             output_rows=len(resampled),
             total_missing_seconds=total_missing,
             data_root=data_root,
+            source=source,
+            data_dir=resolve_bid_ask_data_dir(interval, source, data_root),
         )
         results[interval] = {
             "output_path": output_path,
             "report_path": report_path,
         }
     return results
+
+
+def _resolve_target_intervals(to_interval: str) -> tuple[str, ...]:
+    if to_interval == "all":
+        return ("15s", "1m")
+    if to_interval not in SUPPORTED_INTERVALS:
+        supported = ", ".join(sorted(SUPPORTED_INTERVALS | {"all"}))
+        raise ValueError(f"Unsupported to-interval {to_interval!r}; use one of: {supported}")
+    return (to_interval,)
+
+
+def _build_arg_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Resample 1-second bid/ask CSV files into 15-second and 1-minute bars "
+            "(read-only, research-only, paper-only)."
+        )
+    )
+    parser.add_argument("--coins", nargs="+", required=True, help="Coin symbols, e.g. BTC ETH")
+    parser.add_argument(
+        "--from-interval",
+        default="1s",
+        choices=sorted(SUPPORTED_INPUT_INTERVALS),
+        help="Input interval (default: 1s)",
+    )
+    parser.add_argument(
+        "--to-interval",
+        required=True,
+        help="Output interval: 15s, 1m, or all",
+    )
+    parser.add_argument(
+        "--source",
+        default="local",
+        choices=sorted(SUPPORTED_SOURCES),
+        help="Data source: local recorder CSVs or historical archive CSVs (default: local)",
+    )
+    parser.add_argument(
+        "--data-root",
+        type=Path,
+        default=DEFAULT_DATA_ROOT,
+        help="Root directory for bid/ask CSV files (default: data/bid_ask_csv)",
+    )
+    return parser
+
+
+def main(argv: list[str] | None = None) -> int:
+    args = _build_arg_parser().parse_args(argv)
+    if args.from_interval != "1s":
+        print(f"error=Only 1s input is supported; got {args.from_interval!r}", file=sys.stderr)
+        return 2
+
+    try:
+        intervals = _resolve_target_intervals(args.to_interval)
+    except ValueError as exc:
+        print(f"error={exc}", file=sys.stderr)
+        return 2
+
+    source = normalize_source(args.source)
+    coins = [coin.strip().upper() for coin in args.coins if coin.strip()]
+    exit_code = 0
+    for coin in coins:
+        try:
+            results = resample_coin(
+                coin,
+                intervals=intervals,
+                data_root=args.data_root,
+                source=source,
+            )
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            print(f"coin={coin} error={exc}")
+            exit_code = 1
+            continue
+
+        for interval, paths in results.items():
+            print(f"coin={coin} interval={interval} source={source}")
+            print(f"output_path={paths['output_path']}")
+            print(f"report_path={paths['report_path']}")
+    return exit_code
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

@@ -12,12 +12,13 @@ import bid_ask_extractor
 import bid_ask_resampler
 import bid_ask_train
 import bid_ask_validator
+from bid_ask_resampler import normalize_source, resolve_bid_ask_data_dir
 
 DATA_COVERAGE_STATEMENT = (
     "Using locally collected data only. This is not full exchange all-time history."
 )
-HISTORICAL_WARNING = (
-    "Historical exchange backfill is not implemented yet. Using locally collected data only."
+HISTORICAL_EXTRACT_SKIP_MESSAGE = (
+    "Historical source uses already imported historical_1s CSVs; extraction is not run."
 )
 
 DEFAULT_DATA_ROOT = bid_ask_extractor.DEFAULT_OUTPUT_ROOT
@@ -30,8 +31,7 @@ SUPPORTED_VALIDATE_INTERVALS = frozenset({"1s", "15s", "1m"})
 SUPPORTED_RESAMPLE_FROM = frozenset({"1s"})
 SUPPORTED_RESAMPLE_TO = frozenset({"15s", "1m", "all"})
 SUPPORTED_TRAIN_INTERVALS = frozenset({"15s", "1m"})
-SUPPORTED_SOURCES = frozenset({"local"})
-HISTORICAL_SOURCE_ALIASES = frozenset({"historical", "exchange", "all-time", "alltime"})
+SUPPORTED_SOURCES = frozenset({"local", "historical"})
 RESAMPLE_ALL_INTERVALS = ("15s", "1m")
 
 
@@ -53,7 +53,18 @@ def _normalize_coins(coins: list[str]) -> list[str]:
     return [coin.strip().upper() for coin in coins if coin.strip()]
 
 
-def _print_data_coverage() -> None:
+def _normalize_source(source: str) -> str:
+    return normalize_source(source)
+
+
+def _is_historical_source(source: str) -> bool:
+    return _normalize_source(source) == "historical"
+
+
+def _print_data_coverage(*, source: str = "local") -> None:
+    if _is_historical_source(source):
+        print("Using historical archive CSVs from data/bid_ask_csv/historical_* folders.")
+        return
     print(DATA_COVERAGE_STATEMENT)
 
 
@@ -81,12 +92,13 @@ def _print_step_summary(result: StepResult, *, next_command: str | None = None) 
     print()
 
 
-def _maybe_warn_historical_source(source: str | None) -> None:
-    if source is None:
-        return
-    normalized = source.strip().lower()
-    if normalized in HISTORICAL_SOURCE_ALIASES or normalized not in SUPPORTED_SOURCES:
-        print(HISTORICAL_WARNING)
+def _maybe_warn_legacy_historical_flags(args: argparse.Namespace) -> None:
+    if getattr(args, "historical", False) or getattr(args, "all_time", False):
+        source = getattr(args, "source", "local")
+        if not _is_historical_source(source):
+            print(
+                "Note: --historical/--all-time flags are legacy; prefer --source historical."
+            )
 
 
 def _strict_blocks_continue(report_passed: bool | None, *, strict: bool) -> bool:
@@ -102,18 +114,30 @@ def cmd_extract(
     data_root: Path = DEFAULT_DATA_ROOT,
     market_stream_dir: Path = DEFAULT_MARKET_STREAM_DIR,
 ) -> list[StepResult]:
-    _maybe_warn_historical_source(source)
+    normalized_source = _normalize_source(source)
+    if _is_historical_source(normalized_source):
+        results: list[StepResult] = []
+        normalized = _normalize_coins(coins)
+        for coin in normalized:
+            result = StepResult(action="extract", coin=coin, intervals=[interval])
+            result.skipped = True
+            result.warnings.append(HISTORICAL_EXTRACT_SKIP_MESSAGE)
+            _print_step_summary(result)
+            results.append(result)
+        return results
 
     if interval not in SUPPORTED_EXTRACT_INTERVALS:
         raise ValueError(f"Extract supports interval 1s only; got {interval!r}")
 
-    _print_data_coverage()
+    _print_data_coverage(source=normalized_source)
     results: list[StepResult] = []
     normalized = _normalize_coins(coins)
     for index, coin in enumerate(normalized):
         result = StepResult(action="extract", coin=coin, intervals=[interval])
         if dry_run:
-            output_path = str(data_root / "1s" / f"{coin}_1s.csv")
+            output_path = str(
+                resolve_bid_ask_data_dir("1s", normalized_source, data_root) / f"{coin}_1s.csv"
+            )
             result.output_paths = [output_path]
             result.report_paths = [str(data_root / "reports" / f"{coin}_<timestamp>.json")]
             result.warnings.append("dry-run: no files written")
@@ -162,15 +186,24 @@ def cmd_validate(
     interval: str,
     dry_run: bool = False,
     data_root: Path = DEFAULT_DATA_ROOT,
+    source: str = "local",
 ) -> list[StepResult]:
     if interval not in SUPPORTED_VALIDATE_INTERVALS:
         raise ValueError(f"Unsupported interval {interval!r}")
 
+    normalized_source = _normalize_source(source)
     results: list[StepResult] = []
     normalized = _normalize_coins(coins)
     for index, coin in enumerate(normalized):
         result = StepResult(action="validate", coin=coin, intervals=[interval])
-        input_path = str(bid_ask_validator.bid_ask_csv_path(coin, interval, data_root))
+        input_path = str(
+            bid_ask_validator.bid_ask_csv_path(
+                coin,
+                interval,
+                data_root,
+                source=normalized_source,
+            )
+        )
         result.output_paths = [input_path]
 
         if dry_run:
@@ -193,6 +226,7 @@ def cmd_validate(
                 coin,
                 interval,
                 data_root=data_root,
+                source=normalized_source,
             )
             result.report_paths = [report.report_path]
             result.row_counts[interval] = report.row_count
@@ -225,12 +259,14 @@ def cmd_resample(
     to_interval: str,
     dry_run: bool = False,
     data_root: Path = DEFAULT_DATA_ROOT,
+    source: str = "local",
 ) -> list[StepResult]:
     if from_interval not in SUPPORTED_RESAMPLE_FROM:
         raise ValueError(f"Resample supports from-interval 1s only; got {from_interval!r}")
     if to_interval not in SUPPORTED_RESAMPLE_TO:
         raise ValueError(f"Unsupported to-interval {to_interval!r}")
 
+    normalized_source = _normalize_source(source)
     intervals = list(RESAMPLE_ALL_INTERVALS) if to_interval == "all" else [to_interval]
     results: list[StepResult] = []
     normalized = _normalize_coins(coins)
@@ -239,7 +275,14 @@ def cmd_resample(
         result = StepResult(action="resample", coin=coin, intervals=intervals)
         if dry_run:
             result.output_paths = [
-                str(bid_ask_resampler.resampled_csv_path(coin, interval, data_root))
+                str(
+                    bid_ask_resampler.resampled_csv_path(
+                        coin,
+                        interval,
+                        data_root,
+                        source=normalized_source,
+                    )
+                )
                 for interval in intervals
             ]
             result.report_paths = [
@@ -262,6 +305,7 @@ def cmd_resample(
                 coin,
                 intervals=tuple(intervals),
                 data_root=data_root,
+                source=normalized_source,
             )
             for interval, paths in resample_results.items():
                 result.output_paths.append(str(paths["output_path"]))
@@ -295,15 +339,24 @@ def cmd_train(
     data_root: Path = DEFAULT_DATA_ROOT,
     reports_dir: Path = DEFAULT_TRAINING_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
+    source: str = "local",
 ) -> StepResult:
     if interval not in SUPPORTED_TRAIN_INTERVALS:
         raise ValueError(f"Training supports intervals 15s and 1m only; got {interval!r}")
 
+    normalized_source = _normalize_source(source)
     normalized_coin = coin.strip().upper()
     result = StepResult(action="train", coin=normalized_coin, intervals=[interval])
-    _print_data_coverage()
+    _print_data_coverage(source=normalized_source)
 
-    source_path = str(bid_ask_resampler.resampled_csv_path(normalized_coin, interval, data_root))
+    source_path = str(
+        bid_ask_resampler.resampled_csv_path(
+            normalized_coin,
+            interval,
+            data_root,
+            source=normalized_source,
+        )
+    )
     result.output_paths = [source_path]
 
     if dry_run:
@@ -320,6 +373,7 @@ def cmd_train(
             data_root=data_root,
             reports_dir=reports_dir,
             models_dir=models_dir,
+            source=normalized_source,
         )
         evaluation = pipeline_result["evaluation"]
         report = pipeline_result["report"]
@@ -350,27 +404,32 @@ def run_one_coin_workflow(
     market_stream_dir: Path = DEFAULT_MARKET_STREAM_DIR,
     reports_dir: Path = DEFAULT_TRAINING_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
+    source: str = "local",
 ) -> tuple[list[StepResult], bool]:
     """Run extract -> validate 1s -> resample -> validate 15s/1m -> train."""
+    normalized_source = _normalize_source(source)
     all_results: list[StepResult] = []
     success = True
 
-    extract_results = cmd_extract(
-        [coin],
-        interval="1s",
-        dry_run=dry_run,
-        data_root=data_root,
-        market_stream_dir=market_stream_dir,
-    )
-    all_results.extend(extract_results)
-    if any(r.error for r in extract_results):
-        return all_results, False
+    if not _is_historical_source(normalized_source):
+        extract_results = cmd_extract(
+            [coin],
+            source=normalized_source,
+            interval="1s",
+            dry_run=dry_run,
+            data_root=data_root,
+            market_stream_dir=market_stream_dir,
+        )
+        all_results.extend(extract_results)
+        if any(r.error for r in extract_results):
+            return all_results, False
 
     validate_1s_results = cmd_validate(
         [coin],
         interval="1s",
         dry_run=dry_run,
         data_root=data_root,
+        source=normalized_source,
     )
     all_results.extend(validate_1s_results)
     validate_1s = validate_1s_results[0] if validate_1s_results else None
@@ -387,6 +446,7 @@ def run_one_coin_workflow(
         to_interval="all",
         dry_run=dry_run,
         data_root=data_root,
+        source=normalized_source,
     )
     all_results.extend(resample_results)
     if any(r.error for r in resample_results):
@@ -398,6 +458,7 @@ def run_one_coin_workflow(
             interval=interval,
             dry_run=dry_run,
             data_root=data_root,
+            source=normalized_source,
         )
         all_results.extend(validate_results)
         step = validate_results[0] if validate_results else None
@@ -424,6 +485,7 @@ def run_one_coin_workflow(
         data_root=data_root,
         reports_dir=reports_dir,
         models_dir=models_dir,
+        source=normalized_source,
     )
     all_results.append(train_result)
     if train_result.error:
@@ -442,10 +504,15 @@ def cmd_run_one(
     market_stream_dir: Path = DEFAULT_MARKET_STREAM_DIR,
     reports_dir: Path = DEFAULT_TRAINING_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
+    source: str = "local",
 ) -> bool:
     normalized = coin.strip().upper()
-    print(f"action=run-one coin={normalized} train_interval={train_interval} horizon={horizon}")
-    _print_data_coverage()
+    normalized_source = _normalize_source(source)
+    print(
+        f"action=run-one coin={normalized} train_interval={train_interval} "
+        f"horizon={horizon} source={normalized_source}"
+    )
+    _print_data_coverage(source=normalized_source)
     _, success = run_one_coin_workflow(
         normalized,
         train_interval=train_interval,
@@ -456,6 +523,7 @@ def cmd_run_one(
         market_stream_dir=market_stream_dir,
         reports_dir=reports_dir,
         models_dir=models_dir,
+        source=normalized_source,
     )
     print(f"run-one_complete coin={normalized} success={success}")
     return success
@@ -472,16 +540,18 @@ def cmd_run_all(
     market_stream_dir: Path = DEFAULT_MARKET_STREAM_DIR,
     reports_dir: Path = DEFAULT_TRAINING_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
+    source: str = "local",
 ) -> dict[str, bool]:
     normalized = _normalize_coins(coins)
+    normalized_source = _normalize_source(source)
     total = len(normalized)
     outcomes: dict[str, bool] = {}
 
     print(
         f"action=run-all coins={','.join(normalized)} "
-        f"train_interval={train_interval} horizon={horizon}"
+        f"train_interval={train_interval} horizon={horizon} source={normalized_source}"
     )
-    _print_data_coverage()
+    _print_data_coverage(source=normalized_source)
 
     for index, coin in enumerate(normalized, start=1):
         print(f"[{index}/{total}] {coin}")
@@ -496,6 +566,7 @@ def cmd_run_all(
                 market_stream_dir=market_stream_dir,
                 reports_dir=reports_dir,
                 models_dir=models_dir,
+                source=normalized_source,
             )
             outcomes[coin] = success
         except Exception as exc:  # noqa: BLE001 - CLI boundary
@@ -554,14 +625,20 @@ def build_parser() -> argparse.ArgumentParser:
         help="Sklearn model output directory (default: models/bid_ask)",
     )
     parent.add_argument(
+        "--source",
+        default="local",
+        choices=sorted(SUPPORTED_SOURCES),
+        help="Data source: local recorder CSVs or historical archive CSVs (default: local)",
+    )
+    parent.add_argument(
         "--historical",
         action="store_true",
-        help="Request historical exchange backfill (not implemented; uses local data)",
+        help="Legacy alias; prefer --source historical",
     )
     parent.add_argument(
         "--all-time",
         action="store_true",
-        help="Request all-time exchange history (not implemented; uses local data)",
+        help="Legacy alias; prefer --source historical",
     )
 
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -572,7 +649,6 @@ def build_parser() -> argparse.ArgumentParser:
         help="Extract 1s bid/ask CSV from local data",
     )
     extract_parser.add_argument("--coins", nargs="+", required=True)
-    extract_parser.add_argument("--source", default="local")
     extract_parser.add_argument("--interval", default="1s")
 
     validate_parser = subparsers.add_parser(
@@ -623,25 +699,29 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def _pipeline_options(args: argparse.Namespace) -> dict[str, object]:
+    source = args.source
+    if getattr(args, "historical", False) or getattr(args, "all_time", False):
+        source = "historical"
     return {
         "dry_run": args.dry_run,
         "data_root": args.data_root,
         "market_stream_dir": args.market_stream_dir,
         "reports_dir": args.reports_dir,
         "models_dir": args.models_dir,
+        "source": normalize_source(source),
     }
 
 
 def dispatch(args: argparse.Namespace) -> int:
-    if args.historical or args.all_time:
-        print(HISTORICAL_WARNING)
+    _maybe_warn_legacy_historical_flags(args)
 
     options = _pipeline_options(args)
+    source = str(options["source"])
 
     if args.command == "extract":
         cmd_extract(
             args.coins,
-            source=args.source,
+            source=source,
             interval=args.interval,
             dry_run=bool(options["dry_run"]),
             data_root=options["data_root"],  # type: ignore[arg-type]
@@ -655,6 +735,7 @@ def dispatch(args: argparse.Namespace) -> int:
             interval=args.interval,
             dry_run=bool(options["dry_run"]),
             data_root=options["data_root"],  # type: ignore[arg-type]
+            source=source,
         )
         return 0
 
@@ -665,6 +746,7 @@ def dispatch(args: argparse.Namespace) -> int:
             to_interval=args.to_interval,
             dry_run=bool(options["dry_run"]),
             data_root=options["data_root"],  # type: ignore[arg-type]
+            source=source,
         )
         return 0
 
@@ -677,6 +759,7 @@ def dispatch(args: argparse.Namespace) -> int:
             data_root=options["data_root"],  # type: ignore[arg-type]
             reports_dir=options["reports_dir"],  # type: ignore[arg-type]
             models_dir=options["models_dir"],  # type: ignore[arg-type]
+            source=source,
         )
         return 0 if result.error is None else 1
 
@@ -691,6 +774,7 @@ def dispatch(args: argparse.Namespace) -> int:
             market_stream_dir=options["market_stream_dir"],  # type: ignore[arg-type]
             reports_dir=options["reports_dir"],  # type: ignore[arg-type]
             models_dir=options["models_dir"],  # type: ignore[arg-type]
+            source=source,
         )
         return 0 if success else 1
 
@@ -705,6 +789,7 @@ def dispatch(args: argparse.Namespace) -> int:
             market_stream_dir=options["market_stream_dir"],  # type: ignore[arg-type]
             reports_dir=options["reports_dir"],  # type: ignore[arg-type]
             models_dir=options["models_dir"],  # type: ignore[arg-type]
+            source=source,
         )
         return 0 if all(outcomes.values()) else 1
 

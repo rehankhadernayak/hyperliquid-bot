@@ -11,7 +11,7 @@ import pytest
 
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS
-from bid_ask_model_io import build_artifact_payload, load_model_artifact, save_model_artifact
+from bid_ask_model_io import build_artifact_payload, load_model_artifact
 from bid_ask_train import (
     EXECUTION_ENABLED,
     FEATURE_COLUMNS,
@@ -28,6 +28,7 @@ from bid_ask_train import (
     load_training_data,
     main,
     run_training_pipeline,
+    save_training_model_artifact,
     save_training_report,
     train_baseline_model,
     train_optional_sklearn_model,
@@ -121,6 +122,13 @@ class TestLoadTrainingData:
         assert len(df) == 40
         assert list(df.columns) == list(RESAMPLED_COLUMNS)
         assert df["start_timestamp_ms"].is_monotonic_increasing
+
+    def test_load_historical_training_data(self, data_root: Path) -> None:
+        path = resampled_csv_path("SOL", "1m", data_root, source="historical")
+        _write_resampled_csv(path, _make_resampled_rows(coin="SOL", count=20, step_ms=60_000))
+        df = load_training_data("SOL", "1m", data_root, source="historical")
+        assert len(df) == 20
+        assert path == data_root / "historical_1m" / "SOL_1m.csv"
 
 
 class TestCreateFeatures:
@@ -513,6 +521,7 @@ class TestReportCreation:
             sklearn_result=sklearn_result,
             models_dir=models_dir,
             artifact_payload=artifact_payload,
+            source="local",
         )
         loaded = json.loads(path.read_text(encoding="utf-8"))
         assert "model_artifact_path" in loaded
@@ -521,6 +530,45 @@ class TestReportCreation:
         assert artifact is not None
         assert artifact["paper_only"] is True
         assert artifact["execution_enabled"] is False
+
+    def test_historical_artifact_name_does_not_overwrite_local(self, tmp_path: Path) -> None:
+        models_dir = tmp_path / "models"
+        artifact_id = "testartifact123"
+        payload = build_artifact_payload(
+            model=FakeModel(),
+            scaler=FakeScaler(),
+            feature_names=FEATURE_COLUMNS,
+            coin="SOL",
+            interval="1m",
+            horizon=5,
+            threshold_bps=1.0,
+            train_rows=10,
+            test_rows=5,
+            baseline_accuracy=0.4,
+            model_accuracy=0.6,
+            model_type="FakeModel",
+        )
+        payload["source"] = "historical"
+        payload["data_dir"] = "data/bid_ask_csv/historical_1m"
+
+        local_path = save_training_model_artifact(
+            payload,
+            models_dir=models_dir,
+            artifact_id=artifact_id,
+            source="local",
+        )
+        historical_path = save_training_model_artifact(
+            payload,
+            models_dir=models_dir,
+            artifact_id=artifact_id,
+            source="historical",
+        )
+
+        assert local_path.name == f"SOL_1m_{artifact_id}.joblib"
+        assert historical_path.name == f"SOL_historical_1m_{artifact_id}.joblib"
+        assert local_path != historical_path
+        assert local_path.is_file()
+        assert historical_path.is_file()
 
     def test_model_edge_vs_baseline_in_report(self) -> None:
         evaluation = {
@@ -581,6 +629,10 @@ class TestReportCreation:
             models_dir=tmp_path / "models",
         )
         assert result["report"]["coin"] == "BTC"
+        assert result["report"]["source"] == "local"
+        assert result["report"]["data_dir"] == str(data_root / "15s")
+        assert result["report"]["paper_only"] is True
+        assert result["report"]["execution_enabled"] is False
         assert result["evaluation"]["test_rows"] > 0
         assert result["report_path"] is not None
         assert result["report_path"].is_file()
@@ -588,6 +640,26 @@ class TestReportCreation:
         loaded = json.loads(result["report_path"].read_text(encoding="utf-8"))
         if loaded.get("model_artifact_path"):
             assert Path(loaded["model_artifact_path"]).is_file()
+
+    def test_run_training_pipeline_historical_source(self, data_root: Path, tmp_path: Path) -> None:
+        path = resampled_csv_path("SOL", "1m", data_root, source="historical")
+        _write_resampled_csv(path, _make_resampled_rows(coin="SOL", count=40, step_ms=60_000))
+        result = run_training_pipeline(
+            coin="SOL",
+            interval="1m",
+            horizon=5,
+            data_root=data_root,
+            reports_dir=tmp_path / "reports",
+            models_dir=tmp_path / "models",
+            source="historical",
+        )
+        report = result["report"]
+        assert report["source"] == "historical"
+        assert report["data_dir"] == str(data_root / "historical_1m")
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        if report.get("model_artifact_path"):
+            assert "historical_1m" in Path(report["model_artifact_path"]).name
 
 
 class TestSklearnOptional:
@@ -611,6 +683,14 @@ class TestCommandParser:
         assert args.coin == "BTC"
         assert args.interval == "15s"
         assert args.horizon == 1
+        assert args.source == "local"
+
+    def test_argparse_historical_source(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            ["--coin", "SOL", "--interval", "1m", "--horizon", "5", "--source", "historical"]
+        )
+        assert args.source == "historical"
 
     def test_main_with_temp_data(self, data_root: Path, tmp_path: Path, capsys) -> None:
         path = resampled_csv_path("BTC", "15s", data_root)

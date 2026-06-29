@@ -14,10 +14,15 @@ import pandas as pd
 
 from bid_ask_model_io import (
     DEFAULT_MODELS_DIR as MODEL_IO_DEFAULT_MODELS_DIR,
+    _dump_artifact,
     build_artifact_payload,
-    save_model_artifact,
 )
-from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
+from bid_ask_resampler import (
+    RESAMPLED_COLUMNS,
+    normalize_source,
+    resolve_bid_ask_data_dir,
+    resampled_csv_path,
+)
 from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY
 
 SAFETY_STATEMENT = (
@@ -68,13 +73,15 @@ def load_training_data(
     coin: str,
     interval: str,
     data_root: Path = DEFAULT_DATA_ROOT,
+    *,
+    source: str = "local",
 ) -> pd.DataFrame:
     """Load resampled bid/ask CSV for the given coin and interval."""
     if interval not in SUPPORTED_INTERVALS:
         supported = ", ".join(sorted(SUPPORTED_INTERVALS))
         raise ValueError(f"Unsupported interval {interval!r}; use one of: {supported}")
 
-    path = resampled_csv_path(coin, interval, data_root)
+    path = resampled_csv_path(coin, interval, data_root, source=source)
     if not path.is_file():
         raise FileNotFoundError(f"Training CSV not found: {path}")
 
@@ -370,6 +377,45 @@ def evaluate_predictions(
     }
 
 
+def _model_artifact_path(
+    *,
+    coin: str,
+    interval: str,
+    artifact_id: str,
+    models_dir: Path,
+    source: str = "local",
+) -> Path:
+    normalized_source = normalize_source(source)
+    if normalized_source == "historical":
+        filename = f"{coin.upper()}_historical_{interval}_{artifact_id}.joblib"
+    else:
+        filename = f"{coin.upper()}_{interval}_{artifact_id}.joblib"
+    return models_dir / filename
+
+
+def save_training_model_artifact(
+    payload: dict[str, Any],
+    models_dir: Path = DEFAULT_MODELS_DIR,
+    *,
+    artifact_id: str | None = None,
+    source: str = "local",
+) -> Path:
+    """Persist a training artifact without overwriting local model names."""
+    models_dir.mkdir(parents=True, exist_ok=True)
+    coin = str(payload.get("coin", "UNKNOWN")).upper()
+    interval = str(payload.get("interval", "unknown"))
+    artifact_id = artifact_id or datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    path = _model_artifact_path(
+        coin=coin,
+        interval=interval,
+        artifact_id=artifact_id,
+        models_dir=models_dir,
+        source=source,
+    )
+    _dump_artifact(payload, path)
+    return path
+
+
 def save_training_report(
     report: dict[str, Any],
     reports_dir: Path = DEFAULT_REPORTS_DIR,
@@ -377,6 +423,7 @@ def save_training_report(
     sklearn_result: dict[str, Any] | None = None,
     models_dir: Path = DEFAULT_MODELS_DIR,
     artifact_payload: dict[str, Any] | None = None,
+    source: str = "local",
 ) -> Path:
     """Persist JSON training report; optionally save sklearn model artifact."""
     reports_dir.mkdir(parents=True, exist_ok=True)
@@ -385,10 +432,11 @@ def save_training_report(
 
     if artifact_payload is not None and sklearn_result and sklearn_result.get("model") is not None:
         try:
-            artifact_path = save_model_artifact(
+            artifact_path = save_training_model_artifact(
                 artifact_payload,
                 models_dir=models_dir,
                 artifact_id=report_id,
+                source=source,
             )
         except Exception as exc:
             report.setdefault("warnings", []).append(
@@ -417,6 +465,8 @@ def build_training_report(
     baseline: dict[str, Any],
     sklearn_result: dict[str, Any],
     model_used: str,
+    source: str = "local",
+    data_dir: str | None = None,
 ) -> dict[str, Any]:
     model_accuracy = float(evaluation.get("accuracy", 0.0))
     baseline_accuracy = float(evaluation.get("baseline_accuracy", 0.0))
@@ -437,6 +487,8 @@ def build_training_report(
     return {
         "coin": coin,
         "interval": interval,
+        "source": normalize_source(source),
+        "data_dir": data_dir,
         "horizon": horizon,
         "threshold_bps": threshold_bps,
         "train_fraction": train_fraction,
@@ -477,9 +529,12 @@ def run_training_pipeline(
     reports_dir: Path = DEFAULT_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
     save_report: bool = True,
+    source: str = "local",
 ) -> dict[str, Any]:
     """End-to-end training pipeline for CLI and tests."""
-    raw_df = load_training_data(coin, interval, data_root)
+    normalized_source = normalize_source(source)
+    data_dir = resolve_bid_ask_data_dir(interval, normalized_source, data_root)
+    raw_df = load_training_data(coin, interval, data_root, source=normalized_source)
     if max_rows is not None and max_rows > 0:
         raw_df = raw_df.iloc[:max_rows].copy()
     featured_df = create_features(raw_df)
@@ -508,7 +563,7 @@ def run_training_pipeline(
         baseline_predictions=baseline_predictions,
     )
 
-    source_path = str(resampled_csv_path(coin, interval, data_root))
+    source_path = str(resampled_csv_path(coin, interval, data_root, source=normalized_source))
     report = build_training_report(
         coin=coin,
         interval=interval,
@@ -520,6 +575,8 @@ def run_training_pipeline(
         baseline=baseline,
         sklearn_result=sklearn_result,
         model_used=model_used,
+        source=normalized_source,
+        data_dir=str(data_dir),
     )
 
     artifact_payload: dict[str, Any] | None = None
@@ -538,6 +595,8 @@ def run_training_pipeline(
             model_accuracy=evaluation["accuracy"],
             model_type=str(sklearn_result.get("model_type") or model_used),
         )
+        artifact_payload["source"] = normalized_source
+        artifact_payload["data_dir"] = str(data_dir)
 
     report_path: Path | None = None
     if save_report:
@@ -547,6 +606,7 @@ def run_training_pipeline(
             sklearn_result=sklearn_result,
             models_dir=models_dir,
             artifact_payload=artifact_payload,
+            source=normalized_source,
         )
         report["report_path"] = str(report_path)
 
@@ -596,6 +656,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Chronological train split fraction (default: 0.70)",
     )
     parser.add_argument(
+        "--source",
+        default="local",
+        choices=("local", "historical"),
+        help="Data source: local recorder CSVs or historical archive CSVs (default: local)",
+    )
+    parser.add_argument(
         "--data-root",
         type=Path,
         default=DEFAULT_DATA_ROOT,
@@ -620,9 +686,12 @@ def main(argv: list[str] | None = None) -> int:
         train_fraction=args.train_fraction,
         data_root=args.data_root,
         reports_dir=args.reports_dir,
+        source=args.source,
     )
     evaluation = result["evaluation"]
+    report = result["report"]
     print(f"coin={args.coin.upper()} interval={args.interval} horizon={args.horizon}")
+    print(f"source={report['source']} data_dir={report['data_dir']}")
     print(f"train_rows={evaluation['train_rows']} test_rows={evaluation['test_rows']}")
     print(f"accuracy={evaluation['accuracy']:.4f} baseline_accuracy={evaluation['baseline_accuracy']:.4f}")
     print(f"model_edge_vs_baseline={result['report']['model_edge_vs_baseline']:.4f}")

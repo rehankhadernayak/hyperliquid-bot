@@ -71,15 +71,94 @@ class TestExtractCommand:
         pipeline.main(["extract", "--coins", "BTC", "ETH", "SOL", "--source", "local", "--interval", "1s"])
         assert calls == ["BTC", "ETH", "SOL"]
 
-    def test_historical_source_prints_warning(self, capsys: pytest.CaptureFixture[str]) -> None:
-        pipeline.main(["extract", "--coins", "BTC", "--source", "historical", "--interval", "1s", "--dry-run"])
+    def test_historical_source_prints_skip_message(self, capsys: pytest.CaptureFixture[str]) -> None:
+        pipeline.main(
+            [
+                "extract",
+                "--coins",
+                "BTC",
+                "--source",
+                "historical",
+                "--interval",
+                "1s",
+                "--dry-run",
+            ]
+        )
         captured = capsys.readouterr().out
-        assert pipeline.HISTORICAL_WARNING in captured
+        assert pipeline.HISTORICAL_EXTRACT_SKIP_MESSAGE in captured
+        assert "skipped=true" in captured
 
     def test_all_time_flag_prints_warning(self, capsys: pytest.CaptureFixture[str]) -> None:
         pipeline.main(["extract", "--coins", "BTC", "--source", "local", "--interval", "1s", "--all-time", "--dry-run"])
         captured = capsys.readouterr().out
-        assert pipeline.HISTORICAL_WARNING in captured
+        assert "prefer --source historical" in captured
+
+
+class TestHistoricalSource:
+    def test_validate_uses_historical_folders(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[tuple[str, str, str]] = []
+
+        def fake_validate(coin: str, interval: str, **kwargs: object) -> ValidationReport:
+            calls.append((coin, interval, str(kwargs.get("source", "local"))))
+            return _validation_report(coin, interval)
+
+        monkeypatch.setattr(bid_ask_validator, "validate_coin_interval", fake_validate)
+        pipeline.main(
+            [
+                "validate",
+                "--coins",
+                "SOL",
+                "--interval",
+                "1m",
+                "--source",
+                "historical",
+            ]
+        )
+        assert calls == [("SOL", "1m", "historical")]
+
+    def test_resample_uses_historical_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[tuple[str, str]] = []
+
+        def fake_resample(coin: str, intervals: tuple[str, ...] = ("15s", "1m"), **kwargs: object):
+            calls.append((coin, str(kwargs.get("source", "local"))))
+            return {
+                interval: {
+                    "output_path": Path(f"/tmp/{coin}_{interval}.csv"),
+                    "report_path": Path(f"/tmp/{coin}_{interval}_report.json"),
+                }
+                for interval in intervals
+            }
+
+        monkeypatch.setattr(bid_ask_resampler, "resample_coin", fake_resample)
+        pipeline.main(
+            [
+                "resample",
+                "--coins",
+                "BTC",
+                "--from-interval",
+                "1s",
+                "--to-interval",
+                "all",
+                "--source",
+                "historical",
+            ]
+        )
+        assert calls == [("BTC", "historical")]
+
+    def test_train_uses_historical_source(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        calls: list[str] = []
+
+        def fake_train(**kwargs: object) -> dict[str, object]:
+            calls.append(str(kwargs.get("source", "local")))
+            return {
+                "evaluation": {"train_rows": 7, "test_rows": 3, "warnings": []},
+                "report": {"model_used": "majority_class", "source": "historical"},
+                "report_path": Path("/tmp/report.json"),
+            }
+
+        monkeypatch.setattr(bid_ask_train, "run_training_pipeline", fake_train)
+        pipeline.main(["train", "--coin", "SOL", "--interval", "1m", "--horizon", "5", "--source", "historical"])
+        assert calls == ["historical"]
 
 
 class TestValidateCommand:
@@ -189,6 +268,68 @@ class TestRunOneWorkflow:
 
         assert order == [
             "extract:BTC",
+            "validate:BTC:1s",
+            "resample:BTC:15s,1m",
+            "validate:BTC:15s",
+            "validate:BTC:1m",
+            "train:BTC:15s",
+        ]
+
+    def test_run_one_historical_skips_extract(self, monkeypatch: pytest.MonkeyPatch) -> None:
+        order: list[str] = []
+
+        monkeypatch.setattr(
+            bid_ask_extractor,
+            "extract_coin_bid_ask_1s",
+            lambda coin, **kwargs: (_ for _ in ()).throw(
+                AssertionError("extract should not run for historical source")
+            ),
+        )
+
+        def fake_validate(coin: str, interval: str, **kwargs: object) -> ValidationReport:
+            order.append(f"validate:{coin}:{interval}")
+            return _validation_report(coin, interval)
+
+        monkeypatch.setattr(bid_ask_validator, "validate_coin_interval", fake_validate)
+
+        def fake_resample(coin: str, intervals: tuple[str, ...] = ("15s", "1m"), **kwargs: object):
+            order.append(f"resample:{coin}:{','.join(intervals)}")
+            return {
+                interval: {
+                    "output_path": Path(f"/tmp/{coin}_{interval}.csv"),
+                    "report_path": Path(f"/tmp/{coin}_{interval}_report.json"),
+                }
+                for interval in intervals
+            }
+
+        monkeypatch.setattr(bid_ask_resampler, "resample_coin", fake_resample)
+        monkeypatch.setattr(
+            bid_ask_train,
+            "run_training_pipeline",
+            lambda **kwargs: (
+                order.append(f"train:{kwargs['coin']}:{kwargs['interval']}") or {
+                    "evaluation": {"train_rows": 1, "test_rows": 1, "warnings": []},
+                    "report": {"source": "historical"},
+                    "report_path": Path("/tmp/train_report.json"),
+                }
+            ),
+        )
+
+        pipeline.main(
+            [
+                "run-one",
+                "--coin",
+                "BTC",
+                "--train-interval",
+                "15s",
+                "--horizon",
+                "1",
+                "--source",
+                "historical",
+            ]
+        )
+
+        assert order == [
             "validate:BTC:1s",
             "resample:BTC:15s,1m",
             "validate:BTC:15s",

@@ -21,6 +21,7 @@ from bid_ask_resampler import (
     bid_ask_1s_path,
     load_1s_csv,
     reports_dir,
+    resolve_bid_ask_data_dir,
     resample_bid_ask,
     resample_coin,
     resampled_csv_path,
@@ -160,6 +161,34 @@ class TestOutputPaths:
         assert path_1m == data_root / "1m" / "BTC_1m.csv"
         assert path_15s.is_file()
         assert path_1m.is_file()
+
+    def test_historical_output_paths(self, data_root: Path) -> None:
+        source_path = bid_ask_1s_path("SOL", data_root, source="historical")
+        _write_1s_csv(source_path, _make_rows(coin="SOL", count=30))
+        results = resample_coin("SOL", intervals=("15s", "1m"), data_root=data_root, source="historical")
+
+        path_15s = results["15s"]["output_path"]
+        path_1m = results["1m"]["output_path"]
+        assert path_15s == data_root / "historical_15s" / "SOL_15s.csv"
+        assert path_1m == data_root / "historical_1m" / "SOL_1m.csv"
+        assert path_15s.is_file()
+        assert path_1m.is_file()
+
+
+class TestResolveBidAskDataDir:
+    def test_local_source_paths(self, data_root: Path) -> None:
+        assert resolve_bid_ask_data_dir("1s", "local", data_root) == data_root / "1s"
+        assert resolve_bid_ask_data_dir("15s", "local", data_root) == data_root / "15s"
+        assert resolve_bid_ask_data_dir("1m", "local", data_root) == data_root / "1m"
+
+    def test_historical_source_paths(self, data_root: Path) -> None:
+        assert resolve_bid_ask_data_dir("1s", "historical", data_root) == data_root / "historical_1s"
+        assert resolve_bid_ask_data_dir("15s", "historical", data_root) == data_root / "historical_15s"
+        assert resolve_bid_ask_data_dir("1m", "historical", data_root) == data_root / "historical_1m"
+
+    def test_local_source_remains_default(self, data_root: Path) -> None:
+        assert resolve_bid_ask_data_dir("1s", data_root=data_root) == data_root / "1s"
+        assert resampled_csv_path("BTC", "15s", data_root) == data_root / "15s" / "BTC_15s.csv"
 
     def test_resampling_report_path(self, data_root: Path, btc_1s_path: Path) -> None:
         source_path = bid_ask_1s_path("BTC", data_root)
