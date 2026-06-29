@@ -359,6 +359,30 @@ class TestProbeOneFile:
             Range="bytes=0-1023",
         )
 
+    def test_probe_includes_request_payer_when_enabled(self) -> None:
+        entry = _sample_plan()["files"][4]
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"x" * 512)
+
+        probe_one_file(mock_client, entry, requester_pays=True)
+
+        mock_client.get_object.assert_called_once_with(
+            Bucket="hyperliquid-archive",
+            Key="market_data/20230916/9/l2Book/SOL.lz4",
+            Range="bytes=0-1023",
+            RequestPayer="requester",
+        )
+
+    def test_probe_omits_request_payer_when_anonymous(self) -> None:
+        entry = _sample_plan()["files"][4]
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"x" * 512)
+
+        probe_one_file(mock_client, entry, requester_pays=False)
+
+        call_kwargs = mock_client.get_object.call_args[1]
+        assert "RequestPayer" not in call_kwargs
+
     def test_forbidden_classified_correctly(self) -> None:
         from botocore.exceptions import ClientError
 
