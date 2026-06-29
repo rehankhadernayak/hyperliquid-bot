@@ -14,6 +14,7 @@ import pytest
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 from historical_l2_python_downloader import (
     DEFAULT_MAX_FILES,
+    DEFAULT_PROBE_MAX_FILES,
     HARD_CAP_MAX_FILES,
     HARD_CAP_MAX_FILES_ALLOW_MORE,
     classify_download_error,
@@ -21,10 +22,15 @@ from historical_l2_python_downloader import (
     decompress_one_file,
     discover_latest_command_plan,
     download_one_file,
+    file_entry_from_s3_path,
     load_plan,
     main,
     parse_s3_path,
+    probe_one_file,
     resolve_max_files,
+    resolve_probe_max_files,
+    run_availability_probe,
+    run_probe_path,
     run_sample_download,
     select_plan_files,
     write_report_json,
@@ -103,6 +109,14 @@ def _make_fake_lz4(content: bytes = b'{"test": true}\n') -> bytes:
 def _make_fake_get_object_response(payload: bytes) -> dict:
     body = MagicMock()
     body.iter_chunks.return_value = [payload]
+    body.read.return_value = payload
+    body.close = MagicMock()
+    return {"Body": body}
+
+
+def _make_fake_range_probe_response(payload: bytes) -> dict:
+    body = MagicMock()
+    body.read.return_value = payload
     body.close = MagicMock()
     return {"Body": body}
 
@@ -140,7 +154,7 @@ class TestLoadPlan:
         loaded = load_plan(path)
         assert loaded["paper_only"] is True
         assert loaded["execution_enabled"] is False
-        assert len(loaded["files"]) == 4
+        assert len(loaded["files"]) == 5
         assert loaded["_source_plan_path"] == str(path.resolve())
 
     def test_reject_non_paper_plan(self, tmp_path: Path) -> None:
@@ -186,11 +200,20 @@ class TestMaxFilesCaps:
         assert DEFAULT_MAX_FILES == 1
         assert resolve_max_files(None) == 1
 
+    def test_default_probe_max_files_is_three(self) -> None:
+        assert DEFAULT_PROBE_MAX_FILES == 3
+        assert resolve_probe_max_files(None) == 3
+
     def test_hard_cap_three_without_allow_more(self) -> None:
         assert resolve_max_files(1) == 1
         assert resolve_max_files(3) == 3
         with pytest.raises(ValueError, match="exceeds hard cap of 3"):
             resolve_max_files(4)
+
+    def test_probe_hard_cap_three_without_allow_more(self) -> None:
+        assert resolve_probe_max_files(3) == 3
+        with pytest.raises(ValueError, match="exceeds hard cap of 3"):
+            resolve_probe_max_files(4)
 
     def test_hard_cap_twenty_four_with_allow_more(self) -> None:
         assert resolve_max_files(10, allow_more=True) == 10
@@ -198,9 +221,17 @@ class TestMaxFilesCaps:
         with pytest.raises(ValueError, match="exceeds hard cap of 24"):
             resolve_max_files(25, allow_more=True)
 
+    def test_probe_hard_cap_twenty_four_with_allow_more(self) -> None:
+        assert resolve_probe_max_files(10, allow_more=True) == 10
+        assert resolve_probe_max_files(HARD_CAP_MAX_FILES_ALLOW_MORE, allow_more=True) == 24
+        with pytest.raises(ValueError, match="exceeds hard cap of 24"):
+            resolve_probe_max_files(25, allow_more=True)
+
     def test_reject_zero_max_files(self) -> None:
         with pytest.raises(ValueError, match="must be at least 1"):
             resolve_max_files(0)
+        with pytest.raises(ValueError, match="must be at least 1"):
+            resolve_probe_max_files(0)
 
 
 class TestSelectPlanFiles:
@@ -242,6 +273,155 @@ class TestClassifyDownloadError:
 
     def test_unknown_error(self) -> None:
         assert classify_download_error(RuntimeError("boom")) == "unknown_error"
+
+
+class TestFileEntryFromS3Path:
+    def test_parse_archive_path(self) -> None:
+        entry = file_entry_from_s3_path(
+            "s3://hyperliquid-archive/market_data/20230916/9/l2Book/SOL.lz4"
+        )
+        assert entry["coin"] == "SOL"
+        assert entry["date"] == "20230916"
+        assert entry["hour"] == "9"
+
+    def test_reject_unparseable_path(self) -> None:
+        with pytest.raises(ValueError, match="cannot parse archive path metadata"):
+            file_entry_from_s3_path("s3://hyperliquid-archive/other/path/SOL.lz4")
+
+
+class TestProbeOneFile:
+    def test_successful_range_get_object_probe(self) -> None:
+        entry = _sample_plan()["files"][4]
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"x" * 512)
+
+        result = probe_one_file(mock_client, entry)
+
+        assert result["accessible"] is True
+        assert result["error_class"] == "none"
+        assert result["error_message"] is None
+        assert result["bytes_read"] == 512
+        assert result["coin"] == "SOL"
+        assert result["date"] == "20230916"
+        assert result["hour"] == "9"
+        mock_client.get_object.assert_called_once_with(
+            Bucket="hyperliquid-archive",
+            Key="market_data/20230916/9/l2Book/SOL.lz4",
+            Range="bytes=0-1023",
+        )
+
+    def test_forbidden_classified_correctly(self) -> None:
+        from botocore.exceptions import ClientError
+
+        entry = _sample_plan()["files"][0]
+        mock_client = MagicMock()
+        mock_client.get_object.side_effect = ClientError(
+            {"Error": {"Code": "403", "Message": "Forbidden"}, "ResponseMetadata": {"HTTPStatusCode": 403}},
+            "GetObject",
+        )
+
+        result = probe_one_file(mock_client, entry)
+
+        assert result["accessible"] is False
+        assert result["error_class"] == "forbidden"
+        assert result["error_message"] is not None
+        assert result["bytes_read"] == 0
+
+    def test_not_found_classified_correctly(self) -> None:
+        from botocore.exceptions import ClientError
+
+        entry = _sample_plan()["files"][0]
+        mock_client = MagicMock()
+        mock_client.get_object.side_effect = ClientError(
+            {"Error": {"Code": "NoSuchKey", "Message": "Not Found"}, "ResponseMetadata": {"HTTPStatusCode": 404}},
+            "GetObject",
+        )
+
+        result = probe_one_file(mock_client, entry)
+
+        assert result["accessible"] is False
+        assert result["error_class"] == "not_found"
+        assert result["bytes_read"] == 0
+
+    def test_probe_does_not_download_full_file(self) -> None:
+        entry = _sample_plan()["files"][0]
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"partial")
+
+        probe_one_file(mock_client, entry)
+
+        mock_client.get_object.assert_called_once()
+        call_kwargs = mock_client.get_object.call_args[1]
+        assert call_kwargs["Range"] == "bytes=0-1023"
+        body = mock_client.get_object.return_value["Body"]
+        body.read.assert_called_once()
+        body.iter_chunks.assert_not_called()
+        mock_client.download_file.assert_not_called()
+        mock_client.download_fileobj.assert_not_called()
+
+
+class TestRunAvailabilityProbe:
+    def test_probe_respects_selectors(self, tmp_path: Path) -> None:
+        plan_path = _write_plan(tmp_path, _sample_plan())
+        plan = load_plan(plan_path)
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"ok")
+
+        report = run_availability_probe(
+            plan,
+            max_files=3,
+            client=mock_client,
+            coin="SOL",
+            date="20230916",
+            hour="9",
+        )
+
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["probed_count"] == 1
+        assert report["accessible_count"] == 1
+        assert report["failed_count"] == 0
+        assert len(report["results"]) == 1
+        assert report["results"][0]["coin"] == "SOL"
+        assert report["results"][0]["hour"] == "9"
+        mock_client.get_object.assert_called_once_with(
+            Bucket="hyperliquid-archive",
+            Key="market_data/20230916/9/l2Book/SOL.lz4",
+            Range="bytes=0-1023",
+        )
+
+    def test_probe_max_files_limits_selection(self, tmp_path: Path) -> None:
+        plan_path = _write_plan(tmp_path, _sample_plan())
+        plan = load_plan(plan_path)
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"ok")
+
+        report = run_availability_probe(plan, max_files=2, client=mock_client)
+
+        assert report["probed_count"] == 2
+        assert mock_client.get_object.call_count == 2
+
+
+class TestRunProbePath:
+    def test_probe_path_without_manifest(self) -> None:
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"probe")
+
+        report = run_probe_path(
+            "s3://hyperliquid-archive/market_data/20230916/9/l2Book/SOL.lz4",
+            client=mock_client,
+        )
+
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["source_plan_path"] is None
+        assert report["probed_count"] == 1
+        assert report["accessible_count"] == 1
+        entry = report["results"][0]
+        assert entry["coin"] == "SOL"
+        assert entry["accessible"] is True
 
 
 class TestDownloadOneFile:
@@ -486,6 +666,75 @@ class TestWriters:
         assert "## Research-only disclaimer" in text
         assert "s3_path=" in text
 
+    def test_write_probe_report_json(self, tmp_path: Path) -> None:
+        report = {
+            "generated_at": "2026-01-01T00:00:00Z",
+            "paper_only": True,
+            "execution_enabled": False,
+            "mode": "availability_probe",
+            "source_plan_path": "/tmp/plan.json",
+            "requested_files": 1,
+            "probed_count": 1,
+            "accessible_count": 1,
+            "failed_count": 0,
+            "results": [
+                {
+                    "coin": "SOL",
+                    "date": "20230916",
+                    "hour": "9",
+                    "s3_path": "s3://hyperliquid-archive/market_data/20230916/9/l2Book/SOL.lz4",
+                    "accessible": True,
+                    "error_class": "none",
+                    "error_message": None,
+                    "bytes_read": 128,
+                }
+            ],
+            "warnings": [],
+        }
+        output_dir = tmp_path / "reports"
+        json_path = write_report_json(report, output_dir=output_dir)
+
+        assert json_path.exists()
+        assert "historical_l2_python_probe_" in json_path.name
+        loaded = json.loads(json_path.read_text(encoding="utf-8"))
+        assert loaded["paper_only"] is True
+        assert loaded["execution_enabled"] is False
+        assert loaded["probed_count"] == 1
+
+    def test_write_probe_report_markdown(self, tmp_path: Path) -> None:
+        report = {
+            "generated_at": "2026-01-01T00:00:00Z",
+            "paper_only": True,
+            "execution_enabled": False,
+            "mode": "availability_probe",
+            "source_plan_path": "/tmp/plan.json",
+            "requested_files": 1,
+            "probed_count": 1,
+            "accessible_count": 0,
+            "failed_count": 1,
+            "results": [
+                {
+                    "coin": "SOL",
+                    "date": "20230916",
+                    "hour": "9",
+                    "s3_path": "s3://hyperliquid-archive/market_data/20230916/9/l2Book/SOL.lz4",
+                    "accessible": False,
+                    "error_class": "forbidden",
+                    "error_message": "403 Forbidden",
+                    "bytes_read": 0,
+                }
+            ],
+            "warnings": ["sample warning"],
+        }
+        output_dir = tmp_path / "reports"
+        md_path = write_report_markdown(report, output_dir=output_dir)
+        text = md_path.read_text(encoding="utf-8")
+
+        assert md_path.exists()
+        assert "historical_l2_python_probe_" in md_path.name
+        assert "## Probe results" in text
+        assert "error_class=forbidden" in text
+
 
 class TestCli:
     @patch("historical_l2_python_downloader.create_unsigned_s3_client")
@@ -599,6 +848,130 @@ class TestCli:
         assert exit_code == 1
         assert "exceeds hard cap" in captured.err
 
+    @patch("historical_l2_python_downloader.create_unsigned_s3_client")
+    def test_main_probe_with_latest(
+        self,
+        mock_create_client: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        plan = _sample_plan()
+        plan_path = _write_plan(tmp_path / "plans", plan)
+        report_dir = tmp_path / "reports"
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"probe")
+        mock_create_client.return_value = mock_client
+
+        with patch(
+            "historical_l2_python_downloader.discover_latest_command_plan",
+            return_value=plan_path,
+        ):
+            exit_code = main(
+                [
+                    "--latest",
+                    "--probe",
+                    "--max-files",
+                    "3",
+                    "--report-dir",
+                    str(report_dir),
+                ]
+            )
+        captured = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "Probed: 3" in captured
+        assert "Accessible: 3" in captured
+        assert "Probed file:" in captured
+        assert "accessibility=accessible" in captured
+        assert "error_class=none" in captured
+        assert list(report_dir.glob("historical_l2_python_probe_*.json"))
+
+    @patch("historical_l2_python_downloader.create_unsigned_s3_client")
+    def test_main_probe_path_without_manifest(
+        self,
+        mock_create_client: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        report_dir = tmp_path / "reports"
+        s3_path = "s3://hyperliquid-archive/market_data/20230916/9/l2Book/SOL.lz4"
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"probe")
+        mock_create_client.return_value = mock_client
+
+        exit_code = main(
+            [
+                "--probe-path",
+                s3_path,
+                "--report-dir",
+                str(report_dir),
+            ]
+        )
+        captured = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "coin=SOL" in captured
+        assert "hour=9" in captured
+        assert s3_path in captured
+        assert "accessibility=accessible" in captured
+        mock_client.get_object.assert_called_once_with(
+            Bucket="hyperliquid-archive",
+            Key="market_data/20230916/9/l2Book/SOL.lz4",
+            Range="bytes=0-1023",
+        )
+        report = json.loads(list(report_dir.glob("historical_l2_python_probe_*.json"))[0].read_text())
+        assert report["source_plan_path"] is None
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+
+    @patch("historical_l2_python_downloader.create_unsigned_s3_client")
+    def test_main_probe_selector_by_coin_date_hour(
+        self,
+        mock_create_client: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        plan_path = _write_plan(tmp_path, _sample_plan())
+        report_dir = tmp_path / "reports"
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_range_probe_response(b"probe")
+        mock_create_client.return_value = mock_client
+
+        exit_code = main(
+            [
+                "--plan",
+                str(plan_path),
+                "--probe",
+                "--coin",
+                "SOL",
+                "--date",
+                "20230916",
+                "--hour",
+                "9",
+                "--max-files",
+                "3",
+                "--report-dir",
+                str(report_dir),
+            ]
+        )
+        captured = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "coin=SOL" in captured
+        assert "hour=9" in captured
+        assert "market_data/20230916/9/l2Book/SOL.lz4" in captured
+        mock_client.get_object.assert_called_once()
+
+    def test_main_probe_rejects_over_cap(self, tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
+        plan_path = _write_plan(tmp_path, _sample_plan())
+        exit_code = main(["--plan", str(plan_path), "--probe", "--max-files", "5"])
+        captured = capsys.readouterr()
+        assert exit_code == 1
+        assert "exceeds hard cap" in captured.err
+
 
 class TestSafety:
     def test_no_subprocess_calls(self) -> None:
@@ -635,5 +1008,6 @@ class TestSafety:
     def test_paper_only_and_execution_disabled(self) -> None:
         assert PAPER_ONLY is True
         assert EXECUTION_ENABLED is False
+        assert DEFAULT_PROBE_MAX_FILES == 3
         assert HARD_CAP_MAX_FILES == 3
         assert HARD_CAP_MAX_FILES_ALLOW_MORE == 24

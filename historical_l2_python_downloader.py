@@ -27,6 +27,7 @@ DEFAULT_BACKFILL_PLAN_DIR = Path("reports/historical_l2_backfill_plans")
 DEFAULT_REPORT_DIR = Path("reports/historical_l2_python_downloads")
 
 DEFAULT_MAX_FILES = 1
+DEFAULT_PROBE_MAX_FILES = 3
 HARD_CAP_MAX_FILES = 3
 HARD_CAP_MAX_FILES_ALLOW_MORE = 24
 
@@ -119,6 +120,27 @@ def create_unsigned_s3_client():
         "s3",
         config=Config(signature_version=UNSIGNED),
     )
+
+
+def file_entry_from_s3_path(s3_path: str) -> dict[str, Any]:
+    """Build a minimal file entry from an archive S3 path (no manifest required)."""
+    _, key = parse_s3_path(s3_path)
+    parts = key.split("/")
+    if len(parts) < 5 or parts[0] != "market_data" or parts[3] != "l2Book":
+        raise ValueError(f"cannot parse archive path metadata from: {s3_path}")
+
+    coin = Path(parts[4]).stem
+    if not coin:
+        raise ValueError(f"cannot parse coin from archive path: {s3_path}")
+
+    return {
+        "s3_path": s3_path,
+        "coin": coin,
+        "date": parts[1],
+        "hour": parts[2],
+        "local_lz4_path": "",
+        "local_jsonl_path": "",
+    }
 
 
 def classify_download_error(exc: BaseException) -> str:
@@ -248,9 +270,10 @@ def resolve_max_files(
     max_files: int | None,
     *,
     allow_more: bool = False,
+    default: int = DEFAULT_MAX_FILES,
 ) -> int:
     """Apply default and hard caps to max_files."""
-    requested = DEFAULT_MAX_FILES if max_files is None else max_files
+    requested = default if max_files is None else max_files
     if requested < 1:
         raise ValueError("max_files must be at least 1")
 
@@ -267,6 +290,142 @@ def resolve_max_files(
         )
 
     return requested
+
+
+def resolve_probe_max_files(
+    max_files: int | None,
+    *,
+    allow_more: bool = False,
+) -> int:
+    """Apply default and hard caps to probe max_files."""
+    return resolve_max_files(
+        max_files,
+        allow_more=allow_more,
+        default=DEFAULT_PROBE_MAX_FILES,
+    )
+
+
+def probe_one_file(client, file_entry: dict[str, Any]) -> dict[str, Any]:
+    """Lightweight S3 access check using a small Range request (no full download)."""
+    result: dict[str, Any] = {
+        "coin": file_entry["coin"],
+        "date": file_entry["date"],
+        "hour": file_entry["hour"],
+        "s3_path": file_entry["s3_path"],
+        "accessible": False,
+        "error_class": "none",
+        "error_message": None,
+        "bytes_read": 0,
+    }
+
+    try:
+        bucket, key = parse_s3_path(file_entry["s3_path"])
+        response = client.get_object(Bucket=bucket, Key=key, Range="bytes=0-1023")
+        body = response["Body"]
+        try:
+            data = body.read()
+            result["bytes_read"] = len(data)
+            result["accessible"] = True
+        finally:
+            body.close()
+    except Exception as exc:  # noqa: BLE001 - capture per-file failures in report
+        result["accessible"] = False
+        result["error_class"] = classify_download_error(exc)
+        result["error_message"] = str(exc)
+
+    return result
+
+
+def run_availability_probe(
+    plan: dict[str, Any],
+    *,
+    max_files: int = DEFAULT_PROBE_MAX_FILES,
+    client=None,
+    coin: str | None = None,
+    date: str | None = None,
+    hour: str | None = None,
+) -> dict[str, Any]:
+    """Probe the first N matching plan files for S3 accessibility without full downloads."""
+    filtered = select_plan_files(plan["files"], coin=coin, date=date, hour=hour)
+    selected = list(filtered[:max_files])
+    source_plan_path = plan.get("_source_plan_path") or plan.get("source_manifest_path", "")
+
+    if client is None:
+        client = create_unsigned_s3_client()
+
+    results: list[dict[str, Any]] = []
+    warnings: list[str] = [
+        "This tool probes only a tiny sample; it does not verify all-time archive coverage.",
+        "Archive data may be missing or incomplete; accessibility is not guaranteed.",
+    ]
+
+    accessible_count = 0
+    failed_count = 0
+
+    for entry in selected:
+        probe_result = probe_one_file(client, entry)
+        results.append(probe_result)
+        if probe_result["accessible"]:
+            accessible_count += 1
+        else:
+            failed_count += 1
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "paper_only": True,
+        "execution_enabled": False,
+        "mode": "availability_probe",
+        "source_plan_path": source_plan_path,
+        "requested_files": max_files,
+        "probed_count": len(selected),
+        "accessible_count": accessible_count,
+        "failed_count": failed_count,
+        "selector": {
+            "coin": coin,
+            "date": date,
+            "hour": hour,
+        },
+        "results": results,
+        "warnings": warnings,
+    }
+
+
+def run_probe_path(
+    s3_path: str,
+    *,
+    client=None,
+) -> dict[str, Any]:
+    """Probe a single archive S3 path without requiring a manifest."""
+    file_entry = file_entry_from_s3_path(s3_path)
+
+    if client is None:
+        client = create_unsigned_s3_client()
+
+    probe_result = probe_one_file(client, file_entry)
+    warnings: list[str] = [
+        "Single-path probe; no manifest or bulk coverage check performed.",
+        "Archive data may be missing or incomplete; accessibility is not guaranteed.",
+    ]
+
+    return {
+        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+        "paper_only": True,
+        "execution_enabled": False,
+        "mode": "availability_probe",
+        "source_plan_path": None,
+        "requested_files": 1,
+        "probed_count": 1,
+        "accessible_count": 1 if probe_result["accessible"] else 0,
+        "failed_count": 0 if probe_result["accessible"] else 1,
+        "selector": {
+            "coin": file_entry["coin"],
+            "date": file_entry["date"],
+            "hour": file_entry["hour"],
+            "probe_path": s3_path,
+        },
+        "results": [probe_result],
+        "warnings": warnings,
+    }
 
 
 def run_sample_download(
@@ -367,7 +526,12 @@ def run_sample_download(
 def _report_stamp(report: dict[str, Any]) -> str:
     ts = report.get("generated_at", datetime.now(timezone.utc).isoformat())
     safe_ts = ts.replace(":", "").replace("-", "").replace(".", "")
-    return f"historical_l2_python_download_{safe_ts}"
+    prefix = (
+        "historical_l2_python_probe"
+        if report.get("mode") == "availability_probe"
+        else "historical_l2_python_download"
+    )
+    return f"{prefix}_{safe_ts}"
 
 
 def write_report_json(
@@ -387,10 +551,13 @@ def write_report_markdown(
     report: dict[str, Any],
     output_dir: Path | str = DEFAULT_REPORT_DIR,
 ) -> Path:
-    """Save download report Markdown under reports/historical_l2_python_downloads/."""
+    """Save download or probe report Markdown under reports/historical_l2_python_downloads/."""
     root = Path(output_dir)
     root.mkdir(parents=True, exist_ok=True)
     output_path = root / f"{_report_stamp(report)}.md"
+
+    if report.get("mode") == "availability_probe":
+        return _write_probe_report_markdown(report, output_path)
 
     failures: list[str] = []
     for entry in report.get("file_results", []):
@@ -464,6 +631,76 @@ def write_report_markdown(
     return output_path
 
 
+def _write_probe_report_markdown(report: dict[str, Any], output_path: Path) -> Path:
+    failures: list[str] = []
+    for entry in report.get("results", []):
+        if not entry.get("accessible"):
+            failures.append(
+                f"- probe failed ({entry.get('coin')} {entry.get('date')} hour {entry.get('hour')}): "
+                f"{entry.get('error_class')} — {entry.get('error_message', 'unknown error')}"
+            )
+
+    result_lines: list[str] = []
+    for entry in report.get("results", []):
+        accessibility = "accessible" if entry.get("accessible") else "inaccessible"
+        result_lines.append(
+            f"- coin={entry.get('coin')} date={entry.get('date')} hour={entry.get('hour')}: "
+            f"s3_path={entry.get('s3_path')}, "
+            f"accessibility={accessibility}, error_class={entry.get('error_class')}, "
+            f"bytes_read={entry.get('bytes_read', 0)}"
+        )
+
+    warning_lines = [f"- {w}" for w in report.get("warnings", [])]
+
+    lines = [
+        "# Historical L2 Archive Availability Probe Report",
+        "",
+        "## Summary",
+        "",
+        f"- generated_at: {report.get('generated_at', 'n/a')}",
+        f"- source_plan_path: {report.get('source_plan_path', 'n/a')}",
+        f"- requested_files: {report.get('requested_files', 0)}",
+        f"- probed_count: {report.get('probed_count', 0)}",
+        f"- accessible_count: {report.get('accessible_count', 0)}",
+        f"- failed_count: {report.get('failed_count', 0)}",
+        f"- paper_only: {report.get('paper_only')}",
+        f"- execution_enabled: {report.get('execution_enabled')}",
+        "",
+        "## Probe results",
+        "",
+        *(result_lines or ["- (none)"]),
+        "",
+        "## Failures",
+        "",
+        *(failures or ["- (none)"]),
+        "",
+        "## Limitations",
+        "",
+        *warning_lines,
+        "- Uses unsigned public S3 access only; no AWS access keys.",
+        "- Range probe reads at most 1024 bytes per file; no full download.",
+        "- Hard cap: 3 files without --allow-more, 24 with --allow-more.",
+        "",
+        "## Research-only disclaimer",
+        "",
+        SAFETY_STATEMENT,
+        "",
+    ]
+
+    output_path.write_text("\n".join(lines), encoding="utf-8")
+    report["markdown_report_path"] = str(output_path)
+    return output_path
+
+
+def _print_probe_result(entry: dict[str, Any]) -> None:
+    accessibility = "accessible" if entry.get("accessible") else "inaccessible"
+    print(
+        f"Probed file: coin={entry.get('coin')} date={entry.get('date')} "
+        f"hour={entry.get('hour')} s3_path={entry.get('s3_path')} "
+        f"accessibility={accessibility} error_class={entry.get('error_class')}"
+    )
+
+
 def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -471,7 +708,7 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
             "using Python-native unsigned S3 access and lz4 decompression."
         )
     )
-    source = parser.add_mutually_exclusive_group(required=True)
+    source = parser.add_mutually_exclusive_group(required=False)
     source.add_argument(
         "--plan",
         help="Path to a command plan or backfill plan JSON file",
@@ -481,11 +718,24 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         action="store_true",
         help="Use the newest plan under reports/historical_l2_download_commands/ or backfill plans",
     )
+    source.add_argument(
+        "--probe-path",
+        help="Probe a single archive S3 path directly (no manifest required)",
+    )
+    parser.add_argument(
+        "--probe",
+        action="store_true",
+        help="Probe S3 accessibility with a small Range request instead of downloading",
+    )
     parser.add_argument(
         "--max-files",
         type=int,
-        default=DEFAULT_MAX_FILES,
-        help=f"Number of files to download (default: {DEFAULT_MAX_FILES}, hard cap: {HARD_CAP_MAX_FILES})",
+        default=None,
+        help=(
+            f"Number of files to process "
+            f"(download default: {DEFAULT_MAX_FILES}, probe default: {DEFAULT_PROBE_MAX_FILES}; "
+            f"hard cap: {HARD_CAP_MAX_FILES})"
+        ),
     )
     parser.add_argument(
         "--overwrite",
@@ -520,33 +770,96 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
-    try:
-        max_files = resolve_max_files(args.max_files, allow_more=args.allow_more)
-    except ValueError as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+    probe_mode = args.probe or args.probe_path is not None
 
-    if args.latest:
-        plan_path = discover_latest_command_plan()
+    if args.probe_path:
+        if args.probe and (args.plan or args.latest):
+            print("Error: --probe-path cannot be combined with --plan or --latest", file=sys.stderr)
+            return 1
+        try:
+            report = run_probe_path(args.probe_path)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+    elif probe_mode:
+        if not args.plan and not args.latest:
+            print("Error: --probe requires --plan or --latest", file=sys.stderr)
+            return 1
+        if args.plan and args.latest:
+            print("Error: --plan and --latest are mutually exclusive", file=sys.stderr)
+            return 1
+
+        try:
+            max_files = resolve_probe_max_files(args.max_files, allow_more=args.allow_more)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        if args.latest:
+            plan_path = discover_latest_command_plan()
+        else:
+            plan_path = Path(args.plan)
+
+        try:
+            plan = load_plan(plan_path)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        report = run_availability_probe(
+            plan,
+            max_files=max_files,
+            coin=args.coin,
+            date=args.date,
+            hour=args.hour,
+        )
     else:
-        plan_path = Path(args.plan)
+        if not args.plan and not args.latest:
+            print("Error: --plan or --latest is required", file=sys.stderr)
+            return 1
+        if args.plan and args.latest:
+            print("Error: --plan and --latest are mutually exclusive", file=sys.stderr)
+            return 1
 
-    try:
-        plan = load_plan(plan_path)
-    except (FileNotFoundError, ValueError) as exc:
-        print(f"Error: {exc}", file=sys.stderr)
-        return 1
+        try:
+            max_files = resolve_max_files(args.max_files, allow_more=args.allow_more)
+        except ValueError as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
 
-    report = run_sample_download(
-        plan,
-        max_files=max_files,
-        overwrite=args.overwrite,
-        coin=args.coin,
-        date=args.date,
-        hour=args.hour,
-    )
+        if args.latest:
+            plan_path = discover_latest_command_plan()
+        else:
+            plan_path = Path(args.plan)
+
+        try:
+            plan = load_plan(plan_path)
+        except (FileNotFoundError, ValueError) as exc:
+            print(f"Error: {exc}", file=sys.stderr)
+            return 1
+
+        report = run_sample_download(
+            plan,
+            max_files=max_files,
+            overwrite=args.overwrite,
+            coin=args.coin,
+            date=args.date,
+            hour=args.hour,
+        )
+
     json_path = write_report_json(report, output_dir=args.report_dir)
     markdown_path = write_report_markdown(report, output_dir=args.report_dir)
+
+    if probe_mode:
+        print("Historical L2 archive availability probe complete (research-only).")
+        print(f"JSON report: {json_path}")
+        print(f"Markdown report: {markdown_path}")
+        print(f"Probed: {report['probed_count']}")
+        print(f"Accessible: {report['accessible_count']}")
+        print(f"Failed: {report['failed_count']}")
+        for entry in report.get("results", []):
+            _print_probe_result(entry)
+        return 0 if report["failed_count"] == 0 else 1
 
     print("Historical L2 Python sample download complete (research-only).")
     print(f"JSON report: {json_path}")
