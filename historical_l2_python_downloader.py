@@ -114,12 +114,32 @@ def parse_s3_path(s3_path: str) -> tuple[str, str]:
     return bucket, key
 
 
+REQUESTER_PAYS_WARNING = (
+    "Requester Pays may incur AWS charges. Use only with adult/mentor approval."
+)
+
+
+def create_s3_client(
+    requester_pays: bool = False,
+    aws_profile: str | None = None,
+):
+    """Create an S3 client for anonymous or authenticated Requester Pays access."""
+    if not requester_pays:
+        return boto3.client(
+            "s3",
+            config=Config(signature_version=UNSIGNED),
+        )
+
+    if aws_profile:
+        session = boto3.Session(profile_name=aws_profile)
+    else:
+        session = boto3.Session()
+    return session.client("s3")
+
+
 def create_unsigned_s3_client():
     """Create a boto3 S3 client with unsigned (no-signature) configuration."""
-    return boto3.client(
-        "s3",
-        config=Config(signature_version=UNSIGNED),
-    )
+    return create_s3_client(requester_pays=False)
 
 
 def file_entry_from_s3_path(s3_path: str) -> dict[str, Any]:
@@ -143,12 +163,51 @@ def file_entry_from_s3_path(s3_path: str) -> dict[str, Any]:
     }
 
 
+def _get_object_kwargs(
+    bucket: str,
+    key: str,
+    *,
+    requester_pays: bool = False,
+    range_header: str | None = None,
+) -> dict[str, Any]:
+    kwargs: dict[str, Any] = {"Bucket": bucket, "Key": key}
+    if range_header is not None:
+        kwargs["Range"] = range_header
+    if requester_pays:
+        kwargs["RequestPayer"] = "requester"
+    return kwargs
+
+
+def _aws_access_report_fields(
+    requester_pays: bool,
+    aws_profile: str | None,
+) -> dict[str, Any]:
+    return {
+        "requester_pays": requester_pays,
+        "aws_profile_used": (aws_profile if aws_profile else "default_chain") if requester_pays else None,
+    }
+
+
+def _aws_access_warnings(
+    requester_pays: bool,
+    existing: list[str] | None = None,
+) -> list[str]:
+    warnings = list(existing or [])
+    if requester_pays and REQUESTER_PAYS_WARNING not in warnings:
+        warnings.append(REQUESTER_PAYS_WARNING)
+    return warnings
+
+
 def classify_download_error(exc: BaseException) -> str:
     """Classify an S3 download failure into a stable error category."""
     if isinstance(exc, ClientError):
         error_code = exc.response.get("Error", {}).get("Code", "")
+        error_message = exc.response.get("Error", {}).get("Message", "")
         http_status = exc.response.get("ResponseMetadata", {}).get("HTTPStatusCode")
         if error_code in {"403", "AccessDenied", "Forbidden"} or http_status == 403:
+            combined = f"{error_message} {exc}".lower()
+            if "requester pays" in combined or "please authenticate" in combined:
+                return "requester_pays_auth_required"
             return "forbidden"
         if error_code in {"404", "NoSuchKey", "NotFound"} or http_status == 404:
             return "not_found"
@@ -187,6 +246,7 @@ def download_one_file(
     file_entry: dict[str, Any],
     *,
     overwrite: bool = False,
+    requester_pays: bool = False,
 ) -> dict[str, Any]:
     """Download one .lz4 file from S3 to local_lz4_path via get_object streaming."""
     local_path = Path(file_entry["local_lz4_path"])
@@ -208,7 +268,9 @@ def download_one_file(
     try:
         bucket, key = parse_s3_path(file_entry["s3_path"])
         local_path.parent.mkdir(parents=True, exist_ok=True)
-        response = client.get_object(Bucket=bucket, Key=key)
+        response = client.get_object(
+            **_get_object_kwargs(bucket, key, requester_pays=requester_pays)
+        )
         body = response["Body"]
         try:
             with local_path.open("wb") as handle:
@@ -305,7 +367,12 @@ def resolve_probe_max_files(
     )
 
 
-def probe_one_file(client, file_entry: dict[str, Any]) -> dict[str, Any]:
+def probe_one_file(
+    client,
+    file_entry: dict[str, Any],
+    *,
+    requester_pays: bool = False,
+) -> dict[str, Any]:
     """Lightweight S3 access check using a small Range request (no full download)."""
     result: dict[str, Any] = {
         "coin": file_entry["coin"],
@@ -320,7 +387,14 @@ def probe_one_file(client, file_entry: dict[str, Any]) -> dict[str, Any]:
 
     try:
         bucket, key = parse_s3_path(file_entry["s3_path"])
-        response = client.get_object(Bucket=bucket, Key=key, Range="bytes=0-1023")
+        response = client.get_object(
+            **_get_object_kwargs(
+                bucket,
+                key,
+                requester_pays=requester_pays,
+                range_header="bytes=0-1023",
+            )
+        )
         body = response["Body"]
         try:
             data = body.read()
@@ -344,6 +418,8 @@ def run_availability_probe(
     coin: str | None = None,
     date: str | None = None,
     hour: str | None = None,
+    requester_pays: bool = False,
+    aws_profile: str | None = None,
 ) -> dict[str, Any]:
     """Probe the first N matching plan files for S3 accessibility without full downloads."""
     filtered = select_plan_files(plan["files"], coin=coin, date=date, hour=hour)
@@ -351,19 +427,22 @@ def run_availability_probe(
     source_plan_path = plan.get("_source_plan_path") or plan.get("source_manifest_path", "")
 
     if client is None:
-        client = create_unsigned_s3_client()
+        client = create_s3_client(requester_pays=requester_pays, aws_profile=aws_profile)
 
     results: list[dict[str, Any]] = []
-    warnings: list[str] = [
-        "This tool probes only a tiny sample; it does not verify all-time archive coverage.",
-        "Archive data may be missing or incomplete; accessibility is not guaranteed.",
-    ]
+    warnings = _aws_access_warnings(
+        requester_pays,
+        [
+            "This tool probes only a tiny sample; it does not verify all-time archive coverage.",
+            "Archive data may be missing or incomplete; accessibility is not guaranteed.",
+        ],
+    )
 
     accessible_count = 0
     failed_count = 0
 
     for entry in selected:
-        probe_result = probe_one_file(client, entry)
+        probe_result = probe_one_file(client, entry, requester_pays=requester_pays)
         results.append(probe_result)
         if probe_result["accessible"]:
             accessible_count += 1
@@ -387,6 +466,7 @@ def run_availability_probe(
         },
         "results": results,
         "warnings": warnings,
+        **_aws_access_report_fields(requester_pays, aws_profile),
     }
 
 
@@ -394,18 +474,23 @@ def run_probe_path(
     s3_path: str,
     *,
     client=None,
+    requester_pays: bool = False,
+    aws_profile: str | None = None,
 ) -> dict[str, Any]:
     """Probe a single archive S3 path without requiring a manifest."""
     file_entry = file_entry_from_s3_path(s3_path)
 
     if client is None:
-        client = create_unsigned_s3_client()
+        client = create_s3_client(requester_pays=requester_pays, aws_profile=aws_profile)
 
-    probe_result = probe_one_file(client, file_entry)
-    warnings: list[str] = [
-        "Single-path probe; no manifest or bulk coverage check performed.",
-        "Archive data may be missing or incomplete; accessibility is not guaranteed.",
-    ]
+    probe_result = probe_one_file(client, file_entry, requester_pays=requester_pays)
+    warnings = _aws_access_warnings(
+        requester_pays,
+        [
+            "Single-path probe; no manifest or bulk coverage check performed.",
+            "Archive data may be missing or incomplete; accessibility is not guaranteed.",
+        ],
+    )
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -425,6 +510,7 @@ def run_probe_path(
         },
         "results": [probe_result],
         "warnings": warnings,
+        **_aws_access_report_fields(requester_pays, aws_profile),
     }
 
 
@@ -437,6 +523,8 @@ def run_sample_download(
     coin: str | None = None,
     date: str | None = None,
     hour: str | None = None,
+    requester_pays: bool = False,
+    aws_profile: str | None = None,
 ) -> dict[str, Any]:
     """Download and decompress the first N files from a validated plan."""
     filtered = select_plan_files(plan["files"], coin=coin, date=date, hour=hour)
@@ -444,13 +532,16 @@ def run_sample_download(
     source_plan_path = plan.get("_source_plan_path") or plan.get("source_manifest_path", "")
 
     if client is None:
-        client = create_unsigned_s3_client()
+        client = create_s3_client(requester_pays=requester_pays, aws_profile=aws_profile)
 
     file_results: list[dict[str, Any]] = []
-    warnings: list[str] = [
-        "This tool downloads only a tiny sample; it does not support all-time bulk downloads.",
-        "Archive data may be missing or incomplete; availability is not guaranteed.",
-    ]
+    warnings = _aws_access_warnings(
+        requester_pays,
+        [
+            "This tool downloads only a tiny sample; it does not support all-time bulk downloads.",
+            "Archive data may be missing or incomplete; availability is not guaranteed.",
+        ],
+    )
     next_import_commands: list[str] = []
 
     downloaded_count = 0
@@ -459,7 +550,12 @@ def run_sample_download(
     failed_count = 0
 
     for entry in selected:
-        download_result = download_one_file(client, entry, overwrite=overwrite)
+        download_result = download_one_file(
+            client,
+            entry,
+            overwrite=overwrite,
+            requester_pays=requester_pays,
+        )
         dl_status = download_result["download_status"]
         local_lz4_path = Path(entry["local_lz4_path"])
 
@@ -520,6 +616,7 @@ def run_sample_download(
         "file_results": file_results,
         "warnings": warnings,
         "next_import_commands": next_import_commands,
+        **_aws_access_report_fields(requester_pays, aws_profile),
     }
 
 
@@ -600,6 +697,8 @@ def write_report_markdown(
         f"- failed_count: {report.get('failed_count', 0)}",
         f"- paper_only: {report.get('paper_only')}",
         f"- execution_enabled: {report.get('execution_enabled')}",
+        f"- requester_pays: {report.get('requester_pays', False)}",
+        f"- aws_profile_used: {report.get('aws_profile_used')}",
         "",
         "## File results",
         "",
@@ -616,7 +715,11 @@ def write_report_markdown(
         "## Limitations",
         "",
         *warning_lines,
-        "- Uses unsigned public S3 access only; no AWS access keys.",
+        *(
+            ["- Uses authenticated AWS access with Requester Pays; charges may apply."]
+            if report.get("requester_pays")
+            else ["- Uses unsigned public S3 access only; no AWS access keys."]
+        ),
         "- Hard cap: 3 files without --allow-more, 24 with --allow-more.",
         "- Does not support all-time or bulk archive downloads.",
         "",
@@ -665,6 +768,8 @@ def _write_probe_report_markdown(report: dict[str, Any], output_path: Path) -> P
         f"- failed_count: {report.get('failed_count', 0)}",
         f"- paper_only: {report.get('paper_only')}",
         f"- execution_enabled: {report.get('execution_enabled')}",
+        f"- requester_pays: {report.get('requester_pays', False)}",
+        f"- aws_profile_used: {report.get('aws_profile_used')}",
         "",
         "## Probe results",
         "",
@@ -677,7 +782,11 @@ def _write_probe_report_markdown(report: dict[str, Any], output_path: Path) -> P
         "## Limitations",
         "",
         *warning_lines,
-        "- Uses unsigned public S3 access only; no AWS access keys.",
+        *(
+            ["- Uses authenticated AWS access with Requester Pays; charges may apply."]
+            if report.get("requester_pays")
+            else ["- Uses unsigned public S3 access only; no AWS access keys."]
+        ),
         "- Range probe reads at most 1024 bytes per file; no full download.",
         "- Hard cap: 3 files without --allow-more, 24 with --allow-more.",
         "",
@@ -764,6 +873,19 @@ def _parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         "--hour",
         help="Select only plan files matching this hour (e.g. 9)",
     )
+    parser.add_argument(
+        "--requester-pays",
+        action="store_true",
+        help=(
+            "Use authenticated AWS access with Requester Pays for S3 get_object "
+            "(may incur AWS charges)"
+        ),
+    )
+    parser.add_argument(
+        "--aws-profile",
+        metavar="PROFILE",
+        help="AWS profile name for Requester Pays access (default: boto3 credential chain)",
+    )
     return parser.parse_args(argv)
 
 
@@ -771,13 +893,19 @@ def main(argv: list[str] | None = None) -> int:
     args = _parse_args(argv)
 
     probe_mode = args.probe or args.probe_path is not None
+    requester_pays = args.requester_pays
+    aws_profile = args.aws_profile
 
     if args.probe_path:
         if args.probe and (args.plan or args.latest):
             print("Error: --probe-path cannot be combined with --plan or --latest", file=sys.stderr)
             return 1
         try:
-            report = run_probe_path(args.probe_path)
+            report = run_probe_path(
+                args.probe_path,
+                requester_pays=requester_pays,
+                aws_profile=aws_profile,
+            )
         except ValueError as exc:
             print(f"Error: {exc}", file=sys.stderr)
             return 1
@@ -812,6 +940,8 @@ def main(argv: list[str] | None = None) -> int:
             coin=args.coin,
             date=args.date,
             hour=args.hour,
+            requester_pays=requester_pays,
+            aws_profile=aws_profile,
         )
     else:
         if not args.plan and not args.latest:
@@ -845,6 +975,8 @@ def main(argv: list[str] | None = None) -> int:
             coin=args.coin,
             date=args.date,
             hour=args.hour,
+            requester_pays=requester_pays,
+            aws_profile=aws_profile,
         )
 
     json_path = write_report_json(report, output_dir=args.report_dir)

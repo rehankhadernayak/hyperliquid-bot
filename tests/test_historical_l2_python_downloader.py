@@ -17,7 +17,9 @@ from historical_l2_python_downloader import (
     DEFAULT_PROBE_MAX_FILES,
     HARD_CAP_MAX_FILES,
     HARD_CAP_MAX_FILES_ALLOW_MORE,
+    REQUESTER_PAYS_WARNING,
     classify_download_error,
+    create_s3_client,
     create_unsigned_s3_client,
     decompress_one_file,
     discover_latest_command_plan,
@@ -147,6 +149,35 @@ class TestUnsignedClient:
         assert call_kwargs[0][0] == "s3"
         assert call_kwargs[1]["config"] is not None
 
+    @patch("historical_l2_python_downloader.boto3.client")
+    def test_default_create_s3_client_is_unsigned(self, mock_boto_client: MagicMock) -> None:
+        create_s3_client()
+        mock_boto_client.assert_called_once()
+        call_kwargs = mock_boto_client.call_args
+        assert call_kwargs[0][0] == "s3"
+        assert call_kwargs[1]["config"] is not None
+
+    @patch("historical_l2_python_downloader.boto3.Session")
+    def test_requester_pays_uses_authenticated_client(self, mock_session_cls: MagicMock) -> None:
+        mock_session = MagicMock()
+        mock_session_cls.return_value = mock_session
+
+        client = create_s3_client(requester_pays=True)
+
+        mock_session_cls.assert_called_once_with()
+        mock_session.client.assert_called_once_with("s3")
+        assert client is mock_session.client.return_value
+
+    @patch("historical_l2_python_downloader.boto3.Session")
+    def test_requester_pays_aws_profile_passed_to_session(self, mock_session_cls: MagicMock) -> None:
+        mock_session = MagicMock()
+        mock_session_cls.return_value = mock_session
+
+        create_s3_client(requester_pays=True, aws_profile="hyperliquid-research")
+
+        mock_session_cls.assert_called_once_with(profile_name="hyperliquid-research")
+        mock_session.client.assert_called_once_with("s3")
+
 
 class TestLoadPlan:
     def test_load_plan_validates_and_loads(self, tmp_path: Path) -> None:
@@ -258,6 +289,24 @@ class TestClassifyDownloadError:
             "GetObject",
         )
         assert classify_download_error(exc) == "forbidden"
+
+    def test_requester_pays_auth_required_classified(self) -> None:
+        from botocore.exceptions import ClientError
+
+        exc = ClientError(
+            {
+                "Error": {
+                    "Code": "AccessDenied",
+                    "Message": (
+                        "Anonymous users cannot invoke requests against Requester Pays buckets. "
+                        "Please authenticate."
+                    ),
+                },
+                "ResponseMetadata": {"HTTPStatusCode": 403},
+            },
+            "GetObject",
+        )
+        assert classify_download_error(exc) == "requester_pays_auth_required"
 
     def test_404_client_error_is_not_found(self) -> None:
         from botocore.exceptions import ClientError
@@ -457,6 +506,35 @@ class TestDownloadOneFile:
         mock_client.download_file.assert_not_called()
         mock_client.download_fileobj.assert_not_called()
 
+    def test_download_includes_request_payer_when_enabled(self, tmp_path: Path) -> None:
+        entry = _sample_plan()["files"][0]
+        entry = dict(entry)
+        lz4_path = tmp_path / "BTC.lz4"
+        entry["local_lz4_path"] = str(lz4_path)
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_get_object_response(b"fake-lz4-data")
+        download_one_file(mock_client, entry, overwrite=False, requester_pays=True)
+
+        mock_client.get_object.assert_called_once_with(
+            Bucket="hyperliquid-archive",
+            Key="market_data/20230916/0/l2Book/BTC.lz4",
+            RequestPayer="requester",
+        )
+
+    def test_download_omits_request_payer_when_anonymous(self, tmp_path: Path) -> None:
+        entry = _sample_plan()["files"][0]
+        entry = dict(entry)
+        lz4_path = tmp_path / "BTC.lz4"
+        entry["local_lz4_path"] = str(lz4_path)
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_get_object_response(b"fake-lz4-data")
+        download_one_file(mock_client, entry, overwrite=False, requester_pays=False)
+
+        call_kwargs = mock_client.get_object.call_args[1]
+        assert "RequestPayer" not in call_kwargs
+
     def test_403_classified_as_forbidden(self, tmp_path: Path) -> None:
         from botocore.exceptions import ClientError
 
@@ -603,6 +681,114 @@ class TestRunSampleDownload:
         assert report["failed_count"] == 1
 
 
+class TestRequesterPaysReports:
+    def test_run_sample_download_report_includes_requester_pays_fields(self, tmp_path: Path) -> None:
+        plan_path = _write_plan(tmp_path, _sample_plan())
+        plan = load_plan(plan_path)
+        plan["files"] = [
+            {
+                **_sample_plan()["files"][0],
+                "local_lz4_path": str(tmp_path / "BTC.lz4"),
+                "local_jsonl_path": str(tmp_path / "BTC.jsonl"),
+            }
+        ]
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_get_object_response(
+            _make_fake_lz4(b'{"coin":"BTC"}\n')
+        )
+
+        report = run_sample_download(
+            plan,
+            max_files=1,
+            client=mock_client,
+            requester_pays=True,
+            aws_profile="hyperliquid-research",
+        )
+
+        assert report["requester_pays"] is True
+        assert report["aws_profile_used"] == "hyperliquid-research"
+        assert REQUESTER_PAYS_WARNING in report["warnings"]
+
+    def test_run_sample_download_report_default_chain_profile(self, tmp_path: Path) -> None:
+        plan_path = _write_plan(tmp_path, _sample_plan())
+        plan = load_plan(plan_path)
+        plan["files"] = [
+            {
+                **_sample_plan()["files"][0],
+                "local_lz4_path": str(tmp_path / "BTC.lz4"),
+                "local_jsonl_path": str(tmp_path / "BTC.jsonl"),
+            }
+        ]
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_get_object_response(
+            _make_fake_lz4(b'{"coin":"BTC"}\n')
+        )
+
+        report = run_sample_download(
+            plan,
+            max_files=1,
+            client=mock_client,
+            requester_pays=True,
+        )
+
+        assert report["requester_pays"] is True
+        assert report["aws_profile_used"] == "default_chain"
+
+    def test_anonymous_report_requester_pays_false(self, tmp_path: Path) -> None:
+        plan_path = _write_plan(tmp_path, _sample_plan())
+        plan = load_plan(plan_path)
+        plan["files"] = [
+            {
+                **_sample_plan()["files"][0],
+                "local_lz4_path": str(tmp_path / "BTC.lz4"),
+                "local_jsonl_path": str(tmp_path / "BTC.jsonl"),
+            }
+        ]
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_get_object_response(
+            _make_fake_lz4(b'{"coin":"BTC"}\n')
+        )
+
+        report = run_sample_download(plan, max_files=1, client=mock_client)
+
+        assert report["requester_pays"] is False
+        assert report["aws_profile_used"] is None
+        assert REQUESTER_PAYS_WARNING not in report["warnings"]
+
+    def test_report_json_does_not_contain_credential_fields(self, tmp_path: Path) -> None:
+        report = {
+            "generated_at": "2026-01-01T00:00:00Z",
+            "paper_only": True,
+            "execution_enabled": False,
+            "requester_pays": True,
+            "aws_profile_used": "hyperliquid-research",
+            "source_plan_path": "/tmp/plan.json",
+            "requested_files": 1,
+            "downloaded_count": 1,
+            "decompressed_count": 1,
+            "skipped_count": 0,
+            "failed_count": 0,
+            "file_results": [],
+            "warnings": [REQUESTER_PAYS_WARNING],
+            "next_import_commands": [],
+        }
+        output_dir = tmp_path / "reports"
+        json_path = write_report_json(report, output_dir=output_dir)
+        serialized = json_path.read_text(encoding="utf-8").lower()
+
+        for token in (
+            "aws_access_key",
+            "aws_secret",
+            "secret_access_key",
+            "session_token",
+            "private_key",
+        ):
+            assert token not in serialized
+
+
 class TestWriters:
     def test_write_report_json(self, tmp_path: Path) -> None:
         report = {
@@ -737,7 +923,7 @@ class TestWriters:
 
 
 class TestCli:
-    @patch("historical_l2_python_downloader.create_unsigned_s3_client")
+    @patch("historical_l2_python_downloader.create_s3_client")
     def test_main_with_plan(
         self,
         mock_create_client: MagicMock,
@@ -785,7 +971,7 @@ class TestCli:
         assert list(report_dir.glob("*.json"))
         assert list(report_dir.glob("*.md"))
 
-    @patch("historical_l2_python_downloader.create_unsigned_s3_client")
+    @patch("historical_l2_python_downloader.create_s3_client")
     def test_main_selector_by_coin_date_hour(
         self,
         mock_create_client: MagicMock,
@@ -848,7 +1034,7 @@ class TestCli:
         assert exit_code == 1
         assert "exceeds hard cap" in captured.err
 
-    @patch("historical_l2_python_downloader.create_unsigned_s3_client")
+    @patch("historical_l2_python_downloader.create_s3_client")
     def test_main_probe_with_latest(
         self,
         mock_create_client: MagicMock,
@@ -887,7 +1073,7 @@ class TestCli:
         assert "error_class=none" in captured
         assert list(report_dir.glob("historical_l2_python_probe_*.json"))
 
-    @patch("historical_l2_python_downloader.create_unsigned_s3_client")
+    @patch("historical_l2_python_downloader.create_s3_client")
     def test_main_probe_path_without_manifest(
         self,
         mock_create_client: MagicMock,
@@ -926,7 +1112,7 @@ class TestCli:
         assert report["paper_only"] is True
         assert report["execution_enabled"] is False
 
-    @patch("historical_l2_python_downloader.create_unsigned_s3_client")
+    @patch("historical_l2_python_downloader.create_s3_client")
     def test_main_probe_selector_by_coin_date_hour(
         self,
         mock_create_client: MagicMock,
@@ -971,6 +1157,67 @@ class TestCli:
         captured = capsys.readouterr()
         assert exit_code == 1
         assert "exceeds hard cap" in captured.err
+
+    @patch("historical_l2_python_downloader.create_s3_client")
+    def test_main_requester_pays_with_aws_profile(
+        self,
+        mock_create_client: MagicMock,
+        tmp_path: Path,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        plan = _sample_plan()
+        sol_entry = next(entry for entry in plan["files"] if entry["coin"] == "SOL" and entry["hour"] == "9")
+        plan["files"] = [
+            {
+                **sol_entry,
+                "local_lz4_path": str(tmp_path / "SOL.lz4"),
+                "local_jsonl_path": str(tmp_path / "SOL.jsonl"),
+            }
+        ]
+        plan_path = _write_plan(tmp_path / "plans", plan)
+        report_dir = tmp_path / "reports"
+
+        mock_client = MagicMock()
+        mock_client.get_object.return_value = _make_fake_get_object_response(
+            _make_fake_lz4(b'{"coin":"SOL"}\n')
+        )
+        mock_create_client.return_value = mock_client
+
+        exit_code = main(
+            [
+                "--plan",
+                str(plan_path),
+                "--coin",
+                "SOL",
+                "--date",
+                "20230916",
+                "--hour",
+                "9",
+                "--max-files",
+                "1",
+                "--report-dir",
+                str(report_dir),
+                "--requester-pays",
+                "--aws-profile",
+                "hyperliquid-research",
+            ]
+        )
+
+        assert exit_code == 0
+        mock_create_client.assert_called_once_with(
+            requester_pays=True,
+            aws_profile="hyperliquid-research",
+        )
+        mock_client.get_object.assert_called_once_with(
+            Bucket="hyperliquid-archive",
+            Key="market_data/20230916/9/l2Book/SOL.lz4",
+            RequestPayer="requester",
+        )
+        report = json.loads(list(report_dir.glob("*.json"))[0].read_text(encoding="utf-8"))
+        assert report["requester_pays"] is True
+        assert report["aws_profile_used"] == "hyperliquid-research"
+        assert REQUESTER_PAYS_WARNING in report["warnings"]
+        assert capsys.readouterr().out
 
 
 class TestSafety:
