@@ -325,6 +325,157 @@ class TestDailyCycle:
         assert report.paper_only is True
         assert report.execution_enabled is False
 
+    def test_daily_cycle_report_stores_train_interval_and_horizon(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        runs_dir = tmp_path / "runs"
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_historical_backfill_next",
+            lambda **k: scheduler.SchedulerReport(
+                workflows_run=["historical-backfill-next"],
+                coins=["BTC", "ETH", "SOL"],
+                historical_date="20230916",
+                historical_hours=["0", "1", "2"],
+                source="historical",
+                train_interval=k.get("train_interval"),
+                horizon=k.get("horizon"),
+            ),
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "cmd_resample_validate",
+            lambda **k: orchestrator.OrchestratorReport(workflows_run=["resample-validate"]),
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "cmd_train_evaluate",
+            lambda **k: orchestrator.OrchestratorReport(workflows_run=["train-evaluate"]),
+        )
+        monkeypatch.setattr(
+            scheduler.bid_ask_daily_summary,
+            "build_daily_summary",
+            lambda *a, **k: {"generated_at": "2026-01-01T00:00:00Z"},
+        )
+        monkeypatch.setattr(
+            scheduler.bid_ask_daily_summary,
+            "write_summary_json",
+            lambda s, d: d / "summary.json",
+        )
+        monkeypatch.setattr(
+            scheduler.bid_ask_daily_summary,
+            "write_summary_markdown",
+            lambda s, d: d / "summary.md",
+        )
+
+        report = scheduler.cmd_daily_cycle(
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=tmp_path / "daily",
+            train_interval="15s",
+            horizon=5,
+        )
+        assert report.train_interval == "15s"
+        assert report.horizon == 5
+        assert report.source == "historical"
+        assert report.coins == ["BTC", "ETH", "SOL"]
+        assert report.historical_date == "20230916"
+        assert report.historical_hours == ["0", "1", "2"]
+
+        state = scheduler.load_state(state_path)
+        assert state.last_report_path is not None
+        saved = json.loads(Path(state.last_report_path).read_text(encoding="utf-8"))
+        assert saved["train_interval"] == "15s"
+        assert saved["horizon"] == 5
+        assert saved["source"] == "historical"
+        assert saved["historical_date"] == "20230916"
+        assert saved["historical_hours"] == ["0", "1", "2"]
+        assert saved["coins"] == ["BTC", "ETH", "SOL"]
+
+    def test_daily_cycle_report_includes_training_metadata(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        runs_dir = tmp_path / "runs"
+
+        def fake_train(**kwargs: object) -> orchestrator.OrchestratorReport:
+            train_report = orchestrator.OrchestratorReport(
+                workflows_run=["train-evaluate"],
+                model_paths=["models/bid_ask/BTC_historical_15s_abc.joblib"],
+                report_paths=[
+                    "reports/bid_ask_training/abc123.json",
+                    "reports/bid_ask_research_orchestrator/train.json",
+                ],
+            )
+            train_report.details["decision_evaluation"] = {
+                "json_report_path": "reports/bid_ask_decision_evaluation/eval.json",
+            }
+            train_report.details["decision_filter"] = {
+                "json_report_path": "reports/bid_ask_decision_filters/filter.json",
+            }
+            return train_report
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_historical_backfill_next",
+            lambda **k: scheduler.SchedulerReport(
+                workflows_run=["historical-backfill-next"],
+                historical_date="20230916",
+                historical_hours=["0", "1", "2"],
+            ),
+        )
+        monkeypatch.setattr(
+            orchestrator,
+            "cmd_resample_validate",
+            lambda **k: orchestrator.OrchestratorReport(workflows_run=["resample-validate"]),
+        )
+        monkeypatch.setattr(orchestrator, "cmd_train_evaluate", fake_train)
+        monkeypatch.setattr(
+            scheduler.bid_ask_daily_summary,
+            "build_daily_summary",
+            lambda *a, **k: {"generated_at": "2026-01-01T00:00:00Z"},
+        )
+        monkeypatch.setattr(
+            scheduler.bid_ask_daily_summary,
+            "write_summary_json",
+            lambda s, d: d / "summary.json",
+        )
+        monkeypatch.setattr(
+            scheduler.bid_ask_daily_summary,
+            "write_summary_markdown",
+            lambda s, d: d / "summary.md",
+        )
+
+        report = scheduler.cmd_daily_cycle(
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=tmp_path / "daily",
+            train_interval="15s",
+            horizon=5,
+        )
+        assert report.training_reports == ["reports/bid_ask_training/abc123.json"]
+        assert report.model_artifact_paths == ["models/bid_ask/BTC_historical_15s_abc.joblib"]
+        assert report.evaluation_report_paths == [
+            "reports/bid_ask_decision_evaluation/eval.json"
+        ]
+        assert report.filter_report_paths == ["reports/bid_ask_decision_filters/filter.json"]
+
+        state = scheduler.load_state(state_path)
+        saved = json.loads(Path(state.last_report_path).read_text(encoding="utf-8"))
+        assert saved["training_reports"] == ["reports/bid_ask_training/abc123.json"]
+        assert saved["model_artifact_paths"] == ["models/bid_ask/BTC_historical_15s_abc.joblib"]
+        assert saved["evaluation_report_paths"] == [
+            "reports/bid_ask_decision_evaluation/eval.json"
+        ]
+        assert saved["filter_report_paths"] == ["reports/bid_ask_decision_filters/filter.json"]
+
+
 
 class TestLiveLongSession:
     def test_requires_finite_duration(self, tmp_path: Path) -> None:
@@ -411,8 +562,9 @@ class TestReportsSafetyFields:
             coins=["BTC"],
             historical_date="20230916",
             historical_hours=["0", "1", "2"],
-            training_interval="15s",
-            training_horizon=5,
+            source="historical",
+            train_interval="15s",
+            horizon=5,
             next_recommended_action="status",
         )
         json_path, md_path = scheduler.write_scheduler_report(
@@ -426,6 +578,9 @@ class TestReportsSafetyFields:
         assert saved["execution_enabled"] is False
         assert saved["workflows_run"] == ["daily-cycle"]
         assert saved["historical_date"] == "20230916"
+        assert saved["source"] == "historical"
+        assert saved["train_interval"] == "15s"
+        assert saved["horizon"] == 5
         assert saved["next_recommended_action"] == "status"
         assert md_path.is_file()
 

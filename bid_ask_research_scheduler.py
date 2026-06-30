@@ -111,9 +111,14 @@ class SchedulerReport:
     historical_date: str | None = None
     historical_hours: list[str] = field(default_factory=list)
     live_session_duration: float | None = None
-    training_interval: str | None = None
-    training_horizon: int | None = None
+    source: str | None = None
+    train_interval: str | None = None
+    horizon: int | None = None
     row_counts: dict[str, Any] = field(default_factory=dict)
+    training_reports: list[str] = field(default_factory=list)
+    model_artifact_paths: list[str] = field(default_factory=list)
+    evaluation_report_paths: list[str] = field(default_factory=list)
+    filter_report_paths: list[str] = field(default_factory=list)
     model_paths: list[str] = field(default_factory=list)
     evaluation_paths: list[str] = field(default_factory=list)
     warnings: list[str] = field(default_factory=list)
@@ -132,9 +137,14 @@ class SchedulerReport:
             "historical_date": self.historical_date,
             "historical_hours": self.historical_hours,
             "live_session_duration": self.live_session_duration,
-            "training_interval": self.training_interval,
-            "training_horizon": self.training_horizon,
+            "source": self.source,
+            "train_interval": self.train_interval,
+            "horizon": self.horizon,
             "row_counts": self.row_counts,
+            "training_reports": self.training_reports,
+            "model_artifact_paths": self.model_artifact_paths,
+            "evaluation_report_paths": self.evaluation_report_paths,
+            "filter_report_paths": self.filter_report_paths,
             "model_paths": self.model_paths,
             "evaluation_paths": self.evaluation_paths,
             "warnings": self.warnings,
@@ -222,10 +232,12 @@ def write_scheduler_report(
         lines.append(f"- historical_hours: {', '.join(report.historical_hours)}")
     if report.live_session_duration is not None:
         lines.append(f"- live_session_duration: {report.live_session_duration}")
-    if report.training_interval:
-        lines.append(f"- training_interval: {report.training_interval}")
-    if report.training_horizon is not None:
-        lines.append(f"- training_horizon: {report.training_horizon}")
+    if report.source:
+        lines.append(f"- source: {report.source}")
+    if report.train_interval:
+        lines.append(f"- train_interval: {report.train_interval}")
+    if report.horizon is not None:
+        lines.append(f"- horizon: {report.horizon}")
 
     lines.extend(["", "## Row counts", ""])
     for key, value in report.row_counts.items():
@@ -273,6 +285,38 @@ def _extract_evaluation_paths(train_report: orchestrator.OrchestratorReport) -> 
         paths.append(str(filter_path))
     paths.extend(str(p) for p in train_report.report_paths)
     return paths
+
+
+def _is_training_report_path(path: str) -> bool:
+    return "bid_ask_training" in path and path.endswith(".json")
+
+
+def _extract_training_metadata(
+    train_report: orchestrator.OrchestratorReport,
+) -> dict[str, list[str]]:
+    """Pull training artifact and report paths from an orchestrator train-evaluate report."""
+    decision_eval = (train_report.details or {}).get("decision_evaluation") or {}
+    filter_eval = (train_report.details or {}).get("decision_filter") or {}
+    evaluation_path = decision_eval.get("json_report_path")
+    filter_path = filter_eval.get("json_report_path")
+    return {
+        "training_reports": [
+            str(path) for path in train_report.report_paths if _is_training_report_path(str(path))
+        ],
+        "model_artifact_paths": [str(path) for path in train_report.model_paths],
+        "evaluation_report_paths": [str(evaluation_path)] if evaluation_path else [],
+        "filter_report_paths": [str(filter_path)] if filter_path else [],
+    }
+
+
+def _apply_train_metadata(report: SchedulerReport, train_report: orchestrator.OrchestratorReport) -> None:
+    metadata = _extract_training_metadata(train_report)
+    report.training_reports.extend(metadata["training_reports"])
+    report.model_artifact_paths.extend(metadata["model_artifact_paths"])
+    report.evaluation_report_paths.extend(metadata["evaluation_report_paths"])
+    report.filter_report_paths.extend(metadata["filter_report_paths"])
+    report.model_paths.extend(train_report.model_paths)
+    report.evaluation_paths.extend(_extract_evaluation_paths(train_report))
 
 
 def cmd_init_state(
@@ -369,6 +413,9 @@ def cmd_historical_backfill_next(
     state_path: Path = DEFAULT_STATE_PATH,
     runs_dir: Path = DEFAULT_RUNS_DIR,
     s3_client: Any | None = None,
+    train_interval: str | None = None,
+    horizon: int | None = None,
+    source: str | None = None,
 ) -> SchedulerReport:
     """Run the next bounded historical batch from scheduler state."""
     orchestrator.reject_all_time(all_time=all_time)
@@ -383,7 +430,9 @@ def cmd_historical_backfill_next(
     report = SchedulerReport(
         workflows_run=["historical-backfill-next"],
         coins=normalized_coins,
-        training_interval=None,
+        source=source or "historical",
+        train_interval=train_interval,
+        horizon=horizon,
     )
 
     if not state.next_historical_date:
@@ -509,8 +558,9 @@ def cmd_daily_cycle(
     report = SchedulerReport(
         workflows_run=["daily-cycle"],
         coins=normalized_coins,
-        training_interval=train_interval,
-        training_horizon=horizon,
+        source="combined" if include_combined else "historical",
+        train_interval=train_interval,
+        horizon=horizon,
     )
 
     backfill_report = cmd_historical_backfill_next(
@@ -525,6 +575,9 @@ def cmd_daily_cycle(
         state_path=state_path,
         runs_dir=runs_dir,
         s3_client=s3_client,
+        train_interval=train_interval,
+        horizon=horizon,
+        source="historical",
     )
     report.workflows_run.append("historical-backfill-next")
     report.historical_date = backfill_report.historical_date
@@ -567,8 +620,7 @@ def cmd_daily_cycle(
     report.row_counts.update(train_report.row_counts)
     report.warnings.extend(train_report.warnings)
     report.failures.extend(train_report.failures)
-    report.model_paths.extend(train_report.model_paths)
-    report.evaluation_paths.extend(_extract_evaluation_paths(train_report))
+    _apply_train_metadata(report, train_report)
     report.details["train_evaluate_historical"] = train_report.to_dict()
 
     state = load_state(state_path)
@@ -597,8 +649,7 @@ def cmd_daily_cycle(
         report.workflows_run.append("train-evaluate-combined")
         report.row_counts.update(combined_train.row_counts)
         report.warnings.extend(combined_train.warnings)
-        report.model_paths.extend(combined_train.model_paths)
-        report.evaluation_paths.extend(_extract_evaluation_paths(combined_train))
+        _apply_train_metadata(report, combined_train)
         report.details["train_evaluate_combined"] = combined_train.to_dict()
 
     summary = bid_ask_daily_summary.build_daily_summary(
