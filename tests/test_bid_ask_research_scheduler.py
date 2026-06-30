@@ -1075,6 +1075,41 @@ class TestConfigureAutopilot:
         state = scheduler.load_state(state_path)
         assert state.autopilot.enabled is True
 
+    def test_configure_does_not_reset_usage_counters(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        state = scheduler.load_state(state_path)
+        state.autopilot.last_run_date = "20230916"
+        state.autopilot.runs_today = 2
+        state.autopilot.chunks_completed_today = 1
+        state.autopilot.files_downloaded_today = 9
+        scheduler.save_state(state, state_path)
+
+        scheduler.cmd_configure_autopilot(
+            daily_chunk_limit=2,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.runs_today == 2
+        assert state.autopilot.chunks_completed_today == 1
+        assert state.autopilot.files_downloaded_today == 9
+        assert state.autopilot.last_run_date == "20230916"
+
+    def test_configure_reset_usage_clears_counters(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        state = scheduler.load_state(state_path)
+        state.autopilot.runs_today = 2
+        state.autopilot.chunks_completed_today = 1
+        state.autopilot.files_downloaded_today = 9
+        scheduler.save_state(state, state_path)
+
+        scheduler.cmd_configure_autopilot(reset_usage=True, state_path=state_path)
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.runs_today == 0
+        assert state.autopilot.chunks_completed_today == 0
+        assert state.autopilot.files_downloaded_today == 0
+
     def test_pause_resume_disable(self, tmp_path: Path) -> None:
         state_path = _init_state(tmp_path)
         _enable_autopilot(state_path)
@@ -1176,7 +1211,7 @@ class TestAutopilotTick:
             runs_dir=tmp_path / "runs",
             today_override="20230916",
         )
-        assert report.action == "daily_chunk_limit_reached"
+        assert report.action == "limit_skipped"
 
     def test_respects_daily_file_limit(
         self,
@@ -1199,7 +1234,33 @@ class TestAutopilotTick:
             runs_dir=tmp_path / "runs",
             today_override="20230916",
         )
-        assert report.action == "daily_file_limit_reached"
+        assert report.action == "limit_skipped"
+
+    def test_second_tick_same_day_skips_without_backfill(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path, daily_chunk_limit=1)
+        captured = _mock_auto_backfill_next(monkeypatch)
+
+        first = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        second = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        assert first.action == "chunk_completed"
+        assert second.action == "limit_skipped"
+        assert len(captured) == 1
 
     def test_runs_exactly_one_chunk_when_allowed(
         self,
@@ -1256,7 +1317,7 @@ class TestAutopilotTick:
             runs_dir=tmp_path / "runs",
             today_override="20230916",
         )
-        assert report.action == "chunk_failed"
+        assert report.action == "failed"
         state = scheduler.load_state(state_path)
         assert state.autopilot.chunks_completed_today == 0
         assert state.autopilot.failed_runs_in_row == 1
@@ -1366,6 +1427,113 @@ class TestAutopilotTick:
         assert saved["paper_only"] is True
         assert saved["execution_enabled"] is False
         assert "secret_access_key" not in json.dumps(saved).lower()
+
+    def test_file_limit_blocks_before_chunk_when_requested_files_exceed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path, daily_chunk_limit=4, daily_file_limit=9)
+        captured = _mock_auto_backfill_next(monkeypatch)
+        state = scheduler.load_state(state_path)
+        state.autopilot.last_run_date = "20230916"
+        state.autopilot.files_downloaded_today = 7
+        scheduler.save_state(state, state_path)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        assert report.action == "limit_skipped"
+        assert report.requested_files == 9
+        assert len(captured) == 0
+
+    def test_limit_skipped_report_includes_safety_and_limit_fields(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path, daily_chunk_limit=1)
+        _mock_auto_backfill_next(monkeypatch)
+        runs_dir = tmp_path / "runs"
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            today_override="20230916",
+        )
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            today_override="20230916",
+        )
+
+        assert report.action == "limit_skipped"
+        assert report.paper_only is True
+        assert report.execution_enabled is False
+        assert report.daily_chunk_limit == 1
+        assert report.daily_file_limit == 9
+        assert report.chunks_completed_today == 1
+        assert report.requested_files == 9
+        state = scheduler.load_state(state_path)
+        saved = json.loads(Path(state.autopilot.last_autopilot_report_path).read_text(encoding="utf-8"))
+        assert saved["action"] == "limit_skipped"
+        assert saved["paper_only"] is True
+        assert saved["execution_enabled"] is False
+        assert saved["requested_files"] == 9
+
+    def test_successful_tick_persists_counters_to_state_json(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=3)
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        autopilot = payload["autopilot"]
+        assert autopilot["runs_today"] == 1
+        assert autopilot["chunks_completed_today"] == 1
+        assert autopilot["files_downloaded_today"] == 3
+        assert autopilot["last_run_date"] == "20230916"
+
+    def test_failed_tick_does_not_increment_completed_or_file_counters(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, failures=["download failed"])
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        payload = json.loads(state_path.read_text(encoding="utf-8"))
+        autopilot = payload["autopilot"]
+        assert autopilot["chunks_completed_today"] == 0
+        assert autopilot["files_downloaded_today"] == 0
+        assert autopilot["runs_today"] == 0
+        assert autopilot["failed_runs_in_row"] == 1
 
 
 class TestLaunchdAutopilot:

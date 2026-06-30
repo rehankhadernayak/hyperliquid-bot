@@ -563,7 +563,8 @@ python3 bid_ask_research_scheduler.py configure-autopilot \
   --max-daily-file-limit 36
 ```
 
-Also supports `--disable`, `--pause REASON`, and `--resume`.
+Also supports `--disable`, `--pause REASON`, `--resume`, and `--reset-usage` (clears
+today's usage counters; default configure preserves them).
 
 **Run one autopilot tick**:
 
@@ -596,13 +597,20 @@ Autopilot state (`state.json` → `autopilot`):
 
 Behavior:
 
-1. Reads scheduler state and today's daily budget
-2. Skips when disabled, paused, or over daily chunk/file limits
-3. Runs `auto-backfill-next` for exactly one chunk when allowed
-4. Increments counters on success; increments `failed_runs_in_row` on failure
-5. Pauses after 3 consecutive failed runs
-6. Ramps daily limits after configured successful days (not after failures)
-7. Writes JSON/Markdown reports to `reports/bid_ask_research_scheduler/runs/`
+1. Reads scheduler state and reconciles today's daily budget from `state.json` counters,
+   today's `completed_batches` timestamps, and today's autopilot reports (conservative:
+   if unsure, skip rather than over-download)
+2. Skips with `action=limit_skipped` when disabled, paused, or when the next chunk would
+   exceed daily chunk/file limits (`requested_files = len(coins) * chunk_size_hours`)
+3. Runs `auto-backfill-next` for exactly one chunk when allowed (limit skips do not call it)
+4. On success increments `runs_today`, `chunks_completed_today`, and `files_downloaded_today`
+   and persists them to `state.json`; on failure increments `failed_runs_in_row` only
+5. Resets daily counters only when the UTC date changes (or via `--reset-usage`)
+6. Pauses after 3 consecutive failed runs
+7. Ramps daily limits after configured successful days (not after failures)
+8. Writes JSON/Markdown reports to `reports/bid_ask_research_scheduler/runs/` with
+   `action` (`chunk_completed`, `limit_skipped`, `disabled`, `paused`, or `failed`),
+   limits, usage counters, and `requested_files`
 
 **AWS cost control:** Set up [AWS Budget alerts](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) before enabling scheduled requester-pays downloads. Autopilot does not bypass cost controls.
 

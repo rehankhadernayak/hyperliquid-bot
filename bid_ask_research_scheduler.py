@@ -218,7 +218,12 @@ class AutopilotReport:
     coins: list[str] = field(default_factory=list)
     chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS
     estimated_files: int = 0
+    requested_files: int = 0
     files_downloaded: int = 0
+    daily_chunk_limit: int | None = None
+    daily_file_limit: int | None = None
+    chunks_completed_today: int | None = None
+    files_downloaded_today: int | None = None
     autopilot_snapshot: dict[str, Any] = field(default_factory=dict)
     workflows_run: list[str] = field(default_factory=list)
     historical_date: str | None = None
@@ -241,7 +246,12 @@ class AutopilotReport:
             "coins": self.coins,
             "chunk_size_hours": self.chunk_size_hours,
             "estimated_files": self.estimated_files,
+            "requested_files": self.requested_files,
             "files_downloaded": self.files_downloaded,
+            "daily_chunk_limit": self.daily_chunk_limit,
+            "daily_file_limit": self.daily_file_limit,
+            "chunks_completed_today": self.chunks_completed_today,
+            "files_downloaded_today": self.files_downloaded_today,
             "autopilot_snapshot": self.autopilot_snapshot,
             "workflows_run": self.workflows_run,
             "historical_date": self.historical_date,
@@ -374,10 +384,128 @@ def _reset_autopilot_daily_counters(autopilot: AutopilotState, today: str) -> No
     autopilot.last_run_date = today
 
 
+def _utc_date_from_iso_timestamp(iso_timestamp: str) -> str | None:
+    """Extract UTC YYYYMMDD from an ISO-8601 timestamp."""
+    if not iso_timestamp or len(iso_timestamp) < 10:
+        return None
+    date_part = iso_timestamp[:10]
+    if len(date_part) != 10 or date_part[4] != "-" or date_part[7] != "-":
+        return None
+    return date_part.replace("-", "")
+
+
+def _reconcile_autopilot_usage_from_batches(
+    state: SchedulerState,
+    today: str,
+) -> int:
+    """Count completed batches whose completed_at falls on today (UTC)."""
+    chunks = 0
+    for batch in state.completed_batches:
+        completed_at = batch.get("completed_at")
+        if not completed_at:
+            continue
+        if _utc_date_from_iso_timestamp(str(completed_at)) == today:
+            chunks += 1
+    return chunks
+
+
+def _reconcile_autopilot_usage_from_reports(
+    runs_dir: Path,
+    today: str,
+) -> tuple[int, int]:
+    """Count chunk_completed autopilot reports for today (UTC). Conservative usage estimate."""
+    chunks = 0
+    files = 0
+    if not runs_dir.is_dir():
+        return chunks, files
+    for path in sorted(runs_dir.glob("bid_ask_scheduler_autopilot_*.json")):
+        try:
+            payload = json.loads(path.read_text(encoding="utf-8"))
+        except (json.JSONDecodeError, OSError):
+            continue
+        if payload.get("command") != "autopilot-tick":
+            continue
+        if _utc_date_from_iso_timestamp(str(payload.get("generated_at") or "")) != today:
+            continue
+        if payload.get("action") != "chunk_completed":
+            continue
+        chunks += 1
+        files += int(
+            payload.get("files_downloaded")
+            or payload.get("requested_files")
+            or payload.get("estimated_files")
+            or 0
+        )
+    return chunks, files
+
+
+def _reconcile_autopilot_daily_usage(
+    autopilot: AutopilotState,
+    state: SchedulerState,
+    *,
+    today: str,
+    runs_dir: Path | None = None,
+) -> bool:
+    """Align daily usage counters with persisted state and today's evidence. Returns True if modified."""
+    if autopilot.last_run_date != today:
+        _reset_autopilot_daily_counters(autopilot, today)
+        return True
+
+    observed_chunks = autopilot.chunks_completed_today
+    observed_files = autopilot.files_downloaded_today
+    observed_chunks = max(observed_chunks, _reconcile_autopilot_usage_from_batches(state, today))
+    if runs_dir is not None:
+        report_chunks, report_files = _reconcile_autopilot_usage_from_reports(runs_dir, today)
+        observed_chunks = max(observed_chunks, report_chunks)
+        observed_files = max(observed_files, report_files)
+
+    modified = False
+    if observed_chunks > autopilot.chunks_completed_today:
+        autopilot.chunks_completed_today = observed_chunks
+        modified = True
+    if observed_files > autopilot.files_downloaded_today:
+        autopilot.files_downloaded_today = observed_files
+        modified = True
+    return modified
+
+
 def _maybe_reset_autopilot_for_new_day(autopilot: AutopilotState) -> None:
     today = _utc_today_yyyymmdd()
     if autopilot.last_run_date != today:
         _reset_autopilot_daily_counters(autopilot, today)
+
+
+def _populate_autopilot_report_limits(
+    report: AutopilotReport,
+    autopilot: AutopilotState,
+    *,
+    requested_files: int,
+) -> None:
+    report.requested_files = requested_files
+    report.estimated_files = requested_files
+    report.daily_chunk_limit = autopilot.daily_chunk_limit
+    report.daily_file_limit = autopilot.daily_file_limit
+    report.chunks_completed_today = autopilot.chunks_completed_today
+    report.files_downloaded_today = autopilot.files_downloaded_today
+
+
+def _autopilot_would_exceed_daily_limits(
+    autopilot: AutopilotState,
+    requested_files: int,
+) -> str | None:
+    """Return skip reason when the next chunk would exceed daily limits, else None."""
+    if autopilot.chunks_completed_today + 1 > autopilot.daily_chunk_limit:
+        return (
+            f"Daily chunk limit would be exceeded "
+            f"({autopilot.chunks_completed_today}+1 > {autopilot.daily_chunk_limit}); skipping chunk"
+        )
+    if autopilot.files_downloaded_today + requested_files > autopilot.daily_file_limit:
+        return (
+            f"Next chunk would exceed daily file limit "
+            f"({autopilot.files_downloaded_today}+{requested_files} > "
+            f"{autopilot.daily_file_limit}); skipping chunk"
+        )
+    return None
 
 
 def _record_autopilot_success_day(autopilot: AutopilotState, today: str) -> None:
@@ -422,7 +550,7 @@ def _autopilot_next_recommended_action(state: SchedulerState, autopilot: Autopil
         )
     if not autopilot.enabled:
         return "python3 bid_ask_research_scheduler.py configure-autopilot --enable"
-    if autopilot.chunks_completed_today >= autopilot.daily_chunk_limit:
+    if autopilot.chunks_completed_today + 1 > autopilot.daily_chunk_limit:
         return "Wait until tomorrow or increase daily limits via configure-autopilot"
     if state.next_historical_date is None:
         return "python3 bid_ask_research_scheduler.py status"
@@ -452,9 +580,18 @@ def write_autopilot_report(
         f"- action: {report.action}",
         f"- coins: {', '.join(report.coins) or 'none'}",
         f"- chunk_size_hours: {report.chunk_size_hours}",
+        f"- requested_files: {report.requested_files}",
         f"- estimated_files: {report.estimated_files}",
         f"- files_downloaded: {report.files_downloaded}",
     ]
+    if report.daily_chunk_limit is not None:
+        lines.append(f"- daily_chunk_limit: {report.daily_chunk_limit}")
+    if report.daily_file_limit is not None:
+        lines.append(f"- daily_file_limit: {report.daily_file_limit}")
+    if report.chunks_completed_today is not None:
+        lines.append(f"- chunks_completed_today: {report.chunks_completed_today}")
+    if report.files_downloaded_today is not None:
+        lines.append(f"- files_downloaded_today: {report.files_downloaded_today}")
     if report.historical_date:
         lines.append(f"- historical_date: {report.historical_date}")
     if report.historical_hours:
@@ -1711,6 +1848,7 @@ def cmd_configure_autopilot(
     disable: bool = False,
     pause_reason: str | None = None,
     resume: bool = False,
+    reset_usage: bool = False,
     daily_chunk_limit: int | None = None,
     daily_file_limit: int | None = None,
     ramp_enabled: bool | None = None,
@@ -1728,6 +1866,9 @@ def cmd_configure_autopilot(
         raise ValueError("pass --enable or --disable, not both")
     if pause_reason and resume:
         raise ValueError("pass --pause or --resume, not both")
+
+    if reset_usage:
+        _reset_autopilot_daily_counters(autopilot, _utc_today_yyyymmdd())
 
     if enable:
         autopilot.enabled = True
@@ -1788,10 +1929,23 @@ def cmd_configure_autopilot(
     return autopilot
 
 
-def cmd_autopilot_status(*, state_path: Path = DEFAULT_STATE_PATH) -> dict[str, Any]:
+def cmd_autopilot_status(
+    *,
+    state_path: Path = DEFAULT_STATE_PATH,
+    runs_dir: Path = DEFAULT_RUNS_DIR,
+) -> dict[str, Any]:
     """Return printable autopilot status snapshot."""
     state = load_state(state_path)
     autopilot = state.autopilot
+    today = _utc_today_yyyymmdd()
+    if _reconcile_autopilot_daily_usage(
+        autopilot,
+        state,
+        today=today,
+        runs_dir=runs_dir,
+    ):
+        state.autopilot = autopilot
+        save_state(state, state_path)
     return {
         "enabled": autopilot.enabled,
         "paused": autopilot.paused,
@@ -1856,12 +2010,13 @@ def cmd_autopilot_tick(
     autopilot = state.autopilot
     normalized_coins = orchestrator._normalize_coins(coins or state.coins)
     today = today_override or _utc_today_yyyymmdd()
-    estimated_files = _estimate_chunk_files(len(normalized_coins), chunk_size_hours)
+    requested_files = _estimate_chunk_files(len(normalized_coins), chunk_size_hours)
 
     report = AutopilotReport(
         coins=normalized_coins,
         chunk_size_hours=chunk_size_hours,
-        estimated_files=estimated_files,
+        estimated_files=requested_files,
+        requested_files=requested_files,
         train_interval=train_interval,
         horizon=horizon,
     )
@@ -1878,28 +2033,25 @@ def cmd_autopilot_tick(
         )
         return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
-    if autopilot.last_run_date != today:
-        _reset_autopilot_daily_counters(autopilot, today)
+    if _reconcile_autopilot_daily_usage(
+        autopilot,
+        state,
+        today=today,
+        runs_dir=runs_dir,
+    ):
+        state.autopilot = autopilot
+        save_state(state, state_path)
 
-    if autopilot.chunks_completed_today >= autopilot.daily_chunk_limit:
-        report.action = "daily_chunk_limit_reached"
-        report.warnings.append(
-            f"Daily chunk limit reached ({autopilot.chunks_completed_today}/"
-            f"{autopilot.daily_chunk_limit}); skipping chunk"
-        )
+    _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files)
+
+    limit_reason = _autopilot_would_exceed_daily_limits(autopilot, requested_files)
+    if limit_reason:
+        report.action = "limit_skipped"
+        report.warnings.append(limit_reason)
         state.autopilot = autopilot
         return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
-    if autopilot.files_downloaded_today + estimated_files > autopilot.daily_file_limit:
-        report.action = "daily_file_limit_reached"
-        report.warnings.append(
-            f"Next chunk would exceed daily file limit "
-            f"({autopilot.files_downloaded_today}+{estimated_files} > "
-            f"{autopilot.daily_file_limit}); skipping chunk"
-        )
-        state.autopilot = autopilot
-        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
-
+    state.autopilot = autopilot
     save_state(state, state_path)
 
     backfill_report = cmd_auto_backfill_next(
@@ -1929,7 +2081,7 @@ def cmd_autopilot_tick(
     report.failures.extend(backfill_report.failures)
     report.details["auto_backfill"] = backfill_report.to_dict()
 
-    autopilot.runs_today += 1
+    _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files)
 
     if any(AUTO_BACKFILL_COMPLETE_MESSAGE in w for w in backfill_report.warnings):
         report.action = "backfill_complete"
@@ -1940,6 +2092,7 @@ def cmd_autopilot_tick(
     chunk_succeeded = _cycle_succeeded(backfill_report) and not backfill_report.failures
 
     if chunk_succeeded:
+        autopilot.runs_today += 1
         autopilot.chunks_completed_today += 1
         backfill_details = (backfill_report.details or {}).get("historical_backfill") or {}
         if isinstance(backfill_details, dict):
@@ -1949,10 +2102,12 @@ def cmd_autopilot_tick(
             )
         else:
             actual_files = 0
-        files_added = actual_files if actual_files > 0 else estimated_files
+        files_added = actual_files if actual_files > 0 else requested_files
         autopilot.files_downloaded_today += files_added
         report.files_downloaded = files_added
         autopilot.failed_runs_in_row = 0
+        autopilot.last_run_date = today
+        _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files)
         _record_autopilot_success_day(autopilot, today)
         ramped = _maybe_ramp_autopilot_limits(
             autopilot,
@@ -1968,7 +2123,8 @@ def cmd_autopilot_tick(
         report.next_recommended_action = backfill_report.next_recommended_action
     else:
         autopilot.failed_runs_in_row += 1
-        report.action = "chunk_failed"
+        autopilot.last_run_date = today
+        report.action = "failed"
         report.failures.extend(backfill_report.failures or ["chunk did not pass validation"])
         if autopilot.failed_runs_in_row >= AUTOPILOT_FAILURE_PAUSE_THRESHOLD:
             autopilot.paused = True
@@ -2353,6 +2509,11 @@ def build_parser() -> argparse.ArgumentParser:
     configure_autopilot.add_argument("--disable", action="store_true")
     configure_autopilot.add_argument("--pause", dest="pause_reason", default=None, metavar="REASON")
     configure_autopilot.add_argument("--resume", action="store_true")
+    configure_autopilot.add_argument(
+        "--reset-usage",
+        action="store_true",
+        help="Reset daily usage counters (runs/chunks/files today); default preserves them",
+    )
     configure_autopilot.add_argument("--daily-chunk-limit", type=int, default=None)
     configure_autopilot.add_argument("--daily-file-limit", type=int, default=None)
     configure_autopilot.add_argument("--ramp-enabled", action="store_true", default=None)
@@ -2609,6 +2770,7 @@ def main(argv: list[str] | None = None) -> int:
                 disable=args.disable,
                 pause_reason=args.pause_reason,
                 resume=args.resume,
+                reset_usage=args.reset_usage,
                 daily_chunk_limit=args.daily_chunk_limit,
                 daily_file_limit=args.daily_file_limit,
                 ramp_enabled=args.ramp_enabled,
