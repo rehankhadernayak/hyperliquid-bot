@@ -30,6 +30,10 @@ DEFAULT_MAX_FILES = orchestrator.DEFAULT_MAX_FILES
 DEFAULT_LIVE_MAX_DURATION_SECONDS = orchestrator.DEFAULT_LIVE_MAX_DURATION_SECONDS
 LARGE_RANGE_DAYS = 90
 ALL_HOURS = list(range(24))
+DEFAULT_CHUNK_SIZE_HOURS = 3
+MAX_CHUNK_SIZE_HOURS = 8
+MAX_TOTAL_HOURS_PER_RUN = 12
+MAX_TOTAL_HOURS_ALLOW_MORE = 24
 
 ARCHIVE_AVAILABILITY_WARNING = (
     "Historical archive availability is not guaranteed; data may be missing or uploaded late."
@@ -154,6 +158,50 @@ class SchedulerReport:
         }
 
 
+@dataclass
+class BatchSeriesReport:
+    generated_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
+    paper_only: bool = True
+    execution_enabled: bool = False
+    command: str = "run-batch-series"
+    safety_statement: str = SAFETY_STATEMENT
+    date: str | None = None
+    coins: list[str] = field(default_factory=list)
+    chunks: list[list[str]] = field(default_factory=list)
+    chunks_completed: int = 0
+    chunks_failed: int = 0
+    chunks_skipped: int = 0
+    per_chunk_report_paths: list[dict[str, Any]] = field(default_factory=list)
+    train_interval: str | None = None
+    horizon: int | None = None
+    warnings: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    next_recommended_action: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "generated_at": self.generated_at,
+            "paper_only": self.paper_only,
+            "execution_enabled": self.execution_enabled,
+            "command": self.command,
+            "safety_statement": self.safety_statement,
+            "date": self.date,
+            "coins": self.coins,
+            "chunks": self.chunks,
+            "chunks_completed": self.chunks_completed,
+            "chunks_failed": self.chunks_failed,
+            "chunks_skipped": self.chunks_skipped,
+            "per_chunk_report_paths": self.per_chunk_report_paths,
+            "train_interval": self.train_interval,
+            "horizon": self.horizon,
+            "warnings": self.warnings,
+            "failures": self.failures,
+            "next_recommended_action": self.next_recommended_action,
+        }
+
+
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
 
@@ -176,6 +224,67 @@ def _days_in_range(start: str, end: str) -> int:
 
 def _batch_key(date: str, hours: list[str]) -> tuple[str, tuple[str, ...]]:
     return date, tuple(sorted(hours, key=int))
+
+
+def _validate_hour_in_range(hour: int, *, label: str = "hour") -> int:
+    if not isinstance(hour, int) or hour < 0 or hour > 23:
+        raise ValueError(f"{label} must be an integer between 0 and 23, got {hour!r}")
+    return hour
+
+
+def validate_batch_series_hours(
+    *,
+    start_hour: int,
+    end_hour: int,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+    allow_more: bool = False,
+) -> None:
+    """Validate bounded hour-range parameters for run-batch-series."""
+    start = _validate_hour_in_range(start_hour, label="start-hour")
+    end = _validate_hour_in_range(end_hour, label="end-hour")
+    if start > end:
+        raise ValueError(
+            f"start-hour {start} must be less than or equal to end-hour {end}"
+        )
+
+    if chunk_size_hours < 1:
+        raise ValueError(f"chunk-size-hours must be at least 1, got {chunk_size_hours}")
+
+    max_chunk = MAX_CHUNK_SIZE_HOURS
+    if chunk_size_hours > max_chunk and not allow_more:
+        raise ValueError(
+            f"chunk-size-hours {chunk_size_hours} exceeds max {max_chunk}; "
+            "pass --allow-more to proceed"
+        )
+
+    total_hours = end - start + 1
+    max_total = MAX_TOTAL_HOURS_ALLOW_MORE if allow_more else MAX_TOTAL_HOURS_PER_RUN
+    if total_hours > max_total:
+        raise ValueError(
+            f"hour range spans {total_hours} hours (max {max_total}"
+            f"{'' if allow_more else '; pass --allow-more for up to 24 hours'})"
+        )
+
+
+def split_hour_range_into_chunks(
+    start_hour: int,
+    end_hour: int,
+    chunk_size_hours: int,
+) -> list[list[str]]:
+    """Split [start_hour, end_hour] into bounded chunks of hour strings."""
+    validate_batch_series_hours(
+        start_hour=start_hour,
+        end_hour=end_hour,
+        chunk_size_hours=chunk_size_hours,
+        allow_more=True,
+    )
+    chunks: list[list[str]] = []
+    current = start_hour
+    while current <= end_hour:
+        chunk_end = min(current + chunk_size_hours - 1, end_hour)
+        chunks.append([str(h) for h in range(current, chunk_end + 1)])
+        current = chunk_end + 1
+    return chunks
 
 
 def _hours_completed_for_date(state: SchedulerState, date: str) -> set[str]:
@@ -265,6 +374,79 @@ def write_scheduler_report(
     lines.extend(["", report.safety_statement, ""])
     md_path.write_text("\n".join(lines), encoding="utf-8")
     return json_path, md_path
+
+
+def write_batch_series_report(
+    report: BatchSeriesReport,
+    *,
+    runs_dir: Path = DEFAULT_RUNS_DIR,
+) -> tuple[Path, Path]:
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    stamp = report.generated_at.replace(":", "").replace("-", "").replace(".", "")
+    json_path = runs_dir / f"bid_ask_scheduler_batch_series_{stamp}.json"
+    md_path = runs_dir / f"bid_ask_scheduler_batch_series_{stamp}.md"
+
+    json_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+
+    lines = [
+        "# Bid/Ask Research Scheduler Batch Series Report",
+        "",
+        f"- generated_at: {report.generated_at}",
+        f"- paper_only: {report.paper_only}",
+        f"- execution_enabled: {report.execution_enabled}",
+        f"- command: {report.command}",
+        f"- date: {report.date}",
+        f"- coins: {', '.join(report.coins) or 'none'}",
+        f"- chunks_completed: {report.chunks_completed}",
+        f"- chunks_failed: {report.chunks_failed}",
+        f"- chunks_skipped: {report.chunks_skipped}",
+    ]
+    if report.train_interval:
+        lines.append(f"- train_interval: {report.train_interval}")
+    if report.horizon is not None:
+        lines.append(f"- horizon: {report.horizon}")
+
+    lines.extend(["", "## Chunks", ""])
+    for chunk in report.chunks:
+        lines.append(f"- [{', '.join(chunk)}]")
+
+    if report.per_chunk_report_paths:
+        lines.extend(["", "## Per-chunk reports", ""])
+        for entry in report.per_chunk_report_paths:
+            hours = entry.get("hours") or []
+            json_report = entry.get("json")
+            md_report = entry.get("markdown")
+            lines.append(f"- hours {', '.join(str(h) for h in hours)}: {json_report}")
+            if md_report:
+                lines.append(f"  - markdown: {md_report}")
+
+    if report.warnings:
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in report.warnings)
+
+    if report.failures:
+        lines.extend(["", "## Failures", ""])
+        lines.extend(f"- {failure}" for failure in report.failures)
+
+    if report.next_recommended_action:
+        lines.extend(["", "## Next recommended action", "", f"- {report.next_recommended_action}"])
+
+    lines.extend(["", report.safety_statement, ""])
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return json_path, md_path
+
+
+def _chunk_completed_in_state(
+    state: SchedulerState,
+    date: str,
+    hours: list[str],
+) -> bool:
+    batch_key = _batch_key(date, hours)
+    existing_keys = {
+        _batch_key(str(b.get("date")), [str(h) for h in b.get("hours") or []])
+        for b in state.completed_batches
+    }
+    return batch_key in existing_keys
 
 
 def _count_downloaded_files(batch_report: orchestrator.OrchestratorReport) -> int:
@@ -403,6 +585,7 @@ def cmd_historical_backfill_next(
     *,
     coins: list[str] | None = None,
     hours: list[int] | None = None,
+    date: str | None = None,
     max_files: int | None = None,
     allow_more: bool = False,
     all_time: bool = False,
@@ -435,7 +618,7 @@ def cmd_historical_backfill_next(
         horizon=horizon,
     )
 
-    if not state.next_historical_date:
+    if not state.next_historical_date and not date:
         report.warnings.append("No next historical date; backfill may be complete")
         report.next_recommended_action = "python3 bid_ask_research_scheduler.py status"
         json_path, _ = write_scheduler_report(report, runs_dir=runs_dir, label="backfill_skip")
@@ -444,7 +627,7 @@ def cmd_historical_backfill_next(
         save_state(state, state_path)
         return report
 
-    target_date = validate_date_yyyymmdd(state.next_historical_date)
+    target_date = validate_date_yyyymmdd(date or state.next_historical_date)
     batch_key = _batch_key(target_date, normalized_hours)
 
     existing_keys = {
@@ -537,6 +720,7 @@ def cmd_daily_cycle(
     *,
     coins: list[str] | None = None,
     historical_hours: list[int] | None = None,
+    date: str | None = None,
     max_files: int | None = None,
     allow_more: bool = False,
     aws_profile: str | None = None,
@@ -566,6 +750,7 @@ def cmd_daily_cycle(
     backfill_report = cmd_historical_backfill_next(
         coins=normalized_coins,
         hours=historical_hours,
+        date=date,
         max_files=max_files,
         allow_more=allow_more,
         aws_profile=aws_profile,
@@ -676,6 +861,130 @@ def cmd_daily_cycle(
     save_state(state, state_path)
     report.details["scheduler_report_paths"] = {"json": str(json_path), "markdown": str(md_path)}
     return report
+
+
+def cmd_run_batch_series(
+    *,
+    date: str,
+    start_hour: int,
+    end_hour: int,
+    coins: list[str] | None = None,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+    allow_more: bool = False,
+    continue_on_error: bool = False,
+    aws_profile: str | None = None,
+    requester_pays: bool = False,
+    train_interval: str = "15s",
+    horizon: int = 5,
+    include_combined: bool = False,
+    max_files: int | None = None,
+    data_root: Path = orchestrator.DEFAULT_DATA_ROOT,
+    orchestrator_report_dir: Path = orchestrator.DEFAULT_REPORT_DIR,
+    state_path: Path = DEFAULT_STATE_PATH,
+    runs_dir: Path = DEFAULT_RUNS_DIR,
+    daily_summary_dir: Path = bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
+    s3_client: Any | None = None,
+) -> BatchSeriesReport:
+    """Run multiple bounded daily-cycle chunks sequentially for one date."""
+    orchestrator.reject_all_time(all_time=False)
+    validate_batch_series_hours(
+        start_hour=start_hour,
+        end_hour=end_hour,
+        chunk_size_hours=chunk_size_hours,
+        allow_more=allow_more,
+    )
+
+    target_date = validate_date_yyyymmdd(date)
+    state = load_state(state_path)
+    normalized_coins = orchestrator._normalize_coins(coins or state.coins)
+    hour_chunks = split_hour_range_into_chunks(start_hour, end_hour, chunk_size_hours)
+
+    series_report = BatchSeriesReport(
+        date=target_date,
+        coins=normalized_coins,
+        chunks=hour_chunks,
+        train_interval=train_interval,
+        horizon=horizon,
+    )
+
+    stopped_early = False
+    for chunk_hours in hour_chunks:
+        if stopped_early:
+            break
+
+        state = load_state(state_path)
+        if _chunk_completed_in_state(state, target_date, chunk_hours):
+            series_report.chunks_skipped += 1
+            series_report.warnings.append(
+                f"Chunk hours {', '.join(chunk_hours)} already completed for "
+                f"{target_date}; skipping"
+            )
+            continue
+
+        chunk_report = cmd_daily_cycle(
+            coins=normalized_coins,
+            historical_hours=chunk_int_hours,
+            date=target_date,
+            max_files=max_files,
+            allow_more=allow_more,
+            aws_profile=aws_profile,
+            requester_pays=requester_pays,
+            train_interval=train_interval,
+            horizon=horizon,
+            include_combined=include_combined,
+            data_root=data_root,
+            orchestrator_report_dir=orchestrator_report_dir,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=daily_summary_dir,
+            s3_client=s3_client,
+        )
+
+        chunk_paths = (chunk_report.details or {}).get("scheduler_report_paths") or {}
+        per_chunk_entry: dict[str, Any] = {
+            "hours": chunk_hours,
+            "json": chunk_paths.get("json"),
+            "markdown": chunk_paths.get("markdown"),
+        }
+        series_report.per_chunk_report_paths.append(per_chunk_entry)
+
+        if chunk_report.failures:
+            series_report.chunks_failed += 1
+            series_report.failures.extend(chunk_report.failures)
+            series_report.warnings.extend(chunk_report.warnings)
+            if not continue_on_error:
+                stopped_early = True
+                series_report.warnings.append(
+                    f"Stopped batch series after failed chunk hours {', '.join(chunk_hours)}"
+                )
+        else:
+            series_report.chunks_completed += 1
+            series_report.warnings.extend(chunk_report.warnings)
+
+    if series_report.chunks_failed:
+        series_report.next_recommended_action = (
+            "Review failures, fix tooling/network, then rerun run-batch-series "
+            f"--date {target_date} --start-hour {start_hour} --end-hour {end_hour}"
+        )
+    elif series_report.chunks_completed == len(hour_chunks):
+        series_report.next_recommended_action = "python3 bid_ask_research_scheduler.py status"
+    elif series_report.chunks_skipped == len(hour_chunks):
+        series_report.next_recommended_action = (
+            f"All chunks already completed for {target_date}; advance to next date or hours"
+        )
+    else:
+        series_report.next_recommended_action = (
+            "python3 bid_ask_research_scheduler.py run-batch-series "
+            f"--date {target_date} --coins {' '.join(normalized_coins)} "
+            f"--start-hour {start_hour} --end-hour {end_hour}"
+        )
+
+    json_path, md_path = write_batch_series_report(series_report, runs_dir=runs_dir)
+    state = load_state(state_path)
+    state.last_report_path = str(json_path)
+    state.last_run_at = _utc_now_iso()
+    save_state(state, state_path)
+    return series_report
 
 
 def cmd_live_long_session(
@@ -898,6 +1207,37 @@ def build_parser() -> argparse.ArgumentParser:
         default=bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
     )
 
+    batch_series = subparsers.add_parser(
+        "run-batch-series",
+        help="Run multiple bounded daily-cycle chunks for one date",
+    )
+    batch_series.add_argument("--date", required=True, help="YYYYMMDD")
+    batch_series.add_argument("--start-hour", type=int, required=True)
+    batch_series.add_argument("--end-hour", type=int, required=True)
+    batch_series.add_argument("--coins", nargs="+", default=None)
+    batch_series.add_argument(
+        "--chunk-size-hours",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE_HOURS,
+    )
+    batch_series.add_argument("--allow-more", action="store_true")
+    batch_series.add_argument("--continue-on-error", action="store_true")
+    batch_series.add_argument("--aws-profile", default=None)
+    batch_series.add_argument("--requester-pays", action="store_true")
+    batch_series.add_argument("--train-interval", default="15s", choices=["15s", "1m"])
+    batch_series.add_argument("--horizon", type=int, default=5)
+    batch_series.add_argument("--include-combined", action="store_true")
+    batch_series.add_argument("--max-files", type=int, default=None)
+    batch_series.add_argument("--data-root", type=Path, default=orchestrator.DEFAULT_DATA_ROOT)
+    batch_series.add_argument("--report-dir", type=Path, default=orchestrator.DEFAULT_REPORT_DIR)
+    batch_series.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    batch_series.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR)
+    batch_series.add_argument(
+        "--daily-summary-dir",
+        type=Path,
+        default=bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
+    )
+
     live = subparsers.add_parser("live-long-session", help="Finite live recorder session")
     live.add_argument("--coins", nargs="+", required=True)
     live.add_argument("--duration-seconds", type=float, required=True)
@@ -989,6 +1329,35 @@ def main(argv: list[str] | None = None) -> int:
                 daily_summary_dir=args.daily_summary_dir,
             )
             print(f"Daily cycle complete: workflows={report.workflows_run}")
+            if report.next_recommended_action:
+                print(f"Next: {report.next_recommended_action}")
+        elif args.command == "run-batch-series":
+            report = cmd_run_batch_series(
+                date=args.date,
+                start_hour=args.start_hour,
+                end_hour=args.end_hour,
+                coins=args.coins,
+                chunk_size_hours=args.chunk_size_hours,
+                allow_more=args.allow_more,
+                continue_on_error=args.continue_on_error,
+                aws_profile=args.aws_profile,
+                requester_pays=args.requester_pays,
+                train_interval=args.train_interval,
+                horizon=args.horizon,
+                include_combined=args.include_combined,
+                max_files=args.max_files,
+                data_root=args.data_root,
+                orchestrator_report_dir=args.report_dir,
+                state_path=args.state_path,
+                runs_dir=args.runs_dir,
+                daily_summary_dir=args.daily_summary_dir,
+            )
+            print(
+                "Batch series complete: "
+                f"completed={report.chunks_completed} "
+                f"failed={report.chunks_failed} "
+                f"skipped={report.chunks_skipped}"
+            )
             if report.next_recommended_action:
                 print(f"Next: {report.next_recommended_action}")
         elif args.command == "live-long-session":

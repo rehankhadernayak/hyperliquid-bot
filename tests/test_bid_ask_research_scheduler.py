@@ -476,6 +476,251 @@ class TestDailyCycle:
         assert saved["filter_report_paths"] == ["reports/bid_ask_decision_filters/filter.json"]
 
 
+class TestSplitHourRange:
+    def test_splits_15_to_23_into_three_chunks(self) -> None:
+        chunks = scheduler.split_hour_range_into_chunks(15, 23, 3)
+        assert chunks == [["15", "16", "17"], ["18", "19", "20"], ["21", "22", "23"]]
+
+
+class TestBatchSeriesValidation:
+    def test_rejects_invalid_hour_range(self) -> None:
+        with pytest.raises(ValueError, match="start-hour"):
+            scheduler.validate_batch_series_hours(start_hour=-1, end_hour=5, chunk_size_hours=3)
+        with pytest.raises(ValueError, match="end-hour"):
+            scheduler.validate_batch_series_hours(start_hour=0, end_hour=24, chunk_size_hours=3)
+        with pytest.raises(ValueError, match="less than or equal"):
+            scheduler.validate_batch_series_hours(start_hour=10, end_hour=5, chunk_size_hours=3)
+
+    def test_rejects_too_many_total_hours_without_allow_more(self) -> None:
+        with pytest.raises(ValueError, match="hour range spans"):
+            scheduler.validate_batch_series_hours(
+                start_hour=0,
+                end_hour=23,
+                chunk_size_hours=3,
+                allow_more=False,
+            )
+
+    def test_allows_up_to_24_hours_with_allow_more(self) -> None:
+        scheduler.validate_batch_series_hours(
+            start_hour=0,
+            end_hour=23,
+            chunk_size_hours=3,
+            allow_more=True,
+        )
+
+    def test_rejects_too_large_chunk_size_without_allow_more(self) -> None:
+        with pytest.raises(ValueError, match="chunk-size-hours"):
+            scheduler.validate_batch_series_hours(
+                start_hour=0,
+                end_hour=8,
+                chunk_size_hours=9,
+                allow_more=False,
+            )
+
+
+def _mock_daily_cycle_success(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    runs_dir: Path,
+) -> list[list[int]]:
+    captured_hours: list[list[int]] = []
+
+    def fake_daily_cycle(**kwargs: object) -> scheduler.SchedulerReport:
+        hours = kwargs.get("historical_hours") or []
+        captured_hours.append(list(hours))
+        runs_dir.mkdir(parents=True, exist_ok=True)
+        json_path = runs_dir / f"daily_{'-'.join(str(h) for h in hours)}.json"
+        md_path = runs_dir / f"daily_{'-'.join(str(h) for h in hours)}.md"
+        json_path.write_text("{}", encoding="utf-8")
+        md_path.write_text("# daily", encoding="utf-8")
+        return scheduler.SchedulerReport(
+            workflows_run=["daily-cycle"],
+            historical_date=str(kwargs.get("date")),
+            historical_hours=[str(h) for h in hours],
+            details={
+                "scheduler_report_paths": {
+                    "json": str(json_path),
+                    "markdown": str(md_path),
+                }
+            },
+        )
+
+    monkeypatch.setattr(scheduler, "cmd_daily_cycle", fake_daily_cycle)
+    return captured_hours
+
+
+class TestRunBatchSeries:
+    def test_runs_three_chunks_for_15_to_23(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        runs_dir = tmp_path / "runs"
+        captured = _mock_daily_cycle_success(monkeypatch, runs_dir=runs_dir)
+
+        report = scheduler.cmd_run_batch_series(
+            date="20230916",
+            start_hour=15,
+            end_hour=23,
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        assert captured == [[15, 16, 17], [18, 19, 20], [21, 22, 23]]
+        assert report.chunks == [["15", "16", "17"], ["18", "19", "20"], ["21", "22", "23"]]
+        assert report.chunks_completed == 3
+        assert report.chunks_failed == 0
+        assert len(report.per_chunk_report_paths) == 3
+
+    def test_stops_on_first_failed_chunk_by_default(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        runs_dir = tmp_path / "runs"
+        calls: list[list[int]] = []
+
+        def fake_daily_cycle(**kwargs: object) -> scheduler.SchedulerReport:
+            hours = list(kwargs.get("historical_hours") or [])
+            calls.append(hours)
+            report = scheduler.SchedulerReport(
+                workflows_run=["daily-cycle"],
+                historical_hours=[str(h) for h in hours],
+            )
+            if hours == [15, 16, 17]:
+                report.failures.append("simulated chunk failure")
+            else:
+                report.details["scheduler_report_paths"] = {
+                    "json": str(runs_dir / "ok.json"),
+                    "markdown": str(runs_dir / "ok.md"),
+                }
+            return report
+
+        monkeypatch.setattr(scheduler, "cmd_daily_cycle", fake_daily_cycle)
+
+        report = scheduler.cmd_run_batch_series(
+            date="20230916",
+            start_hour=15,
+            end_hour=23,
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        assert calls == [[15, 16, 17]]
+        assert report.chunks_failed == 1
+        assert report.chunks_completed == 0
+        assert any("Stopped batch series" in w for w in report.warnings)
+
+    def test_continues_with_continue_on_error(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        runs_dir = tmp_path / "runs"
+        calls: list[list[int]] = []
+
+        def fake_daily_cycle(**kwargs: object) -> scheduler.SchedulerReport:
+            hours = list(kwargs.get("historical_hours") or [])
+            calls.append(hours)
+            report = scheduler.SchedulerReport(
+                workflows_run=["daily-cycle"],
+                historical_hours=[str(h) for h in hours],
+                details={
+                    "scheduler_report_paths": {
+                        "json": str(runs_dir / f"{hours[0]}.json"),
+                        "markdown": str(runs_dir / f"{hours[0]}.md"),
+                    }
+                },
+            )
+            if hours == [15, 16, 17]:
+                report.failures.append("simulated chunk failure")
+            return report
+
+        monkeypatch.setattr(scheduler, "cmd_daily_cycle", fake_daily_cycle)
+
+        report = scheduler.cmd_run_batch_series(
+            date="20230916",
+            start_hour=15,
+            end_hour=23,
+            chunk_size_hours=3,
+            continue_on_error=True,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        assert calls == [[15, 16, 17], [18, 19, 20], [21, 22, 23]]
+        assert report.chunks_failed == 1
+        assert report.chunks_completed == 2
+
+    def test_skips_already_completed_chunk(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        state = scheduler.load_state(state_path)
+        state.completed_batches.append(
+            {"date": "20230916", "hours": ["15", "16", "17"], "completed_at": "2026-01-01T00:00:00Z"}
+        )
+        scheduler.save_state(state, state_path)
+        runs_dir = tmp_path / "runs"
+        captured = _mock_daily_cycle_success(monkeypatch, runs_dir=runs_dir)
+
+        report = scheduler.cmd_run_batch_series(
+            date="20230916",
+            start_hour=15,
+            end_hour=23,
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        assert captured == [[18, 19, 20], [21, 22, 23]]
+        assert report.chunks_skipped == 1
+        assert report.chunks_completed == 2
+        assert any("already completed" in w for w in report.warnings)
+
+    def test_series_report_includes_safety_fields_and_chunk_paths(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        runs_dir = tmp_path / "runs"
+        _mock_daily_cycle_success(monkeypatch, runs_dir=runs_dir)
+
+        report = scheduler.cmd_run_batch_series(
+            date="20230916",
+            start_hour=15,
+            end_hour=17,
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        state = scheduler.load_state(state_path)
+        saved = json.loads(Path(state.last_report_path).read_text(encoding="utf-8"))
+        assert saved["paper_only"] is True
+        assert saved["execution_enabled"] is False
+        assert saved["command"] == "run-batch-series"
+        assert saved["per_chunk_report_paths"]
+        assert all(entry.get("json") for entry in saved["per_chunk_report_paths"])
+        assert report.chunks_completed == 1
+        series_json = Path(state.last_report_path)
+        series_md = series_json.with_name(series_json.stem + ".md")
+        assert series_json.is_file()
+        assert series_md.is_file()
+
 
 class TestLiveLongSession:
     def test_requires_finite_duration(self, tmp_path: Path) -> None:

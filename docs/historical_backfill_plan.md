@@ -396,6 +396,49 @@ python3 bid_ask_research_scheduler.py daily-cycle \
 Runs: historical backfill → resample/validate → train/evaluate → daily summary.
 Optional `--include-combined` merges local + historical before a combined train pass.
 
+### Batch series (multiple hour chunks)
+
+Run several bounded daily-cycle chunks in one command for a single date:
+
+```bash
+python3 bid_ask_research_scheduler.py run-batch-series \
+  --coins BTC ETH SOL \
+  --aws-profile hyperliquid-research \
+  --requester-pays \
+  --date 20230916 \
+  --start-hour 15 \
+  --end-hour 23 \
+  --chunk-size-hours 3 \
+  --train-interval 15s \
+  --horizon 5
+```
+
+Example split for `--start-hour 15 --end-hour 23 --chunk-size-hours 3`:
+
+- `[15, 16, 17]`
+- `[18, 19, 20]`
+- `[21, 22, 23]`
+
+Each chunk runs the same workflow as `daily-cycle` (backfill → resample/validate →
+train/evaluate → daily summary). Individual chunk reports are preserved under
+`reports/bid_ask_research_scheduler/runs/`; a series-level JSON/Markdown report is
+written after all chunks finish or the series stops on failure.
+
+Limits (research safety caps):
+
+| Limit | Default | With `--allow-more` |
+| --- | --- | --- |
+| `chunk-size-hours` | 3 (default) | max 8 |
+| Total hours per run | max 12 | max 24 |
+| Hour range | 0–23 inclusive | same |
+
+Behavior:
+
+- Already-completed chunks are skipped with a warning; the series continues.
+- On chunk failure: stop by default; pass `--continue-on-error` to proceed.
+- Optional `--include-combined` runs combined dataset + train after each chunk (default off).
+- No `--all-time` support.
+
 ### macOS launchd template (manual install)
 
 ```bash
