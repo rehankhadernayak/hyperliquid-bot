@@ -49,6 +49,82 @@ AUTO_BACKFILL_COMPLETE_MESSAGE = "Historical backfill range complete; no chunks 
 REPAIR_INFERRED_WARNING = (
     "Repair inferred completion from existing data; re-validate before production use."
 )
+AUTOPILOT_FAILURE_PAUSE_THRESHOLD = 3
+AUTOPILOT_DISABLED_MESSAGE = "Autopilot is disabled; no work performed."
+AUTOPILOT_PAUSED_MESSAGE = "Autopilot is paused; no work performed."
+LAUNCHD_PLIST_NAME_AUTOPILOT = "com.hyperliquid.research.autopilot.plist"
+
+
+@dataclass
+class AutopilotState:
+    enabled: bool = False
+    started_at: str | None = None
+    last_run_date: str | None = None
+    last_success_date: str | None = None
+    runs_today: int = 0
+    chunks_completed_today: int = 0
+    files_downloaded_today: int = 0
+    daily_chunk_limit: int = 1
+    daily_file_limit: int = 9
+    ramp_enabled: bool = True
+    ramp_every_successful_days: int = 2
+    ramp_chunk_increment: int = 1
+    max_daily_chunk_limit: int = 4
+    max_daily_file_limit: int = 36
+    successful_days_in_row: int = 0
+    failed_runs_in_row: int = 0
+    paused: bool = False
+    pause_reason: str | None = None
+    last_autopilot_report_path: str | None = None
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "enabled": self.enabled,
+            "started_at": self.started_at,
+            "last_run_date": self.last_run_date,
+            "last_success_date": self.last_success_date,
+            "runs_today": self.runs_today,
+            "chunks_completed_today": self.chunks_completed_today,
+            "files_downloaded_today": self.files_downloaded_today,
+            "daily_chunk_limit": self.daily_chunk_limit,
+            "daily_file_limit": self.daily_file_limit,
+            "ramp_enabled": self.ramp_enabled,
+            "ramp_every_successful_days": self.ramp_every_successful_days,
+            "ramp_chunk_increment": self.ramp_chunk_increment,
+            "max_daily_chunk_limit": self.max_daily_chunk_limit,
+            "max_daily_file_limit": self.max_daily_file_limit,
+            "successful_days_in_row": self.successful_days_in_row,
+            "failed_runs_in_row": self.failed_runs_in_row,
+            "paused": self.paused,
+            "pause_reason": self.pause_reason,
+            "last_autopilot_report_path": self.last_autopilot_report_path,
+        }
+
+    @classmethod
+    def from_dict(cls, payload: dict[str, Any] | None) -> AutopilotState:
+        if not payload:
+            return cls()
+        return cls(
+            enabled=bool(payload.get("enabled", False)),
+            started_at=payload.get("started_at"),
+            last_run_date=payload.get("last_run_date"),
+            last_success_date=payload.get("last_success_date"),
+            runs_today=int(payload.get("runs_today") or 0),
+            chunks_completed_today=int(payload.get("chunks_completed_today") or 0),
+            files_downloaded_today=int(payload.get("files_downloaded_today") or 0),
+            daily_chunk_limit=int(payload.get("daily_chunk_limit") or 1),
+            daily_file_limit=int(payload.get("daily_file_limit") or 9),
+            ramp_enabled=bool(payload.get("ramp_enabled", True)),
+            ramp_every_successful_days=int(payload.get("ramp_every_successful_days") or 2),
+            ramp_chunk_increment=int(payload.get("ramp_chunk_increment") or 1),
+            max_daily_chunk_limit=int(payload.get("max_daily_chunk_limit") or 4),
+            max_daily_file_limit=int(payload.get("max_daily_file_limit") or 36),
+            successful_days_in_row=int(payload.get("successful_days_in_row") or 0),
+            failed_runs_in_row=int(payload.get("failed_runs_in_row") or 0),
+            paused=bool(payload.get("paused", False)),
+            pause_reason=payload.get("pause_reason"),
+            last_autopilot_report_path=payload.get("last_autopilot_report_path"),
+        )
 
 
 @dataclass
@@ -71,6 +147,7 @@ class SchedulerState:
     next_recommended_action: str | None = None
     warnings: list[str] = field(default_factory=list)
     coins: list[str] = field(default_factory=list)
+    autopilot: AutopilotState = field(default_factory=AutopilotState)
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -92,6 +169,7 @@ class SchedulerState:
             "next_recommended_action": self.next_recommended_action,
             "warnings": self.warnings,
             "coins": self.coins,
+            "autopilot": self.autopilot.to_dict(),
         }
 
     @classmethod
@@ -123,7 +201,58 @@ class SchedulerState:
             next_recommended_action=payload.get("next_recommended_action"),
             warnings=list(payload.get("warnings") or []),
             coins=list(payload.get("coins") or []),
+            autopilot=AutopilotState.from_dict(payload.get("autopilot")),
         )
+
+
+@dataclass
+class AutopilotReport:
+    generated_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
+    paper_only: bool = True
+    execution_enabled: bool = False
+    command: str = "autopilot-tick"
+    safety_statement: str = SAFETY_STATEMENT
+    action: str = "noop"
+    coins: list[str] = field(default_factory=list)
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS
+    estimated_files: int = 0
+    files_downloaded: int = 0
+    autopilot_snapshot: dict[str, Any] = field(default_factory=dict)
+    workflows_run: list[str] = field(default_factory=list)
+    historical_date: str | None = None
+    historical_hours: list[str] = field(default_factory=list)
+    train_interval: str | None = None
+    horizon: int | None = None
+    warnings: list[str] = field(default_factory=list)
+    failures: list[str] = field(default_factory=list)
+    next_recommended_action: str | None = None
+    details: dict[str, Any] = field(default_factory=dict)
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "generated_at": self.generated_at,
+            "paper_only": self.paper_only,
+            "execution_enabled": self.execution_enabled,
+            "command": self.command,
+            "safety_statement": self.safety_statement,
+            "action": self.action,
+            "coins": self.coins,
+            "chunk_size_hours": self.chunk_size_hours,
+            "estimated_files": self.estimated_files,
+            "files_downloaded": self.files_downloaded,
+            "autopilot_snapshot": self.autopilot_snapshot,
+            "workflows_run": self.workflows_run,
+            "historical_date": self.historical_date,
+            "historical_hours": self.historical_hours,
+            "train_interval": self.train_interval,
+            "horizon": self.horizon,
+            "warnings": self.warnings,
+            "failures": self.failures,
+            "next_recommended_action": self.next_recommended_action,
+            "details": self.details,
+        }
 
 
 @dataclass
@@ -228,6 +357,145 @@ class BatchSeriesReport:
 
 def _utc_now_iso() -> str:
     return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
+def _utc_today_yyyymmdd() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%d")
+
+
+def _estimate_chunk_files(num_coins: int, chunk_size_hours: int) -> int:
+    return num_coins * chunk_size_hours
+
+
+def _reset_autopilot_daily_counters(autopilot: AutopilotState, today: str) -> None:
+    autopilot.runs_today = 0
+    autopilot.chunks_completed_today = 0
+    autopilot.files_downloaded_today = 0
+    autopilot.last_run_date = today
+
+
+def _maybe_reset_autopilot_for_new_day(autopilot: AutopilotState) -> None:
+    today = _utc_today_yyyymmdd()
+    if autopilot.last_run_date != today:
+        _reset_autopilot_daily_counters(autopilot, today)
+
+
+def _record_autopilot_success_day(autopilot: AutopilotState, today: str) -> None:
+    """Increment successful_days_in_row once per calendar day on first chunk success."""
+    if autopilot.last_success_date == today:
+        return
+    yesterday = _date_add_days(today, -1)
+    if autopilot.last_success_date == yesterday:
+        autopilot.successful_days_in_row += 1
+    else:
+        autopilot.successful_days_in_row = 1
+    autopilot.last_success_date = today
+
+
+def _maybe_ramp_autopilot_limits(
+    autopilot: AutopilotState,
+    *,
+    chunk_size_hours: int,
+    num_coins: int,
+) -> bool:
+    """Apply ramp when streak threshold met. Returns True if limits were increased."""
+    if not autopilot.ramp_enabled:
+        return False
+    if autopilot.successful_days_in_row < autopilot.ramp_every_successful_days:
+        return False
+    autopilot.daily_chunk_limit = min(
+        autopilot.max_daily_chunk_limit,
+        autopilot.daily_chunk_limit + autopilot.ramp_chunk_increment,
+    )
+    autopilot.daily_file_limit = min(
+        autopilot.max_daily_file_limit,
+        autopilot.daily_chunk_limit * chunk_size_hours * num_coins,
+    )
+    autopilot.successful_days_in_row = 0
+    return True
+
+
+def _autopilot_next_recommended_action(state: SchedulerState, autopilot: AutopilotState) -> str:
+    if autopilot.paused:
+        return (
+            "python3 bid_ask_research_scheduler.py configure-autopilot --resume"
+        )
+    if not autopilot.enabled:
+        return "python3 bid_ask_research_scheduler.py configure-autopilot --enable"
+    if autopilot.chunks_completed_today >= autopilot.daily_chunk_limit:
+        return "Wait until tomorrow or increase daily limits via configure-autopilot"
+    if state.next_historical_date is None:
+        return "python3 bid_ask_research_scheduler.py status"
+    return "python3 bid_ask_research_scheduler.py autopilot-tick"
+
+
+def write_autopilot_report(
+    report: AutopilotReport,
+    *,
+    runs_dir: Path = DEFAULT_RUNS_DIR,
+    label: str = "autopilot",
+) -> tuple[Path, Path]:
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    stamp = report.generated_at.replace(":", "").replace("-", "").replace(".", "")
+    json_path = runs_dir / f"bid_ask_scheduler_{label}_{stamp}.json"
+    md_path = runs_dir / f"bid_ask_scheduler_{label}_{stamp}.md"
+
+    json_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+
+    lines = [
+        "# Bid/Ask Research Scheduler Autopilot Report",
+        "",
+        f"- generated_at: {report.generated_at}",
+        f"- paper_only: {report.paper_only}",
+        f"- execution_enabled: {report.execution_enabled}",
+        f"- command: {report.command}",
+        f"- action: {report.action}",
+        f"- coins: {', '.join(report.coins) or 'none'}",
+        f"- chunk_size_hours: {report.chunk_size_hours}",
+        f"- estimated_files: {report.estimated_files}",
+        f"- files_downloaded: {report.files_downloaded}",
+    ]
+    if report.historical_date:
+        lines.append(f"- historical_date: {report.historical_date}")
+    if report.historical_hours:
+        lines.append(f"- historical_hours: {', '.join(report.historical_hours)}")
+    if report.train_interval:
+        lines.append(f"- train_interval: {report.train_interval}")
+    if report.horizon is not None:
+        lines.append(f"- horizon: {report.horizon}")
+
+    ap = report.autopilot_snapshot
+    if ap:
+        lines.extend(
+            [
+                "",
+                "## Autopilot state",
+                "",
+                f"- enabled: {ap.get('enabled')}",
+                f"- paused: {ap.get('paused')}",
+                f"- daily_chunk_limit: {ap.get('daily_chunk_limit')}",
+                f"- daily_file_limit: {ap.get('daily_file_limit')}",
+                f"- chunks_completed_today: {ap.get('chunks_completed_today')}",
+                f"- files_downloaded_today: {ap.get('files_downloaded_today')}",
+                f"- successful_days_in_row: {ap.get('successful_days_in_row')}",
+                f"- failed_runs_in_row: {ap.get('failed_runs_in_row')}",
+            ]
+        )
+
+    if report.warnings:
+        lines.extend(["", "## Warnings", ""])
+        lines.extend(f"- {warning}" for warning in report.warnings)
+
+    if report.failures:
+        lines.extend(["", "## Failures", ""])
+        lines.extend(f"- {failure}" for failure in report.failures)
+
+    if report.next_recommended_action:
+        lines.extend(["", "## Next recommended action", "", f"- {report.next_recommended_action}"])
+
+    lines.extend(["", report.safety_statement, ""])
+    md_path.write_text("\n".join(lines), encoding="utf-8")
+    return json_path, md_path
 
 
 def _date_add_days(date: str, days: int) -> str:
@@ -1437,6 +1705,286 @@ def cmd_repair_state_from_existing_data(
     return report
 
 
+def cmd_configure_autopilot(
+    *,
+    enable: bool = False,
+    disable: bool = False,
+    pause_reason: str | None = None,
+    resume: bool = False,
+    daily_chunk_limit: int | None = None,
+    daily_file_limit: int | None = None,
+    ramp_enabled: bool | None = None,
+    ramp_every_successful_days: int | None = None,
+    ramp_chunk_increment: int | None = None,
+    max_daily_chunk_limit: int | None = None,
+    max_daily_file_limit: int | None = None,
+    state_path: Path = DEFAULT_STATE_PATH,
+) -> AutopilotState:
+    """Create or update autopilot config in state without downloading or training."""
+    state = load_state(state_path)
+    autopilot = state.autopilot
+
+    if enable and disable:
+        raise ValueError("pass --enable or --disable, not both")
+    if pause_reason and resume:
+        raise ValueError("pass --pause or --resume, not both")
+
+    if enable:
+        autopilot.enabled = True
+        autopilot.paused = False
+        autopilot.pause_reason = None
+        if autopilot.started_at is None:
+            autopilot.started_at = _utc_now_iso()
+    if disable:
+        autopilot.enabled = False
+    if pause_reason:
+        autopilot.paused = True
+        autopilot.pause_reason = pause_reason
+    if resume:
+        autopilot.paused = False
+        autopilot.pause_reason = None
+        autopilot.failed_runs_in_row = 0
+
+    if daily_chunk_limit is not None:
+        if daily_chunk_limit < 1:
+            raise ValueError("daily-chunk-limit must be at least 1")
+        autopilot.daily_chunk_limit = daily_chunk_limit
+    if daily_file_limit is not None:
+        if daily_file_limit < 1:
+            raise ValueError("daily-file-limit must be at least 1")
+        autopilot.daily_file_limit = daily_file_limit
+    if ramp_enabled is not None:
+        autopilot.ramp_enabled = ramp_enabled
+    if ramp_every_successful_days is not None:
+        if ramp_every_successful_days < 1:
+            raise ValueError("ramp-every-successful-days must be at least 1")
+        autopilot.ramp_every_successful_days = ramp_every_successful_days
+    if ramp_chunk_increment is not None:
+        if ramp_chunk_increment < 1:
+            raise ValueError("ramp-chunk-increment must be at least 1")
+        autopilot.ramp_chunk_increment = ramp_chunk_increment
+    if max_daily_chunk_limit is not None:
+        if max_daily_chunk_limit < 1:
+            raise ValueError("max-daily-chunk-limit must be at least 1")
+        autopilot.max_daily_chunk_limit = max_daily_chunk_limit
+    if max_daily_file_limit is not None:
+        if max_daily_file_limit < 1:
+            raise ValueError("max-daily-file-limit must be at least 1")
+        autopilot.max_daily_file_limit = max_daily_file_limit
+
+    if autopilot.daily_chunk_limit > autopilot.max_daily_chunk_limit:
+        raise ValueError(
+            f"daily_chunk_limit {autopilot.daily_chunk_limit} exceeds "
+            f"max_daily_chunk_limit {autopilot.max_daily_chunk_limit}"
+        )
+    if autopilot.daily_file_limit > autopilot.max_daily_file_limit:
+        raise ValueError(
+            f"daily_file_limit {autopilot.daily_file_limit} exceeds "
+            f"max_daily_file_limit {autopilot.max_daily_file_limit}"
+        )
+
+    state.autopilot = autopilot
+    save_state(state, state_path)
+    return autopilot
+
+
+def cmd_autopilot_status(*, state_path: Path = DEFAULT_STATE_PATH) -> dict[str, Any]:
+    """Return printable autopilot status snapshot."""
+    state = load_state(state_path)
+    autopilot = state.autopilot
+    return {
+        "enabled": autopilot.enabled,
+        "paused": autopilot.paused,
+        "pause_reason": autopilot.pause_reason,
+        "started_at": autopilot.started_at,
+        "last_run_date": autopilot.last_run_date,
+        "daily_chunk_limit": autopilot.daily_chunk_limit,
+        "daily_file_limit": autopilot.daily_file_limit,
+        "runs_today": autopilot.runs_today,
+        "chunks_completed_today": autopilot.chunks_completed_today,
+        "files_downloaded_today": autopilot.files_downloaded_today,
+        "ramp_enabled": autopilot.ramp_enabled,
+        "ramp_every_successful_days": autopilot.ramp_every_successful_days,
+        "ramp_chunk_increment": autopilot.ramp_chunk_increment,
+        "max_daily_chunk_limit": autopilot.max_daily_chunk_limit,
+        "max_daily_file_limit": autopilot.max_daily_file_limit,
+        "successful_days_in_row": autopilot.successful_days_in_row,
+        "failed_runs_in_row": autopilot.failed_runs_in_row,
+        "next_recommended_action": _autopilot_next_recommended_action(state, autopilot),
+        "latest_report": autopilot.last_autopilot_report_path,
+    }
+
+
+def _finalize_autopilot_report(
+    report: AutopilotReport,
+    state: SchedulerState,
+    *,
+    state_path: Path,
+    runs_dir: Path,
+) -> AutopilotReport:
+    report.autopilot_snapshot = state.autopilot.to_dict()
+    report.next_recommended_action = _autopilot_next_recommended_action(state, state.autopilot)
+    json_path, md_path = write_autopilot_report(report, runs_dir=runs_dir, label="autopilot")
+    state.autopilot.last_autopilot_report_path = str(json_path)
+    save_state(state, state_path)
+    report.details["scheduler_report_paths"] = {"json": str(json_path), "markdown": str(md_path)}
+    return report
+
+
+def cmd_autopilot_tick(
+    *,
+    coins: list[str] | None = None,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+    max_files: int | None = None,
+    allow_more: bool = False,
+    aws_profile: str | None = None,
+    requester_pays: bool = False,
+    train_interval: str = "15s",
+    horizon: int = 5,
+    include_combined: bool = False,
+    data_root: Path = orchestrator.DEFAULT_DATA_ROOT,
+    orchestrator_report_dir: Path = orchestrator.DEFAULT_REPORT_DIR,
+    state_path: Path = DEFAULT_STATE_PATH,
+    runs_dir: Path = DEFAULT_RUNS_DIR,
+    daily_summary_dir: Path = bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
+    s3_client: Any | None = None,
+    today_override: str | None = None,
+) -> AutopilotReport:
+    """Run one bounded autopilot tick: check limits, auto-backfill-next, update state, exit."""
+    orchestrator.reject_all_time(all_time=False)
+    state = load_state(state_path)
+    autopilot = state.autopilot
+    normalized_coins = orchestrator._normalize_coins(coins or state.coins)
+    today = today_override or _utc_today_yyyymmdd()
+    estimated_files = _estimate_chunk_files(len(normalized_coins), chunk_size_hours)
+
+    report = AutopilotReport(
+        coins=normalized_coins,
+        chunk_size_hours=chunk_size_hours,
+        estimated_files=estimated_files,
+        train_interval=train_interval,
+        horizon=horizon,
+    )
+
+    if not autopilot.enabled:
+        report.action = "disabled"
+        report.warnings.append(AUTOPILOT_DISABLED_MESSAGE)
+        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+
+    if autopilot.paused:
+        report.action = "paused"
+        report.warnings.append(
+            f"{AUTOPILOT_PAUSED_MESSAGE} Reason: {autopilot.pause_reason or 'unspecified'}"
+        )
+        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+
+    if autopilot.last_run_date != today:
+        _reset_autopilot_daily_counters(autopilot, today)
+
+    if autopilot.chunks_completed_today >= autopilot.daily_chunk_limit:
+        report.action = "daily_chunk_limit_reached"
+        report.warnings.append(
+            f"Daily chunk limit reached ({autopilot.chunks_completed_today}/"
+            f"{autopilot.daily_chunk_limit}); skipping chunk"
+        )
+        state.autopilot = autopilot
+        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+
+    if autopilot.files_downloaded_today + estimated_files > autopilot.daily_file_limit:
+        report.action = "daily_file_limit_reached"
+        report.warnings.append(
+            f"Next chunk would exceed daily file limit "
+            f"({autopilot.files_downloaded_today}+{estimated_files} > "
+            f"{autopilot.daily_file_limit}); skipping chunk"
+        )
+        state.autopilot = autopilot
+        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+
+    save_state(state, state_path)
+
+    backfill_report = cmd_auto_backfill_next(
+        coins=normalized_coins,
+        chunk_size_hours=chunk_size_hours,
+        max_files=max_files,
+        allow_more=allow_more,
+        aws_profile=aws_profile,
+        requester_pays=requester_pays,
+        train_interval=train_interval,
+        horizon=horizon,
+        include_combined=include_combined,
+        data_root=data_root,
+        orchestrator_report_dir=orchestrator_report_dir,
+        state_path=state_path,
+        runs_dir=runs_dir,
+        daily_summary_dir=daily_summary_dir,
+        s3_client=s3_client,
+    )
+
+    state = load_state(state_path)
+    autopilot = state.autopilot
+    report.workflows_run = list(backfill_report.workflows_run)
+    report.historical_date = backfill_report.historical_date
+    report.historical_hours = backfill_report.historical_hours
+    report.warnings.extend(backfill_report.warnings)
+    report.failures.extend(backfill_report.failures)
+    report.details["auto_backfill"] = backfill_report.to_dict()
+
+    autopilot.runs_today += 1
+
+    if any(AUTO_BACKFILL_COMPLETE_MESSAGE in w for w in backfill_report.warnings):
+        report.action = "backfill_complete"
+        report.next_recommended_action = backfill_report.next_recommended_action
+        state.autopilot = autopilot
+        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+
+    chunk_succeeded = _cycle_succeeded(backfill_report) and not backfill_report.failures
+
+    if chunk_succeeded:
+        autopilot.chunks_completed_today += 1
+        backfill_details = (backfill_report.details or {}).get("historical_backfill") or {}
+        if isinstance(backfill_details, dict):
+            orch_batch = (backfill_details.get("details") or {}).get("orchestrator_batch") or {}
+            actual_files = _count_downloaded_files(
+                orchestrator.OrchestratorReport(details=orch_batch if isinstance(orch_batch, dict) else {})
+            )
+        else:
+            actual_files = 0
+        files_added = actual_files if actual_files > 0 else estimated_files
+        autopilot.files_downloaded_today += files_added
+        report.files_downloaded = files_added
+        autopilot.failed_runs_in_row = 0
+        _record_autopilot_success_day(autopilot, today)
+        ramped = _maybe_ramp_autopilot_limits(
+            autopilot,
+            chunk_size_hours=chunk_size_hours,
+            num_coins=len(normalized_coins),
+        )
+        report.action = "chunk_completed"
+        if ramped:
+            report.warnings.append(
+                f"Ramp applied: daily_chunk_limit={autopilot.daily_chunk_limit}, "
+                f"daily_file_limit={autopilot.daily_file_limit}"
+            )
+        report.next_recommended_action = backfill_report.next_recommended_action
+    else:
+        autopilot.failed_runs_in_row += 1
+        report.action = "chunk_failed"
+        report.failures.extend(backfill_report.failures or ["chunk did not pass validation"])
+        if autopilot.failed_runs_in_row >= AUTOPILOT_FAILURE_PAUSE_THRESHOLD:
+            autopilot.paused = True
+            autopilot.pause_reason = (
+                f"Paused after {autopilot.failed_runs_in_row} consecutive failed autopilot runs"
+            )
+            report.warnings.append(autopilot.pause_reason)
+        report.next_recommended_action = (
+            "Review failure report, fix data/tooling, then "
+            "configure-autopilot --resume and rerun autopilot-tick"
+        )
+
+    state.autopilot = autopilot
+    return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+
+
 def cmd_write_launchd_template(
     *,
     run_time: str = "02:00",
@@ -1448,6 +1996,8 @@ def cmd_write_launchd_template(
     horizon: int = 5,
     state_dir: Path = DEFAULT_STATE_DIR,
     project_root: Path | None = None,
+    autopilot: bool = False,
+    interval_hours: int | None = None,
 ) -> tuple[Path, Path]:
     """Write macOS launchd plist template and setup instructions (does not install)."""
     normalized_coins = orchestrator._normalize_coins(coins)
@@ -1456,10 +2006,11 @@ def cmd_write_launchd_template(
     scheduler_script = root / "bid_ask_research_scheduler.py"
 
     coin_args = " ".join(normalized_coins)
+    subcommand = "autopilot-tick" if autopilot else "auto-backfill-next"
     cmd_parts = [
         python_path,
         str(scheduler_script),
-        "auto-backfill-next",
+        subcommand,
         "--coins",
         *normalized_coins,
         "--chunk-size-hours",
@@ -1474,28 +2025,40 @@ def cmd_write_launchd_template(
     if requester_pays:
         cmd_parts.append("--requester-pays")
 
-    hour, minute = run_time.split(":")
-    plist_path = state_dir / LAUNCHD_PLIST_NAME
+    plist_name = LAUNCHD_PLIST_NAME_AUTOPILOT if autopilot else LAUNCHD_PLIST_NAME
+    label = "com.hyperliquid.research.autopilot" if autopilot else "com.hyperliquid.research.daily"
+    plist_path = state_dir / plist_name
     state_dir.mkdir(parents=True, exist_ok=True)
+
+    if interval_hours is not None:
+        if interval_hours < 1:
+            raise ValueError("interval-hours must be at least 1")
+        schedule_block = f"""    <key>StartInterval</key>
+    <integer>{interval_hours * 3600}</integer>"""
+        schedule_description = f"every **{interval_hours}** hours"
+    else:
+        hour, minute = run_time.split(":")
+        schedule_block = f"""    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{int(hour)}</integer>
+        <key>Minute</key>
+        <integer>{int(minute)}</integer>
+    </dict>"""
+        schedule_description = f"**{run_time}** local time daily"
 
     plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.hyperliquid.research.daily</string>
+    <string>{label}</string>
     <key>ProgramArguments</key>
     <array>
 {''.join(f'        <string>{part}</string>\n' for part in cmd_parts)}    </array>
     <key>WorkingDirectory</key>
     <string>{root}</string>
-    <key>StartCalendarInterval</key>
-    <dict>
-        <key>Hour</key>
-        <integer>{int(hour)}</integer>
-        <key>Minute</key>
-        <integer>{int(minute)}</integer>
-    </dict>
+{schedule_block}
     <key>StandardOutPath</key>
     <string>{state_dir / 'launchd_stdout.log'}</string>
     <key>StandardErrorPath</key>
@@ -1505,66 +2068,95 @@ def cmd_write_launchd_template(
 """
     plist_path.write_text(plist_content, encoding="utf-8")
 
-    setup_md = state_dir / LAUNCHD_SETUP_MD
+    mode_name = "autopilot-tick" if autopilot else "auto-backfill-next"
+    setup_md = state_dir / (LAUNCHD_SETUP_MD if not autopilot else "launchd_autopilot_setup.md")
     setup_lines = [
         "# macOS launchd Setup for Daily Research Scheduler",
         "",
-        "This template runs `auto-backfill-next` once per schedule tick. "
+        f"This template runs `{mode_name}` once per schedule tick. "
         "Each invocation processes **one bounded chunk** and exits. "
         "It is **not installed automatically**.",
         "",
-        "## Files",
-        "",
-        f"- Plist template: `{plist_path}`",
-        f"- Scheduler state: `{state_dir / 'state.json'}`",
-        f"- Run reports: `{state_dir / 'runs/'}`",
-        "",
-        "## Prerequisites",
-        "",
-        "1. Initialize scheduler state:",
-        "",
-        "```bash",
-        "python3 bid_ask_research_scheduler.py init-state \\",
-        "  --historical-start-date YYYYMMDD \\",
-        "  --historical-end-date YYYYMMDD \\",
-        f"  --coins {coin_args} \\",
-        "  --historical-start-hour 0 \\",
-        "  --historical-end-hour 23",
-        "```",
-        "",
-        "2. Verify a manual auto-backfill chunk succeeds:",
-        "",
-        "```bash",
-        "python3 bid_ask_research_scheduler.py auto-backfill-next \\",
-        f"  --coins {coin_args} \\",
-        f"  --chunk-size-hours {chunk_size_hours} \\",
-        f"  --train-interval {train_interval} \\",
-        f"  --horizon {horizon}",
-        "```",
-        "",
-        "## Install (manual)",
-        "",
-        "```bash",
-        f"cp {plist_path} ~/Library/LaunchAgents/",
-        "launchctl load ~/Library/LaunchAgents/com.hyperliquid.research.daily.plist",
-        "```",
-        "",
-        "## Uninstall",
-        "",
-        "```bash",
-        "launchctl unload ~/Library/LaunchAgents/com.hyperliquid.research.daily.plist",
-        "rm ~/Library/LaunchAgents/com.hyperliquid.research.daily.plist",
-        "```",
-        "",
-        "## Safety",
-        "",
-        "- Research-only, paper-only; no orders or execution endpoints.",
-        "- Each scheduled run processes one bounded chunk and exits (no infinite loop).",
-        "- Archive availability is not guaranteed.",
-        "",
-        f"Scheduled time: **{run_time}** local time.",
-        f"Chunk size: **{chunk_size_hours}** hours; train interval: **{train_interval}**; horizon: **{horizon}**.",
     ]
+    if autopilot:
+        setup_lines.extend(
+            [
+                "Autopilot mode enforces daily chunk/file limits and gradual ramp-up. "
+                "Configure autopilot before loading the plist:",
+                "",
+                "```bash",
+                "python3 bid_ask_research_scheduler.py configure-autopilot \\",
+                "  --enable \\",
+                "  --daily-chunk-limit 1 \\",
+                "  --daily-file-limit 9 \\",
+                "  --ramp-enabled \\",
+                "  --ramp-every-successful-days 2 \\",
+                "  --ramp-chunk-increment 1 \\",
+                "  --max-daily-chunk-limit 4 \\",
+                "  --max-daily-file-limit 36",
+                "```",
+                "",
+                "Set up **AWS Budget alerts** before enabling scheduled downloads.",
+                "",
+            ]
+        )
+
+    setup_lines.extend(
+        [
+            "## Files",
+            "",
+            f"- Plist template: `{plist_path}`",
+            f"- Scheduler state: `{state_dir / 'state.json'}`",
+            f"- Run reports: `{state_dir / 'runs/'}`",
+            "",
+            "## Prerequisites",
+            "",
+            "1. Initialize scheduler state:",
+            "",
+            "```bash",
+            "python3 bid_ask_research_scheduler.py init-state \\",
+            "  --historical-start-date YYYYMMDD \\",
+            "  --historical-end-date YYYYMMDD \\",
+            f"  --coins {coin_args} \\",
+            "  --historical-start-hour 0 \\",
+            "  --historical-end-hour 23",
+            "```",
+            "",
+            f"2. Verify a manual {mode_name} succeeds:",
+            "",
+            "```bash",
+            f"python3 bid_ask_research_scheduler.py {mode_name} \\",
+            f"  --coins {coin_args} \\",
+            f"  --chunk-size-hours {chunk_size_hours} \\",
+            f"  --train-interval {train_interval} \\",
+            f"  --horizon {horizon}",
+            "```",
+            "",
+            "## Install (manual)",
+            "",
+            "```bash",
+            f"cp {plist_path} ~/Library/LaunchAgents/",
+            f"launchctl load ~/Library/LaunchAgents/{plist_name}",
+            "```",
+            "",
+            "## Uninstall",
+            "",
+            "```bash",
+            f"launchctl unload ~/Library/LaunchAgents/{plist_name}",
+            f"rm ~/Library/LaunchAgents/{plist_name}",
+            "```",
+            "",
+            "## Safety",
+            "",
+            "- Research-only, paper-only; no orders or execution endpoints.",
+            "- Each scheduled run processes one bounded chunk and exits (no infinite loop).",
+            "- Archive availability is not guaranteed.",
+            "- Use AWS Budget alerts; requester-pays downloads incur charges.",
+            "",
+            f"Schedule: {schedule_description}.",
+            f"Chunk size: **{chunk_size_hours}** hours; train interval: **{train_interval}**; horizon: **{horizon}**.",
+        ]
+    )
     setup_md.write_text("\n".join(setup_lines) + "\n", encoding="utf-8")
     return plist_path, setup_md
 
@@ -1741,8 +2333,94 @@ def build_parser() -> argparse.ArgumentParser:
     launchd.add_argument("--horizon", type=int, default=5)
     launchd.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     launchd.add_argument("--project-root", type=Path, default=None)
+    launchd.add_argument(
+        "--autopilot",
+        action="store_true",
+        help="Schedule autopilot-tick instead of auto-backfill-next",
+    )
+    launchd.add_argument(
+        "--interval-hours",
+        type=int,
+        default=None,
+        help="Run every N hours (StartInterval) instead of daily calendar time",
+    )
+
+    configure_autopilot = subparsers.add_parser(
+        "configure-autopilot",
+        help="Configure autopilot limits and ramp (no download/train)",
+    )
+    configure_autopilot.add_argument("--enable", action="store_true")
+    configure_autopilot.add_argument("--disable", action="store_true")
+    configure_autopilot.add_argument("--pause", dest="pause_reason", default=None, metavar="REASON")
+    configure_autopilot.add_argument("--resume", action="store_true")
+    configure_autopilot.add_argument("--daily-chunk-limit", type=int, default=None)
+    configure_autopilot.add_argument("--daily-file-limit", type=int, default=None)
+    configure_autopilot.add_argument("--ramp-enabled", action="store_true", default=None)
+    configure_autopilot.add_argument("--no-ramp-enabled", action="store_false", dest="ramp_enabled")
+    configure_autopilot.add_argument("--ramp-every-successful-days", type=int, default=None)
+    configure_autopilot.add_argument("--ramp-chunk-increment", type=int, default=None)
+    configure_autopilot.add_argument("--max-daily-chunk-limit", type=int, default=None)
+    configure_autopilot.add_argument("--max-daily-file-limit", type=int, default=None)
+    configure_autopilot.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+
+    autopilot_status = subparsers.add_parser(
+        "autopilot-status",
+        help="Print autopilot settings and usage",
+    )
+    autopilot_status.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+
+    autopilot_tick = subparsers.add_parser(
+        "autopilot-tick",
+        help="Run one bounded autopilot chunk when within daily limits",
+    )
+    autopilot_tick.add_argument("--coins", nargs="+", default=None)
+    autopilot_tick.add_argument(
+        "--chunk-size-hours",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE_HOURS,
+    )
+    autopilot_tick.add_argument("--max-files", type=int, default=None)
+    autopilot_tick.add_argument("--allow-more", action="store_true")
+    autopilot_tick.add_argument("--aws-profile", default=None)
+    autopilot_tick.add_argument("--requester-pays", action="store_true")
+    autopilot_tick.add_argument("--train-interval", default="15s", choices=["15s", "1m"])
+    autopilot_tick.add_argument("--horizon", type=int, default=5)
+    autopilot_tick.add_argument("--include-combined", action="store_true")
+    autopilot_tick.add_argument("--data-root", type=Path, default=orchestrator.DEFAULT_DATA_ROOT)
+    autopilot_tick.add_argument("--report-dir", type=Path, default=orchestrator.DEFAULT_REPORT_DIR)
+    autopilot_tick.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    autopilot_tick.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR)
+    autopilot_tick.add_argument(
+        "--daily-summary-dir",
+        type=Path,
+        default=bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
+    )
 
     return parser
+
+
+def _print_autopilot_status(status: dict[str, Any]) -> None:
+    print("Bid/Ask Research Scheduler Autopilot Status")
+    print(f"  enabled: {status['enabled']}")
+    print(f"  paused: {status['paused']}")
+    if status["pause_reason"]:
+        print(f"  pause_reason: {status['pause_reason']}")
+    print(f"  started_at: {status['started_at']}")
+    print(f"  last_run_date: {status['last_run_date']}")
+    print(f"  daily_chunk_limit: {status['daily_chunk_limit']}")
+    print(f"  daily_file_limit: {status['daily_file_limit']}")
+    print(f"  runs_today: {status['runs_today']}")
+    print(f"  chunks_completed_today: {status['chunks_completed_today']}")
+    print(f"  files_downloaded_today: {status['files_downloaded_today']}")
+    print(f"  ramp_enabled: {status['ramp_enabled']}")
+    print(f"  ramp_every_successful_days: {status['ramp_every_successful_days']}")
+    print(f"  ramp_chunk_increment: {status['ramp_chunk_increment']}")
+    print(f"  max_daily_chunk_limit: {status['max_daily_chunk_limit']}")
+    print(f"  max_daily_file_limit: {status['max_daily_file_limit']}")
+    print(f"  successful_days_in_row: {status['successful_days_in_row']}")
+    print(f"  failed_runs_in_row: {status['failed_runs_in_row']}")
+    print(f"  next_recommended_action: {status['next_recommended_action']}")
+    print(f"  latest_report: {status['latest_report']}")
 
 
 def _print_status(status: dict[str, Any]) -> None:
@@ -1919,10 +2597,58 @@ def main(argv: list[str] | None = None) -> int:
                 horizon=args.horizon,
                 state_dir=args.state_dir,
                 project_root=args.project_root,
+                autopilot=args.autopilot,
+                interval_hours=args.interval_hours,
             )
             print(f"Wrote launchd template: {plist_path}")
             print(f"Wrote setup instructions: {setup_path}")
             print("Not installed automatically.")
+        elif args.command == "configure-autopilot":
+            autopilot = cmd_configure_autopilot(
+                enable=args.enable,
+                disable=args.disable,
+                pause_reason=args.pause_reason,
+                resume=args.resume,
+                daily_chunk_limit=args.daily_chunk_limit,
+                daily_file_limit=args.daily_file_limit,
+                ramp_enabled=args.ramp_enabled,
+                ramp_every_successful_days=args.ramp_every_successful_days,
+                ramp_chunk_increment=args.ramp_chunk_increment,
+                max_daily_chunk_limit=args.max_daily_chunk_limit,
+                max_daily_file_limit=args.max_daily_file_limit,
+                state_path=args.state_path,
+            )
+            _print_autopilot_status(cmd_autopilot_status(state_path=args.state_path))
+            print(f"Autopilot configured: enabled={autopilot.enabled} paused={autopilot.paused}")
+        elif args.command == "autopilot-status":
+            status = cmd_autopilot_status(state_path=args.state_path)
+            _print_autopilot_status(status)
+        elif args.command == "autopilot-tick":
+            report = cmd_autopilot_tick(
+                coins=args.coins,
+                chunk_size_hours=args.chunk_size_hours,
+                max_files=args.max_files,
+                allow_more=args.allow_more,
+                aws_profile=args.aws_profile,
+                requester_pays=args.requester_pays,
+                train_interval=args.train_interval,
+                horizon=args.horizon,
+                include_combined=args.include_combined,
+                data_root=args.data_root,
+                orchestrator_report_dir=args.report_dir,
+                state_path=args.state_path,
+                runs_dir=args.runs_dir,
+                daily_summary_dir=args.daily_summary_dir,
+            )
+            print(f"Autopilot tick: action={report.action}")
+            if report.warnings:
+                for warning in report.warnings:
+                    print(f"  warning: {warning}")
+            if report.failures:
+                for failure in report.failures:
+                    print(f"  failure: {failure}")
+            if report.next_recommended_action:
+                print(f"Next: {report.next_recommended_action}")
         else:
             parser.error(f"unknown command: {args.command}")
     except (ValueError, FileExistsError, FileNotFoundError) as exc:

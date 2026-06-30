@@ -937,6 +937,7 @@ class TestBackwardsCompatibleState:
         assert state.historical_start_hour == 0
         assert state.historical_end_hour == 23
         assert state.failed_batches == []
+        assert state.autopilot.enabled is False
 
 
 def _mock_auto_daily_cycle(
@@ -983,6 +984,425 @@ def _mock_auto_daily_cycle(
 
     monkeypatch.setattr(scheduler, "cmd_daily_cycle", fake_daily_cycle)
     return captured
+
+
+def _enable_autopilot(
+    state_path: Path,
+    *,
+    daily_chunk_limit: int = 1,
+    daily_file_limit: int = 9,
+    ramp_every_successful_days: int = 2,
+    max_daily_chunk_limit: int = 4,
+    max_daily_file_limit: int = 36,
+) -> None:
+    scheduler.cmd_configure_autopilot(
+        enable=True,
+        daily_chunk_limit=daily_chunk_limit,
+        daily_file_limit=daily_file_limit,
+        ramp_every_successful_days=ramp_every_successful_days,
+        max_daily_chunk_limit=max_daily_chunk_limit,
+        max_daily_file_limit=max_daily_file_limit,
+        state_path=state_path,
+    )
+
+
+def _mock_auto_backfill_next(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failures: list[str] | None = None,
+    validation_warning: str | None = None,
+    downloaded_files: int = 1,
+) -> list[dict[str, object]]:
+    captured: list[dict[str, object]] = []
+
+    def fake_auto_backfill(**kwargs: object) -> scheduler.SchedulerReport:
+        captured.append(dict(kwargs))
+        hours = kwargs.get("chunk_size_hours")
+        report = scheduler.SchedulerReport(
+            workflows_run=["auto-backfill-next", "daily-cycle"],
+            historical_date="20230916",
+            historical_hours=["9", "10", "11"],
+            train_interval=str(kwargs.get("train_interval")),
+            horizon=int(kwargs.get("horizon") or 5),
+            details={
+                "chunk_size_hours": hours,
+                "resample_validate": {
+                    "warnings": [validation_warning] if validation_warning else [],
+                    "failures": [],
+                },
+                "historical_backfill": {
+                    "details": {
+                        "orchestrator_batch": {
+                            "download": {
+                                "file_results": [{"status": "downloaded"}] * downloaded_files,
+                            }
+                        }
+                    }
+                },
+                "scheduler_report_paths": {
+                    "json": "/tmp/auto.json",
+                    "markdown": "/tmp/auto.md",
+                },
+            },
+        )
+        if failures:
+            report.failures.extend(failures)
+        return report
+
+    monkeypatch.setattr(scheduler, "cmd_auto_backfill_next", fake_auto_backfill)
+    return captured
+
+
+class TestConfigureAutopilot:
+    def test_enables_settings(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        autopilot = scheduler.cmd_configure_autopilot(
+            enable=True,
+            daily_chunk_limit=2,
+            daily_file_limit=18,
+            ramp_enabled=True,
+            ramp_every_successful_days=3,
+            ramp_chunk_increment=2,
+            max_daily_chunk_limit=6,
+            max_daily_file_limit=54,
+            state_path=state_path,
+        )
+        assert autopilot.enabled is True
+        assert autopilot.daily_chunk_limit == 2
+        assert autopilot.daily_file_limit == 18
+        assert autopilot.ramp_every_successful_days == 3
+        assert autopilot.started_at is not None
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.enabled is True
+
+    def test_pause_resume_disable(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        scheduler.cmd_configure_autopilot(
+            pause_reason="manual hold",
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.paused is True
+        assert state.autopilot.pause_reason == "manual hold"
+
+        scheduler.cmd_configure_autopilot(resume=True, state_path=state_path)
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.paused is False
+        assert state.autopilot.failed_runs_in_row == 0
+
+        scheduler.cmd_configure_autopilot(disable=True, state_path=state_path)
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.enabled is False
+
+
+class TestAutopilotStatus:
+    def test_reads_settings(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        status = scheduler.cmd_autopilot_status(state_path=state_path)
+        assert status["enabled"] is True
+        assert status["daily_chunk_limit"] == 1
+        assert status["daily_file_limit"] == 9
+        assert status["ramp_enabled"] is True
+        assert "autopilot-tick" in status["next_recommended_action"]
+
+
+class TestAutopilotTick:
+    def test_exits_when_disabled(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        report = scheduler.cmd_autopilot_tick(
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+        )
+        assert report.action == "disabled"
+        assert scheduler.AUTOPILOT_DISABLED_MESSAGE in report.warnings[0]
+
+    def test_exits_when_paused(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        scheduler.cmd_configure_autopilot(pause_reason="testing", state_path=state_path)
+        report = scheduler.cmd_autopilot_tick(
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+        )
+        assert report.action == "paused"
+        assert "paused" in report.warnings[0].lower()
+
+    def test_resets_daily_counters_on_new_date(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        state = scheduler.load_state(state_path)
+        state.autopilot.last_run_date = "20230915"
+        state.autopilot.runs_today = 5
+        state.autopilot.chunks_completed_today = 1
+        state.autopilot.files_downloaded_today = 9
+        scheduler.save_state(state, state_path)
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.last_run_date == "20230916"
+        assert state.autopilot.runs_today == 1
+        assert state.autopilot.chunks_completed_today == 1
+
+    def test_respects_daily_chunk_limit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path, daily_chunk_limit=1)
+        _mock_auto_backfill_next(monkeypatch)
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        assert report.action == "daily_chunk_limit_reached"
+
+    def test_respects_daily_file_limit(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path, daily_chunk_limit=4, daily_file_limit=9)
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=9)
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        assert report.action == "daily_file_limit_reached"
+
+    def test_runs_exactly_one_chunk_when_allowed(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        captured = _mock_auto_backfill_next(monkeypatch)
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        assert len(captured) == 1
+
+    def test_successful_tick_increments_counters(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=3)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        assert report.action == "chunk_completed"
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.runs_today == 1
+        assert state.autopilot.chunks_completed_today == 1
+        assert state.autopilot.files_downloaded_today == 3
+        assert state.autopilot.failed_runs_in_row == 0
+        assert state.autopilot.successful_days_in_row == 1
+
+    def test_failed_tick_increments_failed_runs_and_does_not_ramp(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, failures=["download failed"])
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        assert report.action == "chunk_failed"
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.chunks_completed_today == 0
+        assert state.autopilot.failed_runs_in_row == 1
+        assert state.autopilot.daily_chunk_limit == 1
+        assert state.autopilot.successful_days_in_row == 0
+
+    def test_three_failures_pauses_autopilot(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, failures=["download failed"])
+
+        for _ in range(3):
+            scheduler.cmd_autopilot_tick(
+                chunk_size_hours=3,
+                state_path=state_path,
+                runs_dir=tmp_path / "runs",
+                today_override="20230916",
+            )
+
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.paused is True
+        assert state.autopilot.pause_reason is not None
+        assert state.autopilot.failed_runs_in_row >= 3
+
+    def test_ramp_increases_limits_after_successful_days(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path, ramp_every_successful_days=2)
+        _mock_auto_backfill_next(monkeypatch)
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.successful_days_in_row == 1
+        assert state.autopilot.daily_chunk_limit == 1
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230917",
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.daily_chunk_limit == 2
+        assert state.autopilot.daily_file_limit == 18
+        assert state.autopilot.successful_days_in_row == 0
+
+    def test_ramp_caps_at_max_limits(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        scheduler.cmd_configure_autopilot(
+            enable=True,
+            daily_chunk_limit=3,
+            daily_file_limit=27,
+            ramp_every_successful_days=1,
+            ramp_chunk_increment=2,
+            max_daily_chunk_limit=4,
+            max_daily_file_limit=36,
+            state_path=state_path,
+        )
+        _mock_auto_backfill_next(monkeypatch)
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.daily_chunk_limit == 4
+        assert state.autopilot.daily_file_limit == 36
+
+    def test_report_has_safety_fields(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        runs_dir = tmp_path / "runs"
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            today_override="20230916",
+        )
+        assert report.paper_only is True
+        assert report.execution_enabled is False
+        state = scheduler.load_state(state_path)
+        saved = json.loads(Path(state.autopilot.last_autopilot_report_path).read_text(encoding="utf-8"))
+        assert saved["paper_only"] is True
+        assert saved["execution_enabled"] is False
+        assert "secret_access_key" not in json.dumps(saved).lower()
+
+
+class TestLaunchdAutopilot:
+    def test_autopilot_template(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, setup_path = scheduler.cmd_write_launchd_template(
+            run_time="02:00",
+            coins=["BTC", "ETH", "SOL"],
+            aws_profile="hyperliquid-research",
+            requester_pays=True,
+            chunk_size_hours=3,
+            train_interval="15s",
+            horizon=5,
+            state_dir=state_dir,
+            project_root=tmp_path,
+            autopilot=True,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        setup_text = setup_path.read_text(encoding="utf-8")
+        assert "autopilot-tick" in plist_text
+        assert "auto-backfill-next" not in plist_text
+        assert "com.hyperliquid.research.autopilot" in plist_text
+        assert "configure-autopilot" in setup_text
+        assert "AWS Budget" in setup_text
+
+    def test_interval_hours_schedule(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, _ = scheduler.cmd_write_launchd_template(
+            coins=["BTC"],
+            state_dir=state_dir,
+            project_root=tmp_path,
+            autopilot=True,
+            interval_hours=6,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "StartInterval" in plist_text
+        assert "<integer>21600</integer>" in plist_text
 
 
 class TestAutoBackfillNext:

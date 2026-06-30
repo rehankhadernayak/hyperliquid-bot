@@ -518,6 +518,94 @@ Writes `reports/bid_ask_research_scheduler/com.hyperliquid.research.daily.plist`
 `launchd_setup.md`. The plist runs `auto-backfill-next` (one chunk per schedule
 tick). Does **not** install or schedule automatically.
 
+For autopilot mode with daily limits and gradual ramp-up:
+
+```bash
+python3 bid_ask_research_scheduler.py write-launchd-template \
+  --autopilot \
+  --time 02:00 \
+  --coins BTC ETH SOL \
+  --aws-profile hyperliquid-research \
+  --requester-pays \
+  --chunk-size-hours 3 \
+  --train-interval 15s \
+  --horizon 5
+```
+
+Optional interval scheduling (every N hours):
+
+```bash
+python3 bid_ask_research_scheduler.py write-launchd-template \
+  --autopilot \
+  --interval-hours 6 \
+  --coins BTC ETH SOL \
+  --chunk-size-hours 3
+```
+
+### Autopilot scheduler (daily limits + ramp-up)
+
+Autopilot wraps `auto-backfill-next` with explicit daily budgets stored in
+`state.json`. Each `autopilot-tick` invocation checks limits, runs at most one
+chunk, validates/trains, updates counters, writes a report, and exits. Suitable
+for `launchd` scheduling without manual batch triggers.
+
+**Configure autopilot** (no download, no train):
+
+```bash
+python3 bid_ask_research_scheduler.py configure-autopilot \
+  --enable \
+  --daily-chunk-limit 1 \
+  --daily-file-limit 9 \
+  --ramp-enabled \
+  --ramp-every-successful-days 2 \
+  --ramp-chunk-increment 1 \
+  --max-daily-chunk-limit 4 \
+  --max-daily-file-limit 36
+```
+
+Also supports `--disable`, `--pause REASON`, and `--resume`.
+
+**Run one autopilot tick**:
+
+```bash
+python3 bid_ask_research_scheduler.py autopilot-tick \
+  --coins BTC ETH SOL \
+  --aws-profile hyperliquid-research \
+  --requester-pays \
+  --chunk-size-hours 3 \
+  --train-interval 15s \
+  --horizon 5
+```
+
+**Check autopilot status**:
+
+```bash
+python3 bid_ask_research_scheduler.py autopilot-status
+```
+
+Autopilot state (`state.json` → `autopilot`):
+
+| Field | Purpose |
+| --- | --- |
+| `enabled` / `paused` | Whether autopilot runs and pause reason |
+| `daily_chunk_limit` / `daily_file_limit` | Max chunks/files per UTC day |
+| `runs_today` / `chunks_completed_today` / `files_downloaded_today` | Usage counters (reset daily) |
+| `ramp_enabled` / `ramp_every_successful_days` / `ramp_chunk_increment` | Gradual limit increases after successful days |
+| `max_daily_chunk_limit` / `max_daily_file_limit` | Ramp caps |
+| `successful_days_in_row` / `failed_runs_in_row` | Streak tracking; 3 failures pauses autopilot |
+
+Behavior:
+
+1. Reads scheduler state and today's daily budget
+2. Skips when disabled, paused, or over daily chunk/file limits
+3. Runs `auto-backfill-next` for exactly one chunk when allowed
+4. Increments counters on success; increments `failed_runs_in_row` on failure
+5. Pauses after 3 consecutive failed runs
+6. Ramps daily limits after configured successful days (not after failures)
+7. Writes JSON/Markdown reports to `reports/bid_ask_research_scheduler/runs/`
+
+**AWS cost control:** Set up [AWS Budget alerts](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) before enabling scheduled requester-pays downloads. Autopilot does not bypass cost controls.
+
 ## Future Work (Not in This Phase)
 
 - Larger batch Python downloader beyond hard-capped sample limits
