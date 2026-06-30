@@ -30,7 +30,7 @@ from bid_ask_schema import (
 )
 
 SUPPORTED_INTERVALS = frozenset({"1s", "15s", "1m"})
-SUPPORTED_SOURCES = frozenset({"local", "historical"})
+SUPPORTED_SOURCES = frozenset({"local", "historical", "combined"})
 INTERVAL_SECONDS = {"1s": 1, "15s": 15, "1m": 60}
 
 RESAMPLED_COLUMNS = (

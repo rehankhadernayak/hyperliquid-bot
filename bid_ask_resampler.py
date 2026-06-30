@@ -29,7 +29,8 @@ from bid_ask_schema import (
 
 SUPPORTED_INTERVALS = frozenset({"15s", "1m"})
 SUPPORTED_INPUT_INTERVALS = frozenset({"1s"})
-SUPPORTED_SOURCES = frozenset({"local", "historical"})
+SUPPORTED_SOURCES = frozenset({"local", "historical", "combined"})
+COMBINED_SOURCE_ALIASES = frozenset({"combined"})
 INTERVAL_SECONDS = {"15s": 15, "1m": 60}
 
 DEFAULT_DATA_ROOT = Path("data/bid_ask_csv")
@@ -68,6 +69,8 @@ def normalize_source(source: str) -> str:
         return "historical"
     if normalized == "local":
         return "local"
+    if normalized in COMBINED_SOURCE_ALIASES:
+        return "combined"
     supported = ", ".join(sorted(SUPPORTED_SOURCES))
     raise ValueError(f"Unsupported source {source!r}; use one of: {supported}")
 
@@ -85,6 +88,8 @@ def resolve_bid_ask_data_dir(
     normalized_source = normalize_source(source)
     if normalized_source == "local":
         subdir = interval
+    elif normalized_source == "combined":
+        subdir = f"combined_{interval}"
     else:
         subdir = f"historical_{interval}"
     return data_root / subdir
