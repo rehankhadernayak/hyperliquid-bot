@@ -16,7 +16,10 @@ from historical_l2_importer import (
     default_historical_output_path,
     import_decompressed_l2_file,
     l2_snapshot_to_bid_ask_row,
+    main,
+    merge_historical_bid_ask_rows,
     parse_l2_snapshot_line,
+    read_historical_bid_ask_csv,
     summarize_historical_coverage,
     write_historical_bid_ask_csv,
     write_historical_import_report,
@@ -128,13 +131,170 @@ class TestLocalImport:
             output_root=output_root,
         )
         assert csv_path == output_path
+        assert stats.new_rows_imported == 3
         assert stats.rows_written == 3
+        assert stats.rows_after_merge == 3
+        assert stats.existing_rows_before == 0
+        assert stats.mode == "overwrite"
         assert output_path.exists()
 
         content = output_path.read_text(encoding="utf-8").strip().splitlines()
         assert content[0].split(",") == list(BID_ASK_CSV_COLUMNS)
         assert "historical_archive" in content[1]
         assert "historical_l2Book" in content[1]
+
+    def test_second_import_appends_to_same_coin_csv(self, tmp_path: Path) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+
+        hour_one = tmp_path / "hour1"
+        hour_one.write_text(
+            "\n".join(
+                [
+                    _l2_archive_line(time_ms=BASE_TS),
+                    _l2_archive_line(time_ms=BASE_TS + 1000),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        hour_two = tmp_path / "hour2"
+        hour_two.write_text(
+            "\n".join(
+                [
+                    _l2_archive_line(time_ms=BASE_TS + 3600_000, bid_px="151.0", ask_px="151.5"),
+                    _l2_archive_line(time_ms=BASE_TS + 3601_000, bid_px="151.1", ask_px="151.6"),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        _, stats_one = import_decompressed_l2_file(
+            hour_one, "SOL", output_path, output_root=output_root
+        )
+        assert stats_one.new_rows_imported == 2
+        assert stats_one.rows_after_merge == 2
+
+        _, stats_two = import_decompressed_l2_file(
+            hour_two, "SOL", output_path, output_root=output_root
+        )
+        assert stats_two.mode == "append_merge"
+        assert stats_two.existing_rows_before == 2
+        assert stats_two.new_rows_imported == 2
+        assert stats_two.rows_after_merge == 4
+        assert stats_two.duplicate_rows_removed == 0
+
+        summary = summarize_historical_coverage(output_path)
+        assert summary.row_count == 4
+
+    def test_duplicate_timestamp_rows_removed_on_merge(self, tmp_path: Path) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+
+        first = tmp_path / "first"
+        first.write_text(_l2_archive_line(time_ms=BASE_TS, bid_px="150.0", ask_px="150.5") + "\n")
+        second = tmp_path / "second"
+        second.write_text(
+            _l2_archive_line(time_ms=BASE_TS, bid_px="160.0", ask_px="160.5") + "\n"
+        )
+
+        import_decompressed_l2_file(first, "SOL", output_path, output_root=output_root)
+        _, stats = import_decompressed_l2_file(
+            second, "SOL", output_path, output_root=output_root
+        )
+        assert stats.duplicate_rows_removed == 1
+        assert stats.rows_after_merge == 1
+
+        rows = read_historical_bid_ask_csv(output_path)
+        assert len(rows) == 1
+        assert float(rows[0]["best_bid"]) == pytest.approx(160.0)
+        assert float(rows[0]["best_ask"]) == pytest.approx(160.5)
+
+    def test_rows_sorted_ascending_after_merge(self, tmp_path: Path) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+
+        first = tmp_path / "first"
+        first.write_text(
+            "\n".join(
+                [
+                    _l2_archive_line(time_ms=BASE_TS + 3000),
+                    _l2_archive_line(time_ms=BASE_TS),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        second = tmp_path / "second"
+        second.write_text(
+            "\n".join(
+                [
+                    _l2_archive_line(time_ms=BASE_TS + 2000),
+                    _l2_archive_line(time_ms=BASE_TS + 1000),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        import_decompressed_l2_file(first, "SOL", output_path, output_root=output_root)
+        import_decompressed_l2_file(second, "SOL", output_path, output_root=output_root)
+
+        rows = read_historical_bid_ask_csv(output_path)
+        timestamps = [int(row["timestamp_ms"]) for row in rows]
+        assert timestamps == sorted(timestamps)
+        assert timestamps == [BASE_TS, BASE_TS + 1000, BASE_TS + 2000, BASE_TS + 3000]
+
+    def test_overwrite_replaces_existing_csv(self, tmp_path: Path) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+
+        first = tmp_path / "first"
+        first.write_text(
+            "\n".join(
+                [
+                    _l2_archive_line(time_ms=BASE_TS),
+                    _l2_archive_line(time_ms=BASE_TS + 1000),
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        second = tmp_path / "second"
+        second.write_text(_l2_archive_line(time_ms=BASE_TS + 5000) + "\n", encoding="utf-8")
+
+        import_decompressed_l2_file(first, "SOL", output_path, output_root=output_root)
+        _, stats = import_decompressed_l2_file(
+            second,
+            "SOL",
+            output_path,
+            output_root=output_root,
+            overwrite=True,
+        )
+        assert stats.mode == "overwrite"
+        assert stats.existing_rows_before == 0
+        assert stats.new_rows_imported == 1
+        assert stats.rows_after_merge == 1
+
+        summary = summarize_historical_coverage(output_path)
+        assert summary.row_count == 1
+        assert summary.start_timestamp_ms == BASE_TS + 5000
+
+    def test_schema_order_preserved_after_merge(self, tmp_path: Path) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+
+        first = tmp_path / "first"
+        first.write_text(_l2_archive_line(time_ms=BASE_TS) + "\n")
+        second = tmp_path / "second"
+        second.write_text(_l2_archive_line(time_ms=BASE_TS + 1000) + "\n")
+
+        import_decompressed_l2_file(first, "SOL", output_path, output_root=output_root)
+        import_decompressed_l2_file(second, "SOL", output_path, output_root=output_root)
+
+        header = output_path.read_text(encoding="utf-8").splitlines()[0]
+        assert header.split(",") == list(BID_ASK_CSV_COLUMNS)
 
     def test_default_historical_output_path(self) -> None:
         path = default_historical_output_path("sol", output_root=DEFAULT_OUTPUT_ROOT)
@@ -179,6 +339,12 @@ class TestCoverageAndReport:
             invalid_bid_ask_rows=0,
             malformed_lines_skipped=1,
             invalid_rows_skipped=0,
+            mode="append_merge",
+            existing_rows_before=2,
+            new_rows_imported=3,
+            rows_after_merge=5,
+            duplicate_rows_removed=0,
+            dedupe_key="timestamp_ms",
         )
         report_path = write_historical_import_report(report, output_root=output_root)
         assert report_path.exists()
@@ -186,6 +352,38 @@ class TestCoverageAndReport:
         assert payload["coin"] == "SOL"
         assert payload["source"] == "historical_archive_l2Book"
         assert payload["download_enabled"] is False
+        assert payload["paper_only"] is True
+        assert payload["execution_enabled"] is False
+        assert payload["mode"] == "append_merge"
+        assert payload["existing_rows_before"] == 2
+        assert payload["new_rows_imported"] == 3
+        assert payload["rows_after_merge"] == 5
+        assert payload["duplicate_rows_removed"] == 0
+        assert payload["dedupe_key"] == "timestamp_ms"
+
+    def test_invalid_bid_ask_detection_still_works(self, tmp_path: Path) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+        rows = []
+        for offset_ms in (0, 1000):
+            snapshot = parse_l2_snapshot_line(
+                _l2_archive_line(time_ms=BASE_TS + offset_ms)
+            )
+            assert snapshot is not None
+            row = l2_snapshot_to_bid_ask_row(snapshot)
+            assert row is not None
+            rows.append(row)
+        write_historical_bid_ask_csv(rows, output_path, output_root=output_root)
+
+        bad_row = dict(rows[0])
+        bad_row["best_bid"] = "200.0"
+        bad_row["best_ask"] = "150.0"
+        with output_path.open("a", encoding="utf-8", newline="") as handle:
+            handle.write(",".join(str(bad_row[column]) for column in BID_ASK_CSV_COLUMNS) + "\n")
+
+        summary = summarize_historical_coverage(output_path)
+        assert summary.invalid_bid_ask_rows == 1
+        assert summary.row_count == 3
 
 
 class TestSafety:
@@ -239,3 +437,138 @@ class TestSafety:
         assert PAPER_ONLY is True
         assert EXECUTION_ENABLED is False
         assert DOWNLOAD_ENABLED is False
+
+
+class TestSummarizeCli:
+    def test_summarize_cli_reads_local_csv_only(self, tmp_path: Path, capsys) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+        snapshot = parse_l2_snapshot_line(_l2_archive_line())
+        assert snapshot is not None
+        row = l2_snapshot_to_bid_ask_row(snapshot)
+        assert row is not None
+        write_historical_bid_ask_csv([row], output_path, output_root=output_root)
+
+        exit_code = main(
+            [
+                "summarize",
+                "--csv",
+                str(output_path),
+            ]
+        )
+        captured = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "row_count: 1" in captured
+        assert f"start_timestamp_ms: {BASE_TS}" in captured
+        assert f"end_timestamp_ms: {BASE_TS}" in captured
+        assert "missing_seconds: 0" in captured
+        assert "duplicate_timestamps: 0" in captured
+        assert "invalid_bid_ask_rows: 0" in captured
+        assert "historical_archive_l2Book" in captured
+
+    def test_summarize_cli_with_coin_resolves_default_path(
+        self, tmp_path: Path, capsys
+    ) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+        snapshot = parse_l2_snapshot_line(_l2_archive_line())
+        assert snapshot is not None
+        row = l2_snapshot_to_bid_ask_row(snapshot)
+        assert row is not None
+        write_historical_bid_ask_csv([row], output_path, output_root=output_root)
+
+        exit_code = main(
+            [
+                "summarize",
+                "--coin",
+                "SOL",
+                "--output-root",
+                str(output_root),
+            ]
+        )
+        captured = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "row_count: 1" in captured
+        assert str(output_path.resolve()) in captured
+
+
+class TestImportCli:
+    def test_import_cli_merge_output(self, tmp_path: Path, capsys) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+        hour_one = tmp_path / "hour1"
+        hour_one.write_text(_l2_archive_line(time_ms=BASE_TS) + "\n")
+        hour_two = tmp_path / "hour2"
+        hour_two.write_text(_l2_archive_line(time_ms=BASE_TS + 3600_000) + "\n")
+
+        assert (
+            main(
+                [
+                    "import-local",
+                    "--input",
+                    str(hour_one),
+                    "--coin",
+                    "SOL",
+                    "--output",
+                    str(output_path),
+                    "--output-root",
+                    str(output_root),
+                ]
+            )
+            == 0
+        )
+        exit_code = main(
+            [
+                "import-local",
+                "--input",
+                str(hour_two),
+                "--coin",
+                "SOL",
+                "--output",
+                str(output_path),
+                "--output-root",
+                str(output_root),
+            ]
+        )
+        captured = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "Imported 1 new rows" in captured
+        assert "Existing rows before: 1" in captured
+        assert "Rows after merge: 2" in captured
+        assert "Duplicate rows removed: 0" in captured
+        assert str(output_path.resolve()) in captured
+
+    def test_summarize_reports_merged_row_count(self, tmp_path: Path, capsys) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+        hour_one = tmp_path / "hour1"
+        hour_one.write_text(_l2_archive_line(time_ms=BASE_TS) + "\n")
+        hour_two = tmp_path / "hour2"
+        hour_two.write_text(_l2_archive_line(time_ms=BASE_TS + 3600_000) + "\n")
+
+        import_decompressed_l2_file(hour_one, "SOL", output_path, output_root=output_root)
+        import_decompressed_l2_file(hour_two, "SOL", output_path, output_root=output_root)
+
+        exit_code = main(
+            [
+                "summarize",
+                "--csv",
+                str(output_path),
+            ]
+        )
+        captured = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "row_count: 2" in captured
+
+
+class TestMergeHelpers:
+    def test_merge_historical_bid_ask_rows_prefers_new_rows(self) -> None:
+        existing = [{"timestamp_ms": "1000", "best_bid": "1.0"}]
+        new = [{"timestamp_ms": "1000", "best_bid": "2.0"}]
+        merged, removed = merge_historical_bid_ask_rows(existing, new)
+        assert removed == 1
+        assert merged[0]["best_bid"] == "2.0"

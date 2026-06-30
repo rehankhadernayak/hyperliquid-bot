@@ -47,6 +47,11 @@ class ImportStats:
     rows_written: int = 0
     malformed_lines_skipped: int = 0
     invalid_rows_skipped: int = 0
+    mode: str = "overwrite"
+    existing_rows_before: int = 0
+    new_rows_imported: int = 0
+    rows_after_merge: int = 0
+    duplicate_rows_removed: int = 0
 
 
 @dataclass
@@ -76,8 +81,15 @@ class HistoricalImportReport:
     invalid_bid_ask_rows: int
     malformed_lines_skipped: int
     invalid_rows_skipped: int
+    mode: str = "append_merge"
+    existing_rows_before: int = 0
+    new_rows_imported: int = 0
+    rows_after_merge: int = 0
+    duplicate_rows_removed: int = 0
+    dedupe_key: str = TIMESTAMP_MS
     source: str = COVERAGE_SOURCE
     paper_only: bool = PAPER_ONLY
+    execution_enabled: bool = EXECUTION_ENABLED
     download_enabled: bool = DOWNLOAD_ENABLED
     safety_statement: str = SAFETY_STATEMENT
     generated_at: str = field(
@@ -252,6 +264,46 @@ def _validate_historical_output_path(output_path: Path, output_root: Path) -> No
         raise ValueError(f"Output path must be under {allowed_dir}")
 
 
+def read_historical_bid_ask_csv(csv_path: Path | str) -> list[dict[str, Any]]:
+    """Read historical bid/ask rows from an existing CSV."""
+    path = Path(csv_path)
+    if not path.is_file():
+        raise FileNotFoundError(f"CSV file not found: {path}")
+
+    rows: list[dict[str, Any]] = []
+    with path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            rows.append(dict(row))
+    return rows
+
+
+def merge_historical_bid_ask_rows(
+    existing_rows: list[dict[str, Any]],
+    new_rows: list[dict[str, Any]],
+    *,
+    dedupe_key: str = TIMESTAMP_MS,
+) -> tuple[list[dict[str, Any]], int]:
+    """Concatenate rows, dedupe by key keeping the latest row, and sort ascending."""
+    if dedupe_key != TIMESTAMP_MS:
+        raise ValueError(f"Unsupported dedupe_key {dedupe_key!r}; only timestamp_ms is supported")
+
+    combined = list(existing_rows) + list(new_rows)
+    if not combined:
+        return [], 0
+
+    unique_keys = {str(row[dedupe_key]) for row in combined}
+    duplicates_removed = max(0, len(combined) - len(unique_keys))
+
+    deduped: dict[str, dict[str, Any]] = {}
+    for row in combined:
+        key = str(row[dedupe_key])
+        deduped[key] = row
+
+    merged = sorted(deduped.values(), key=lambda item: int(item[dedupe_key]))
+    return merged, duplicates_removed
+
+
 def write_historical_bid_ask_csv(
     rows: list[dict[str, Any]],
     output_path: Path,
@@ -275,6 +327,8 @@ def import_decompressed_l2_file(
     output_path: Path | str,
     *,
     output_root: Path = DEFAULT_OUTPUT_ROOT,
+    overwrite: bool = False,
+    dedupe_key: str = TIMESTAMP_MS,
 ) -> tuple[Path, ImportStats]:
     """Read a decompressed local archive file and write historical bid/ask CSV."""
     input_file = Path(input_path)
@@ -284,7 +338,7 @@ def import_decompressed_l2_file(
     if not input_file.is_file():
         raise FileNotFoundError(f"Input file not found: {input_file}")
 
-    rows: list[dict[str, Any]] = []
+    new_rows: list[dict[str, Any]] = []
     stats = ImportStats()
 
     with input_file.open(encoding="utf-8") as handle:
@@ -304,11 +358,29 @@ def import_decompressed_l2_file(
                 stats.invalid_rows_skipped += 1
                 continue
 
-            rows.append(row)
-            stats.rows_written += 1
+            new_rows.append(row)
 
-    rows.sort(key=lambda item: int(item[TIMESTAMP_MS]))
-    write_historical_bid_ask_csv(rows, output_file, output_root=output_root)
+    stats.new_rows_imported = len(new_rows)
+    new_rows.sort(key=lambda item: int(item[TIMESTAMP_MS]))
+
+    if overwrite or not output_file.is_file():
+        stats.mode = "overwrite"
+        stats.existing_rows_before = 0
+        final_rows = new_rows
+        stats.duplicate_rows_removed = 0
+    else:
+        stats.mode = "append_merge"
+        existing_rows = read_historical_bid_ask_csv(output_file)
+        stats.existing_rows_before = len(existing_rows)
+        final_rows, stats.duplicate_rows_removed = merge_historical_bid_ask_rows(
+            existing_rows,
+            new_rows,
+            dedupe_key=dedupe_key,
+        )
+
+    stats.rows_after_merge = len(final_rows)
+    stats.rows_written = stats.rows_after_merge
+    write_historical_bid_ask_csv(final_rows, output_file, output_root=output_root)
     return output_file, stats
 
 
@@ -399,6 +471,31 @@ def _cmd_inspect_path(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_summarize(args: argparse.Namespace) -> int:
+    if args.csv:
+        csv_path = Path(args.csv)
+    elif args.coin:
+        csv_path = default_historical_output_path(
+            args.coin,
+            output_root=Path(args.output_root),
+        )
+    else:
+        print("Either --csv or --coin is required", file=sys.stderr)
+        return 1
+
+    coverage = summarize_historical_coverage(csv_path)
+    print(f"csv_path: {csv_path.resolve()}")
+    print(f"row_count: {coverage.row_count}")
+    print(f"start_timestamp_ms: {coverage.start_timestamp_ms}")
+    print(f"end_timestamp_ms: {coverage.end_timestamp_ms}")
+    print(f"missing_seconds: {coverage.missing_seconds}")
+    print(f"duplicate_timestamps: {coverage.duplicate_timestamps}")
+    print(f"invalid_bid_ask_rows: {coverage.invalid_bid_ask_rows}")
+    print(f"source: {coverage.source}")
+    print(SAFETY_STATEMENT)
+    return 0
+
+
 def _cmd_import_local(args: argparse.Namespace) -> int:
     coin = _normalize_coin(args.coin)
     output_path = (
@@ -413,6 +510,8 @@ def _cmd_import_local(args: argparse.Namespace) -> int:
         coin,
         output_path,
         output_root=output_root,
+        overwrite=args.overwrite,
+        dedupe_key=args.dedupe_key,
     )
     coverage = summarize_historical_coverage(csv_path)
     report = HistoricalImportReport(
@@ -427,10 +526,20 @@ def _cmd_import_local(args: argparse.Namespace) -> int:
         invalid_bid_ask_rows=coverage.invalid_bid_ask_rows,
         malformed_lines_skipped=stats.malformed_lines_skipped,
         invalid_rows_skipped=stats.invalid_rows_skipped,
+        mode=stats.mode,
+        existing_rows_before=stats.existing_rows_before,
+        new_rows_imported=stats.new_rows_imported,
+        rows_after_merge=stats.rows_after_merge,
+        duplicate_rows_removed=stats.duplicate_rows_removed,
+        dedupe_key=args.dedupe_key,
     )
     report_path = write_historical_import_report(report, output_root=output_root)
 
-    print(f"Imported {coverage.row_count} rows to {csv_path}")
+    print(f"Imported {stats.new_rows_imported} new rows")
+    print(f"Existing rows before: {stats.existing_rows_before}")
+    print(f"Rows after merge: {stats.rows_after_merge}")
+    print(f"Duplicate rows removed: {stats.duplicate_rows_removed}")
+    print(f"Output: {csv_path.resolve()}")
     print(f"Coverage report: {report_path}")
     print(SAFETY_STATEMENT)
     print("No archive data was downloaded.")
@@ -478,7 +587,33 @@ def build_parser() -> argparse.ArgumentParser:
         default=str(DEFAULT_OUTPUT_ROOT),
         help="Bid/ask output root (default: data/bid_ask_csv)",
     )
+    import_parser.add_argument(
+        "--overwrite",
+        action="store_true",
+        help="Replace existing output CSV with only the imported file",
+    )
+    import_parser.add_argument(
+        "--dedupe-key",
+        default=TIMESTAMP_MS,
+        help="Column used to deduplicate rows on merge (default: timestamp_ms)",
+    )
     import_parser.set_defaults(func=_cmd_import_local)
+
+    summarize_parser = subparsers.add_parser(
+        "summarize",
+        help="Summarize coverage for a local historical bid/ask CSV only",
+    )
+    summarize_parser.add_argument(
+        "--csv",
+        help="Path to historical bid/ask CSV under data/bid_ask_csv/historical_1s/",
+    )
+    summarize_parser.add_argument("--coin", help="Coin symbol; uses default historical CSV path")
+    summarize_parser.add_argument(
+        "--output-root",
+        default=str(DEFAULT_OUTPUT_ROOT),
+        help="Bid/ask output root (default: data/bid_ask_csv)",
+    )
+    summarize_parser.set_defaults(func=_cmd_summarize)
 
     return parser
 
