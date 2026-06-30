@@ -342,6 +342,73 @@ data/bid_ask_csv/
 
 Historical CSV columns match `BID_ASK_CSV_COLUMNS` in `bid_ask_schema.py`.
 
+## Daily Research Scheduler
+
+`bid_ask_research_scheduler.py` provides a resumable, bounded daily automation layer
+on top of `bid_ask_research_orchestrator.py`. It tracks progress in
+`reports/bid_ask_research_scheduler/state.json` and writes run reports under
+`reports/bid_ask_research_scheduler/runs/`.
+
+### Initialize state (no downloads)
+
+```bash
+python3 bid_ask_research_scheduler.py init-state \
+  --historical-start-date 20230916 \
+  --historical-end-date 20230930 \
+  --coins BTC ETH SOL
+```
+
+Large date ranges require `--confirm-large-range`. Archive availability is not
+guaranteed.
+
+### Status
+
+```bash
+python3 bid_ask_research_scheduler.py status
+```
+
+### Next historical batch
+
+```bash
+python3 bid_ask_research_scheduler.py historical-backfill-next \
+  --coins BTC ETH SOL \
+  --aws-profile hyperliquid-research \
+  --requester-pays \
+  --hours 0 1 2 \
+  --max-files 9
+```
+
+Default hours are `0 1 2`; default `max_files` is 9 (cap 24 with `--allow-more`).
+Completed date/hour batches are deduplicated on rerun.
+
+### Daily cycle
+
+```bash
+python3 bid_ask_research_scheduler.py daily-cycle \
+  --coins BTC ETH SOL \
+  --aws-profile hyperliquid-research \
+  --requester-pays \
+  --historical-hours 0 1 2 \
+  --train-interval 15s \
+  --horizon 5
+```
+
+Runs: historical backfill → resample/validate → train/evaluate → daily summary.
+Optional `--include-combined` merges local + historical before a combined train pass.
+
+### macOS launchd template (manual install)
+
+```bash
+python3 bid_ask_research_scheduler.py write-launchd-template \
+  --time 02:00 \
+  --coins BTC ETH SOL \
+  --aws-profile hyperliquid-research \
+  --requester-pays
+```
+
+Writes `reports/bid_ask_research_scheduler/com.hyperliquid.research.daily.plist` and
+`launchd_setup.md`. Does **not** install or schedule automatically.
+
 ## Future Work (Not in This Phase)
 
 - Larger batch Python downloader beyond hard-capped sample limits
