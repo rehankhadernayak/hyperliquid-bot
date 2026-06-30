@@ -15,11 +15,20 @@ from bid_ask_schema import FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS
 SCHEDULER_FILE = Path(__file__).resolve().parent.parent / "bid_ask_research_scheduler.py"
 
 
-def _init_state(tmp_path: Path, *, start: str = "20230916", end: str = "20230930") -> Path:
+def _init_state(
+    tmp_path: Path,
+    *,
+    start: str = "20230916",
+    end: str = "20230930",
+    start_hour: int = 0,
+    end_hour: int = 23,
+) -> Path:
     state_path = tmp_path / "state.json"
     scheduler.cmd_init_state(
         historical_start_date=start,
         historical_end_date=end,
+        historical_start_hour=start_hour,
+        historical_end_hour=end_hour,
         coins=["BTC", "ETH", "SOL"],
         state_path=state_path,
     )
@@ -97,6 +106,20 @@ class TestInitState:
             state_path=state_path,
         )
         assert state_path.is_file()
+
+    def test_stores_start_and_end_hours(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "state.json"
+        scheduler.cmd_init_state(
+            historical_start_date="20230916",
+            historical_end_date="20230917",
+            historical_start_hour=9,
+            historical_end_hour=14,
+            coins=["BTC"],
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.historical_start_hour == 9
+        assert state.historical_end_hour == 14
 
 
 class TestStatus:
@@ -781,6 +804,9 @@ class TestLaunchdTemplate:
             coins=["BTC", "ETH", "SOL"],
             aws_profile="hyperliquid-research",
             requester_pays=True,
+            chunk_size_hours=3,
+            train_interval="15s",
+            horizon=5,
             state_dir=state_dir,
             project_root=tmp_path,
         )
@@ -788,10 +814,14 @@ class TestLaunchdTemplate:
         assert setup_path.is_file()
         plist_text = plist_path.read_text(encoding="utf-8")
         assert "com.hyperliquid.research.daily" in plist_text
-        assert "daily-cycle" in plist_text
+        assert "auto-backfill-next" in plist_text
+        assert "chunk-size-hours" in plist_text
+        assert "train-interval" in plist_text
+        assert "horizon" in plist_text
         assert "hyperliquid-research" in plist_text
         setup_text = setup_path.read_text(encoding="utf-8")
         assert "not installed automatically" in setup_text.lower()
+        assert "auto-backfill-next" in setup_text
 
 
 class TestReportsSafetyFields:
@@ -853,3 +883,352 @@ class TestSafetyConstraints:
         combined = json_path.read_text(encoding="utf-8").lower()
         assert "secret_access_key" not in combined
         assert "akia" not in combined
+
+
+class TestFindNextIncompleteChunk:
+    def test_selects_first_incomplete_chunk(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        result = scheduler.find_next_incomplete_chunk(
+            scheduler.load_state(state_path), chunk_size_hours=3
+        )
+        assert result == ("20230916", ["9", "10", "11"])
+
+    def test_skips_completed_chunks(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        state = scheduler.load_state(state_path)
+        state.completed_batches.append(
+            {"date": "20230916", "hours": ["9", "10", "11"], "completed_at": "2026-01-01T00:00:00Z"}
+        )
+        scheduler.save_state(state, state_path)
+        result = scheduler.find_next_incomplete_chunk(
+            scheduler.load_state(state_path), chunk_size_hours=3
+        )
+        assert result == ("20230916", ["12", "13", "14"])
+
+    def test_respects_hour_window_not_zero(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        state = scheduler.load_state(state_path)
+        for hour in range(9, 15):
+            state.completed_batches.append(
+                {
+                    "date": "20230916",
+                    "hours": [str(hour)],
+                    "completed_at": "2026-01-01T00:00:00Z",
+                }
+            )
+        scheduler.save_state(state, state_path)
+        result = scheduler.find_next_incomplete_chunk(
+            scheduler.load_state(state_path), chunk_size_hours=3
+        )
+        assert result is None
+
+
+class TestBackwardsCompatibleState:
+    def test_defaults_start_end_hour_when_missing(self, tmp_path: Path) -> None:
+        state_path = tmp_path / "state.json"
+        payload = {
+            "historical_start_date": "20230916",
+            "historical_end_date_target": "20230917",
+            "next_historical_date": "20230916",
+            "coins": ["BTC"],
+        }
+        state_path.write_text(json.dumps(payload), encoding="utf-8")
+        state = scheduler.load_state(state_path)
+        assert state.historical_start_hour == 0
+        assert state.historical_end_hour == 23
+        assert state.failed_batches == []
+
+
+def _mock_auto_daily_cycle(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    failures: list[str] | None = None,
+    validation_warning: str | None = None,
+) -> list[dict[str, object]]:
+    captured: list[dict[str, object]] = []
+
+    def fake_daily_cycle(**kwargs: object) -> scheduler.SchedulerReport:
+        captured.append(dict(kwargs))
+        hours = kwargs.get("historical_hours") or []
+        report = scheduler.SchedulerReport(
+            workflows_run=["daily-cycle", "resample-validate", "train-evaluate-historical"],
+            historical_date=str(kwargs.get("date")),
+            historical_hours=[str(h) for h in hours],
+            train_interval=str(kwargs.get("train_interval")),
+            horizon=int(kwargs.get("horizon") or 5),
+            details={
+                "resample_validate": {
+                    "workflows_run": ["resample-validate"],
+                    "warnings": [validation_warning] if validation_warning else [],
+                    "failures": [],
+                },
+                "historical_backfill": {
+                    "details": {
+                        "orchestrator_batch": {
+                            "download": {
+                                "file_results": [{"status": "downloaded"}],
+                            }
+                        }
+                    }
+                },
+                "scheduler_report_paths": {
+                    "json": "/tmp/daily.json",
+                    "markdown": "/tmp/daily.md",
+                },
+            },
+        )
+        if failures:
+            report.failures.extend(failures)
+        return report
+
+    monkeypatch.setattr(scheduler, "cmd_daily_cycle", fake_daily_cycle)
+    return captured
+
+
+class TestAutoBackfillNext:
+    def test_selects_first_incomplete_chunk(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        captured = _mock_auto_daily_cycle(monkeypatch)
+
+        report = scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        assert captured[0]["historical_hours"] == [9, 10, 11]
+        assert captured[0]["date"] == "20230916"
+        assert captured[0]["defer_batch_completion"] is True
+        assert report.historical_hours == ["9", "10", "11"]
+
+    def test_skips_completed_chunks_via_state(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        state = scheduler.load_state(state_path)
+        state.completed_batches.append(
+            {"date": "20230916", "hours": ["9", "10", "11"], "completed_at": "2026-01-01T00:00:00Z"}
+        )
+        scheduler.save_state(state, state_path)
+        captured = _mock_auto_daily_cycle(monkeypatch)
+
+        scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        assert captured[0]["historical_hours"] == [12, 13, 14]
+
+    def test_marks_complete_on_success(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11)
+        _mock_auto_daily_cycle(monkeypatch)
+
+        scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        state = scheduler.load_state(state_path)
+        assert len(state.completed_batches) == 1
+        assert state.completed_batches[0]["hours"] == ["9", "10", "11"]
+        assert state.completed_batches[0].get("report_path") == "/tmp/daily.json"
+
+    def test_advances_date_after_all_chunks_complete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start="20230916", end="20230917", start_hour=9, end_hour=11)
+        _mock_auto_daily_cycle(monkeypatch)
+
+        scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        state = scheduler.load_state(state_path)
+        assert state.next_historical_date == "20230917"
+        assert "20230916" in state.completed_dates
+
+    def test_exits_cleanly_when_range_complete(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start="20230916", end="20230916", start_hour=9, end_hour=11)
+        state = scheduler.load_state(state_path)
+        state.completed_batches.append(
+            {"date": "20230916", "hours": ["9", "10", "11"], "completed_at": "2026-01-01T00:00:00Z"}
+        )
+        state.next_historical_date = None
+        scheduler.save_state(state, state_path)
+        captured = _mock_auto_daily_cycle(monkeypatch)
+
+        report = scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        assert captured == []
+        assert any(scheduler.AUTO_BACKFILL_COMPLETE_MESSAGE in w for w in report.warnings)
+
+    def test_does_not_mark_complete_on_validation_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11)
+        _mock_auto_daily_cycle(
+            monkeypatch,
+            validation_warning="BTC 1s validation failed: gaps detected",
+        )
+
+        scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        state = scheduler.load_state(state_path)
+        assert state.completed_batches == []
+        assert len(state.failed_batches) == 1
+        assert state.failed_batches[0]["hours"] == ["9", "10", "11"]
+
+    def test_records_failed_batch_on_cycle_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11)
+        _mock_auto_daily_cycle(monkeypatch, failures=["download failed"])
+
+        scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        state = scheduler.load_state(state_path)
+        assert state.completed_batches == []
+        assert len(state.failed_batches) == 1
+        assert "download failed" in state.failed_batches[0]["reason"]
+
+    def test_report_has_safety_fields(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11)
+        _mock_auto_daily_cycle(monkeypatch)
+        runs_dir = tmp_path / "runs"
+
+        report = scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            daily_summary_dir=tmp_path / "daily",
+        )
+
+        assert report.paper_only is True
+        assert report.execution_enabled is False
+        state = scheduler.load_state(state_path)
+        saved = json.loads(Path(state.last_report_path).read_text(encoding="utf-8"))
+        assert saved["paper_only"] is True
+        assert saved["execution_enabled"] is False
+
+
+class TestRepairStateFromExistingData:
+    def _write_mock_historical_csv(
+        self,
+        data_root: Path,
+        coin: str,
+        date: str,
+        hours: list[int],
+    ) -> None:
+        from bid_ask_schema import (
+            BID_ASK_CSV_COLUMNS,
+            BEST_ASK,
+            BEST_BID,
+            BID_SIZE,
+            ASK_SIZE,
+            TIMESTAMP_MS,
+        )
+
+        csv_dir = data_root / "historical_1s"
+        csv_dir.mkdir(parents=True, exist_ok=True)
+        csv_path = csv_dir / f"{coin}_1s.csv"
+        rows: list[dict[str, str]] = []
+        for hour in hours:
+            base_ms = int(
+                __import__("datetime")
+                .datetime.strptime(date, "%Y%m%d")
+                .replace(hour=hour, tzinfo=__import__("datetime").timezone.utc)
+                .timestamp()
+                * 1000
+            )
+            rows.append(
+                {
+                    TIMESTAMP_MS: str(base_ms + 1000),
+                    BEST_BID: "100.0",
+                    BEST_ASK: "100.1",
+                    BID_SIZE: "1.0",
+                    ASK_SIZE: "1.0",
+                    "coin": coin,
+                    "source_session_id": "historical_archive",
+                    "source_channel": "historical_l2Book",
+                }
+            )
+        import csv
+
+        with csv_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=BID_ASK_CSV_COLUMNS, extrasaction="ignore")
+            writer.writeheader()
+            for row in rows:
+                writer.writerow(row)
+
+    def test_marks_chunks_complete_when_data_validates(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH", "SOL"]:
+            self._write_mock_historical_csv(data_root, coin, "20230916", [9, 10, 11, 12, 13, 14])
+
+        report = scheduler.cmd_repair_state_from_existing_data(
+            date="20230916",
+            start_hour=9,
+            end_hour=14,
+            chunk_size_hours=3,
+            data_root=data_root,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+        )
+
+        state = scheduler.load_state(state_path)
+        assert report.row_counts["chunks_repaired"] == 2
+        assert len(state.completed_batches) == 2
+        assert scheduler.REPAIR_INFERRED_WARNING in report.warnings
+        assert report.paper_only is True
+        assert report.execution_enabled is False

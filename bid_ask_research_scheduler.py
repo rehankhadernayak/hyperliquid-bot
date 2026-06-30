@@ -7,6 +7,7 @@ No wallets, signing, orders, or exchange execution endpoints.
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import logging
 import sys
@@ -17,8 +18,9 @@ from typing import Any
 
 import bid_ask_daily_summary
 import bid_ask_research_orchestrator as orchestrator
-from bid_ask_schema import SAFETY_STATEMENT
+from bid_ask_schema import SAFETY_STATEMENT, TIMESTAMP_MS
 from historical_l2_backfill_planner import validate_date_yyyymmdd
+from historical_l2_importer import default_historical_output_path, summarize_historical_coverage
 
 logger = logging.getLogger(__name__)
 
@@ -41,22 +43,32 @@ ARCHIVE_AVAILABILITY_WARNING = (
 
 LAUNCHD_PLIST_NAME = "com.hyperliquid.research.daily.plist"
 LAUNCHD_SETUP_MD = "launchd_setup.md"
+DEFAULT_HISTORICAL_START_HOUR = 0
+DEFAULT_HISTORICAL_END_HOUR = 23
+AUTO_BACKFILL_COMPLETE_MESSAGE = "Historical backfill range complete; no chunks remaining."
+REPAIR_INFERRED_WARNING = (
+    "Repair inferred completion from existing data; re-validate before production use."
+)
 
 
 @dataclass
 class SchedulerState:
     historical_start_date: str | None = None
     historical_end_date_target: str | None = None
+    historical_start_hour: int = DEFAULT_HISTORICAL_START_HOUR
+    historical_end_hour: int = DEFAULT_HISTORICAL_END_HOUR
     next_historical_date: str | None = None
     completed_dates: list[str] = field(default_factory=list)
     failed_dates: list[str] = field(default_factory=list)
     completed_batches: list[dict[str, Any]] = field(default_factory=list)
+    failed_batches: list[dict[str, Any]] = field(default_factory=list)
     last_live_session_at: str | None = None
     last_training_at: str | None = None
     total_historical_files_downloaded: int = 0
     total_historical_days_completed: int = 0
     last_report_path: str | None = None
     last_run_at: str | None = None
+    next_recommended_action: str | None = None
     warnings: list[str] = field(default_factory=list)
     coins: list[str] = field(default_factory=list)
 
@@ -64,16 +76,20 @@ class SchedulerState:
         return {
             "historical_start_date": self.historical_start_date,
             "historical_end_date_target": self.historical_end_date_target,
+            "historical_start_hour": self.historical_start_hour,
+            "historical_end_hour": self.historical_end_hour,
             "next_historical_date": self.next_historical_date,
             "completed_dates": self.completed_dates,
             "failed_dates": self.failed_dates,
             "completed_batches": self.completed_batches,
+            "failed_batches": self.failed_batches,
             "last_live_session_at": self.last_live_session_at,
             "last_training_at": self.last_training_at,
             "total_historical_files_downloaded": self.total_historical_files_downloaded,
             "total_historical_days_completed": self.total_historical_days_completed,
             "last_report_path": self.last_report_path,
             "last_run_at": self.last_run_at,
+            "next_recommended_action": self.next_recommended_action,
             "warnings": self.warnings,
             "coins": self.coins,
         }
@@ -83,10 +99,17 @@ class SchedulerState:
         return cls(
             historical_start_date=payload.get("historical_start_date"),
             historical_end_date_target=payload.get("historical_end_date_target"),
+            historical_start_hour=int(
+                payload.get("historical_start_hour", DEFAULT_HISTORICAL_START_HOUR)
+            ),
+            historical_end_hour=int(
+                payload.get("historical_end_hour", DEFAULT_HISTORICAL_END_HOUR)
+            ),
             next_historical_date=payload.get("next_historical_date"),
             completed_dates=list(payload.get("completed_dates") or []),
             failed_dates=list(payload.get("failed_dates") or []),
             completed_batches=list(payload.get("completed_batches") or []),
+            failed_batches=list(payload.get("failed_batches") or []),
             last_live_session_at=payload.get("last_live_session_at"),
             last_training_at=payload.get("last_training_at"),
             total_historical_files_downloaded=int(
@@ -97,6 +120,7 @@ class SchedulerState:
             ),
             last_report_path=payload.get("last_report_path"),
             last_run_at=payload.get("last_run_at"),
+            next_recommended_action=payload.get("next_recommended_action"),
             warnings=list(payload.get("warnings") or []),
             coins=list(payload.get("coins") or []),
         )
@@ -295,8 +319,112 @@ def _hours_completed_for_date(state: SchedulerState, date: str) -> set[str]:
     return completed
 
 
+def _expected_hours_for_state(state: SchedulerState) -> set[str]:
+    start = _validate_hour_in_range(state.historical_start_hour, label="historical_start_hour")
+    end = _validate_hour_in_range(state.historical_end_hour, label="historical_end_hour")
+    if start > end:
+        raise ValueError(
+            f"historical_start_hour {start} must be <= historical_end_hour {end} in state"
+        )
+    return {str(h) for h in range(start, end + 1)}
+
+
 def _all_hours_completed_for_date(state: SchedulerState, date: str) -> bool:
-    return _hours_completed_for_date(state, date) >= {str(h) for h in ALL_HOURS}
+    return _hours_completed_for_date(state, date) >= _expected_hours_for_state(state)
+
+
+def find_next_incomplete_chunk(
+    state: SchedulerState,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+) -> tuple[str, list[str]] | None:
+    """Return the earliest incomplete (date, hour-chunk) from scheduler state."""
+    if not state.next_historical_date:
+        return None
+
+    target_date = validate_date_yyyymmdd(state.next_historical_date)
+    start_hour = state.historical_start_hour
+    end_hour = state.historical_end_hour
+    hour_chunks = split_hour_range_into_chunks(start_hour, end_hour, chunk_size_hours)
+
+    for chunk_hours in hour_chunks:
+        if not _chunk_hours_completed(state, target_date, chunk_hours):
+            return target_date, chunk_hours
+
+    return None
+
+
+def _hour_range_timestamp_bounds(date: str, hours: list[str]) -> tuple[int, int]:
+    """Return inclusive UTC millisecond bounds for a date and hour list."""
+    date_norm = validate_date_yyyymmdd(date)
+    hour_ints = sorted(int(h) for h in hours)
+    base = datetime.strptime(date_norm, "%Y%m%d").replace(tzinfo=timezone.utc)
+    start_dt = base.replace(hour=hour_ints[0], minute=0, second=0, microsecond=0)
+    end_dt = base.replace(hour=hour_ints[-1], minute=59, second=59, microsecond=999000)
+    return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+
+def _count_rows_in_timestamp_range(csv_path: Path, start_ms: int, end_ms: int) -> int:
+    count = 0
+    with csv_path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            try:
+                timestamp_ms = int(row[TIMESTAMP_MS])
+            except (KeyError, TypeError, ValueError):
+                continue
+            if start_ms <= timestamp_ms <= end_ms:
+                count += 1
+    return count
+
+
+def validate_chunk_historical_data(
+    *,
+    date: str,
+    hours: list[str],
+    coins: list[str],
+    data_root: Path,
+) -> tuple[bool, list[str]]:
+    """Conservative offline check that historical 1s data appears present for a chunk."""
+    issues: list[str] = []
+    start_ms, end_ms = _hour_range_timestamp_bounds(date, hours)
+
+    for coin in coins:
+        csv_path = default_historical_output_path(coin, output_root=data_root)
+        if not csv_path.is_file():
+            issues.append(f"{coin}: historical_1s CSV missing at {csv_path}")
+            continue
+
+        try:
+            coverage = summarize_historical_coverage(csv_path)
+        except Exception as exc:  # noqa: BLE001
+            issues.append(f"{coin}: coverage summary failed: {exc}")
+            continue
+
+        if coverage.duplicate_timestamps != 0:
+            issues.append(f"{coin}: duplicate_timestamps={coverage.duplicate_timestamps}")
+        if coverage.invalid_bid_ask_rows != 0:
+            issues.append(f"{coin}: invalid_bid_ask_rows={coverage.invalid_bid_ask_rows}")
+
+        rows_in_range = _count_rows_in_timestamp_range(csv_path, start_ms, end_ms)
+        if rows_in_range == 0:
+            issues.append(
+                f"{coin}: zero rows in requested range {date} hours {','.join(hours)}"
+            )
+
+    return len(issues) == 0, issues
+
+
+def _cycle_succeeded(report: SchedulerReport) -> bool:
+    if report.failures:
+        return False
+    validate_payload = (report.details or {}).get("resample_validate") or {}
+    if isinstance(validate_payload, dict):
+        if validate_payload.get("failures"):
+            return False
+        for warning in validate_payload.get("warnings") or []:
+            if "validation failed" in str(warning).lower():
+                return False
+    return not any("validation failed" in warning.lower() for warning in report.warnings)
 
 
 def load_state(state_path: Path = DEFAULT_STATE_PATH) -> SchedulerState:
@@ -449,6 +577,11 @@ def _chunk_completed_in_state(
     return batch_key in existing_keys
 
 
+def _chunk_hours_completed(state: SchedulerState, date: str, hours: list[str]) -> bool:
+    completed = _hours_completed_for_date(state, date)
+    return set(hours) <= completed
+
+
 def _count_downloaded_files(batch_report: orchestrator.OrchestratorReport) -> int:
     download = batch_report.details.get("download") or {}
     file_results = download.get("file_results") or []
@@ -505,6 +638,8 @@ def cmd_init_state(
     *,
     historical_start_date: str,
     historical_end_date: str | None = None,
+    historical_start_hour: int = DEFAULT_HISTORICAL_START_HOUR,
+    historical_end_hour: int = DEFAULT_HISTORICAL_END_HOUR,
     coins: list[str],
     reset: bool = False,
     confirm_large_range: bool = False,
@@ -514,6 +649,12 @@ def cmd_init_state(
     start = validate_date_yyyymmdd(historical_start_date)
     end = validate_date_yyyymmdd(historical_end_date) if historical_end_date else None
     normalized_coins = orchestrator._normalize_coins(coins)
+    start_hour = _validate_hour_in_range(historical_start_hour, label="historical-start-hour")
+    end_hour = _validate_hour_in_range(historical_end_hour, label="historical-end-hour")
+    if start_hour > end_hour:
+        raise ValueError(
+            f"historical-start-hour {start_hour} must be <= historical-end-hour {end_hour}"
+        )
 
     if end is not None:
         span = _days_in_range(start, end)
@@ -531,6 +672,8 @@ def cmd_init_state(
     state = SchedulerState(
         historical_start_date=start,
         historical_end_date_target=end,
+        historical_start_hour=start_hour,
+        historical_end_hour=end_hour,
         next_historical_date=start,
         coins=normalized_coins,
         warnings=[ARCHIVE_AVAILABILITY_WARNING],
@@ -557,6 +700,11 @@ def cmd_status(*, state_path: Path = DEFAULT_STATE_PATH) -> dict[str, Any]:
         "coins": state.coins,
         "historical_start_date": state.historical_start_date,
         "historical_end_date_target": state.historical_end_date_target,
+        "historical_start_hour": state.historical_start_hour,
+        "historical_end_hour": state.historical_end_hour,
+        "next_recommended_action": state.next_recommended_action,
+        "completed_batches": len(state.completed_batches),
+        "failed_batches": len(state.failed_batches),
     }
 
 
@@ -599,6 +747,7 @@ def cmd_historical_backfill_next(
     train_interval: str | None = None,
     horizon: int | None = None,
     source: str | None = None,
+    defer_batch_completion: bool = False,
 ) -> SchedulerReport:
     """Run the next bounded historical batch from scheduler state."""
     orchestrator.reject_all_time(all_time=all_time)
@@ -695,16 +844,21 @@ def cmd_historical_backfill_next(
         save_state(state, state_path)
         return report
 
-    state.completed_batches.append(
-        {"date": target_date, "hours": normalized_hours, "completed_at": _utc_now_iso()}
-    )
     downloaded = _count_downloaded_files(batch_report)
     state.total_historical_files_downloaded += downloaded
     report.row_counts.update(batch_report.row_counts)
     report.warnings.extend(batch_report.warnings)
     report.details["orchestrator_batch"] = batch_report.to_dict()
 
-    _advance_date_if_complete(state)
+    if not defer_batch_completion:
+        state.completed_batches.append(
+            {
+                "date": target_date,
+                "hours": normalized_hours,
+                "completed_at": _utc_now_iso(),
+            }
+        )
+        _advance_date_if_complete(state)
     report.next_recommended_action = (
         "python3 bid_ask_research_scheduler.py daily-cycle "
         f"--coins {' '.join(normalized_coins)}"
@@ -734,6 +888,7 @@ def cmd_daily_cycle(
     runs_dir: Path = DEFAULT_RUNS_DIR,
     daily_summary_dir: Path = bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
     s3_client: Any | None = None,
+    defer_batch_completion: bool = False,
 ) -> SchedulerReport:
     """Run one bounded daily research cycle and update scheduler state."""
     state = load_state(state_path)
@@ -763,6 +918,7 @@ def cmd_daily_cycle(
         train_interval=train_interval,
         horizon=horizon,
         source="historical",
+        defer_batch_completion=defer_batch_completion,
     )
     report.workflows_run.append("historical-backfill-next")
     report.historical_date = backfill_report.historical_date
@@ -913,7 +1069,7 @@ def cmd_run_batch_series(
             break
 
         state = load_state(state_path)
-        if _chunk_completed_in_state(state, target_date, chunk_hours):
+        if _chunk_hours_completed(state, target_date, chunk_hours):
             series_report.chunks_skipped += 1
             series_report.warnings.append(
                 f"Chunk hours {', '.join(chunk_hours)} already completed for "
@@ -923,7 +1079,7 @@ def cmd_run_batch_series(
 
         chunk_report = cmd_daily_cycle(
             coins=normalized_coins,
-            historical_hours=chunk_int_hours,
+            historical_hours=[int(h) for h in chunk_hours],
             date=target_date,
             max_files=max_files,
             allow_more=allow_more,
@@ -1033,12 +1189,263 @@ def cmd_live_long_session(
     return report
 
 
+def cmd_auto_backfill_next(
+    *,
+    coins: list[str] | None = None,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+    max_files: int | None = None,
+    allow_more: bool = False,
+    aws_profile: str | None = None,
+    requester_pays: bool = False,
+    train_interval: str = "15s",
+    horizon: int = 5,
+    include_combined: bool = False,
+    data_root: Path = orchestrator.DEFAULT_DATA_ROOT,
+    orchestrator_report_dir: Path = orchestrator.DEFAULT_REPORT_DIR,
+    state_path: Path = DEFAULT_STATE_PATH,
+    runs_dir: Path = DEFAULT_RUNS_DIR,
+    daily_summary_dir: Path = bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
+    s3_client: Any | None = None,
+) -> SchedulerReport:
+    """Run one bounded historical chunk: backfill, validate, train, update state, exit."""
+    orchestrator.reject_all_time(all_time=False)
+    state = load_state(state_path)
+    if state.next_historical_date and _all_hours_completed_for_date(
+        state, state.next_historical_date
+    ):
+        _advance_date_if_complete(state)
+        save_state(state, state_path)
+        state = load_state(state_path)
+    normalized_coins = orchestrator._normalize_coins(coins or state.coins)
+
+    report = SchedulerReport(
+        workflows_run=["auto-backfill-next"],
+        coins=normalized_coins,
+        source="historical",
+        train_interval=train_interval,
+        horizon=horizon,
+        details={"chunk_size_hours": chunk_size_hours},
+    )
+
+    next_chunk = find_next_incomplete_chunk(state, chunk_size_hours)
+    if next_chunk is None:
+        report.warnings.append(AUTO_BACKFILL_COMPLETE_MESSAGE)
+        report.next_recommended_action = "python3 bid_ask_research_scheduler.py status"
+        json_path, md_path = write_scheduler_report(
+            report, runs_dir=runs_dir, label="auto_backfill_complete"
+        )
+        state.next_recommended_action = report.next_recommended_action
+        state.last_report_path = str(json_path)
+        state.last_run_at = _utc_now_iso()
+        save_state(state, state_path)
+        report.details["scheduler_report_paths"] = {"json": str(json_path), "markdown": str(md_path)}
+        return report
+
+    target_date, chunk_hours = next_chunk
+    report.historical_date = target_date
+    report.historical_hours = chunk_hours
+
+    cycle_report = cmd_daily_cycle(
+        coins=normalized_coins,
+        historical_hours=[int(h) for h in chunk_hours],
+        date=target_date,
+        max_files=max_files,
+        allow_more=allow_more,
+        aws_profile=aws_profile,
+        requester_pays=requester_pays,
+        train_interval=train_interval,
+        horizon=horizon,
+        include_combined=include_combined,
+        data_root=data_root,
+        orchestrator_report_dir=orchestrator_report_dir,
+        state_path=state_path,
+        runs_dir=runs_dir,
+        daily_summary_dir=daily_summary_dir,
+        s3_client=s3_client,
+        defer_batch_completion=True,
+    )
+
+    report.workflows_run.extend(cycle_report.workflows_run)
+    report.row_counts.update(cycle_report.row_counts)
+    report.warnings.extend(cycle_report.warnings)
+    report.failures.extend(cycle_report.failures)
+    report.details.update(cycle_report.details)
+    report.training_reports.extend(cycle_report.training_reports)
+    report.model_artifact_paths.extend(cycle_report.model_artifact_paths)
+    report.evaluation_report_paths.extend(cycle_report.evaluation_report_paths)
+    report.filter_report_paths.extend(cycle_report.filter_report_paths)
+    report.model_paths.extend(cycle_report.model_paths)
+    report.evaluation_paths.extend(cycle_report.evaluation_paths)
+
+    state = load_state(state_path)
+    cycle_paths = (cycle_report.details or {}).get("scheduler_report_paths") or {}
+    json_path_str = cycle_paths.get("json")
+    md_path_str = cycle_paths.get("markdown")
+
+    if _cycle_succeeded(cycle_report):
+        batch_entry = {
+            "date": target_date,
+            "hours": chunk_hours,
+            "completed_at": _utc_now_iso(),
+            "report_path": json_path_str,
+        }
+        state.completed_batches.append(batch_entry)
+        backfill_details = (cycle_report.details or {}).get("historical_backfill") or {}
+        orch_batch = (backfill_details.get("details") or {}).get("orchestrator_batch") or {}
+        downloaded = _count_downloaded_files(
+            orchestrator.OrchestratorReport(details=orch_batch)
+        )
+        state.total_historical_files_downloaded += downloaded
+        _advance_date_if_complete(state)
+        report.next_recommended_action = (
+            "python3 bid_ask_research_scheduler.py auto-backfill-next "
+            f"--coins {' '.join(normalized_coins)} "
+            f"--chunk-size-hours {chunk_size_hours} "
+            f"--train-interval {train_interval} --horizon {horizon}"
+        )
+        if state.next_historical_date is None:
+            report.next_recommended_action = "python3 bid_ask_research_scheduler.py status"
+    else:
+        reason_parts = list(cycle_report.failures)
+        reason_parts.extend(
+            w for w in cycle_report.warnings if "validation failed" in w.lower()
+        )
+        reason = "; ".join(reason_parts) or "daily cycle did not pass validation"
+        failed_entry = {
+            "date": target_date,
+            "hours": chunk_hours,
+            "failed_at": _utc_now_iso(),
+            "reason": reason,
+            "report_path": json_path_str,
+        }
+        state.failed_batches.append(failed_entry)
+        report.next_recommended_action = (
+            "Review failure report, fix data/tooling, then rerun auto-backfill-next"
+        )
+
+    state.next_recommended_action = report.next_recommended_action
+    auto_json_path, auto_md_path = write_scheduler_report(
+        report, runs_dir=runs_dir, label="auto_backfill"
+    )
+    state.last_report_path = str(auto_json_path)
+    state.last_run_at = _utc_now_iso()
+    save_state(state, state_path)
+    report.details["scheduler_report_paths"] = {
+        "json": str(auto_json_path),
+        "markdown": str(auto_md_path),
+        "daily_cycle_json": json_path_str,
+        "daily_cycle_markdown": md_path_str,
+    }
+    return report
+
+
+def cmd_repair_state_from_existing_data(
+    *,
+    date: str,
+    start_hour: int,
+    end_hour: int,
+    coins: list[str] | None = None,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+    data_root: Path = orchestrator.DEFAULT_DATA_ROOT,
+    state_path: Path = DEFAULT_STATE_PATH,
+    runs_dir: Path = DEFAULT_RUNS_DIR,
+) -> SchedulerReport:
+    """Mark completed chunks inferred from existing historical CSV data (no download/train)."""
+    target_date = validate_date_yyyymmdd(date)
+    validate_batch_series_hours(
+        start_hour=start_hour,
+        end_hour=end_hour,
+        chunk_size_hours=chunk_size_hours,
+        allow_more=True,
+    )
+    state = load_state(state_path)
+    normalized_coins = orchestrator._normalize_coins(coins or state.coins)
+    hour_chunks = split_hour_range_into_chunks(start_hour, end_hour, chunk_size_hours)
+
+    report = SchedulerReport(
+        workflows_run=["repair-state-from-existing-data"],
+        coins=normalized_coins,
+        historical_date=target_date,
+        source="historical",
+        warnings=[REPAIR_INFERRED_WARNING],
+        details={"chunk_size_hours": chunk_size_hours, "chunks_repaired": []},
+    )
+
+    repaired = 0
+    skipped = 0
+    failed = 0
+
+    for chunk_hours in hour_chunks:
+        if _chunk_hours_completed(state, target_date, chunk_hours):
+            skipped += 1
+            report.warnings.append(
+                f"Chunk hours {', '.join(chunk_hours)} already completed; skipping"
+            )
+            continue
+
+        valid, issues = validate_chunk_historical_data(
+            date=target_date,
+            hours=chunk_hours,
+            coins=normalized_coins,
+            data_root=data_root,
+        )
+        if not valid:
+            failed += 1
+            report.failures.extend(
+                [f"Chunk {', '.join(chunk_hours)}: {issue}" for issue in issues]
+            )
+            continue
+
+        batch_entry = {
+            "date": target_date,
+            "hours": chunk_hours,
+            "completed_at": _utc_now_iso(),
+            "report_path": None,
+            "repaired_from_existing_data": True,
+        }
+        state.completed_batches.append(batch_entry)
+        repaired += 1
+        report.details["chunks_repaired"].append(chunk_hours)
+
+    if target_date == state.next_historical_date:
+        _advance_date_if_complete(state)
+
+    report.row_counts["chunks_repaired"] = repaired
+    report.row_counts["chunks_skipped"] = skipped
+    report.row_counts["chunks_failed"] = failed
+
+    if failed:
+        report.next_recommended_action = (
+            "Fix missing/invalid data for failed chunks, then rerun repair-state-from-existing-data"
+        )
+    elif repaired:
+        report.next_recommended_action = (
+            "python3 bid_ask_research_scheduler.py auto-backfill-next "
+            f"--coins {' '.join(normalized_coins)}"
+        )
+    else:
+        report.next_recommended_action = "python3 bid_ask_research_scheduler.py status"
+
+    json_path, md_path = write_scheduler_report(report, runs_dir=runs_dir, label="repair_state")
+    state.next_recommended_action = report.next_recommended_action
+    state.last_report_path = str(json_path)
+    state.last_run_at = _utc_now_iso()
+    if REPAIR_INFERRED_WARNING not in state.warnings:
+        state.warnings.append(REPAIR_INFERRED_WARNING)
+    save_state(state, state_path)
+    report.details["scheduler_report_paths"] = {"json": str(json_path), "markdown": str(md_path)}
+    return report
+
+
 def cmd_write_launchd_template(
     *,
     run_time: str = "02:00",
     coins: list[str],
     aws_profile: str | None = None,
     requester_pays: bool = False,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+    train_interval: str = "15s",
+    horizon: int = 5,
     state_dir: Path = DEFAULT_STATE_DIR,
     project_root: Path | None = None,
 ) -> tuple[Path, Path]:
@@ -1052,9 +1459,15 @@ def cmd_write_launchd_template(
     cmd_parts = [
         python_path,
         str(scheduler_script),
-        "daily-cycle",
+        "auto-backfill-next",
         "--coins",
         *normalized_coins,
+        "--chunk-size-hours",
+        str(chunk_size_hours),
+        "--train-interval",
+        train_interval,
+        "--horizon",
+        str(horizon),
     ]
     if aws_profile:
         cmd_parts.extend(["--aws-profile", aws_profile])
@@ -1096,7 +1509,9 @@ def cmd_write_launchd_template(
     setup_lines = [
         "# macOS launchd Setup for Daily Research Scheduler",
         "",
-        "This template runs `daily-cycle` once per day. It is **not installed automatically**.",
+        "This template runs `auto-backfill-next` once per schedule tick. "
+        "Each invocation processes **one bounded chunk** and exits. "
+        "It is **not installed automatically**.",
         "",
         "## Files",
         "",
@@ -1112,14 +1527,19 @@ def cmd_write_launchd_template(
         "python3 bid_ask_research_scheduler.py init-state \\",
         "  --historical-start-date YYYYMMDD \\",
         "  --historical-end-date YYYYMMDD \\",
-        f"  --coins {coin_args}",
+        f"  --coins {coin_args} \\",
+        "  --historical-start-hour 0 \\",
+        "  --historical-end-hour 23",
         "```",
         "",
-        "2. Verify a manual daily cycle succeeds:",
+        "2. Verify a manual auto-backfill chunk succeeds:",
         "",
         "```bash",
-        "python3 bid_ask_research_scheduler.py daily-cycle \\",
-        f"  --coins {coin_args}",
+        "python3 bid_ask_research_scheduler.py auto-backfill-next \\",
+        f"  --coins {coin_args} \\",
+        f"  --chunk-size-hours {chunk_size_hours} \\",
+        f"  --train-interval {train_interval} \\",
+        f"  --horizon {horizon}",
         "```",
         "",
         "## Install (manual)",
@@ -1139,10 +1559,11 @@ def cmd_write_launchd_template(
         "## Safety",
         "",
         "- Research-only, paper-only; no orders or execution endpoints.",
-        "- Historical backfill progresses in bounded daily batches.",
+        "- Each scheduled run processes one bounded chunk and exits (no infinite loop).",
         "- Archive availability is not guaranteed.",
         "",
         f"Scheduled time: **{run_time}** local time.",
+        f"Chunk size: **{chunk_size_hours}** hours; train interval: **{train_interval}**; horizon: **{horizon}**.",
     ]
     setup_md.write_text("\n".join(setup_lines) + "\n", encoding="utf-8")
     return plist_path, setup_md
@@ -1165,6 +1586,18 @@ def build_parser() -> argparse.ArgumentParser:
         "--confirm-large-range",
         action="store_true",
         help=f"Allow ranges larger than {LARGE_RANGE_DAYS} days",
+    )
+    init_state.add_argument(
+        "--historical-start-hour",
+        type=int,
+        default=DEFAULT_HISTORICAL_START_HOUR,
+        help="First UTC hour to backfill each day (default 0)",
+    )
+    init_state.add_argument(
+        "--historical-end-hour",
+        type=int,
+        default=DEFAULT_HISTORICAL_END_HOUR,
+        help="Last UTC hour to backfill each day (default 23)",
     )
     init_state.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
 
@@ -1238,6 +1671,50 @@ def build_parser() -> argparse.ArgumentParser:
         default=bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
     )
 
+    auto_backfill = subparsers.add_parser(
+        "auto-backfill-next",
+        help="Run one self-validating historical chunk and exit",
+    )
+    auto_backfill.add_argument("--coins", nargs="+", default=None)
+    auto_backfill.add_argument(
+        "--chunk-size-hours",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE_HOURS,
+    )
+    auto_backfill.add_argument("--max-files", type=int, default=None)
+    auto_backfill.add_argument("--allow-more", action="store_true")
+    auto_backfill.add_argument("--aws-profile", default=None)
+    auto_backfill.add_argument("--requester-pays", action="store_true")
+    auto_backfill.add_argument("--train-interval", default="15s", choices=["15s", "1m"])
+    auto_backfill.add_argument("--horizon", type=int, default=5)
+    auto_backfill.add_argument("--include-combined", action="store_true")
+    auto_backfill.add_argument("--data-root", type=Path, default=orchestrator.DEFAULT_DATA_ROOT)
+    auto_backfill.add_argument("--report-dir", type=Path, default=orchestrator.DEFAULT_REPORT_DIR)
+    auto_backfill.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    auto_backfill.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR)
+    auto_backfill.add_argument(
+        "--daily-summary-dir",
+        type=Path,
+        default=bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
+    )
+
+    repair_state = subparsers.add_parser(
+        "repair-state-from-existing-data",
+        help="Mark chunks complete from existing historical CSV data",
+    )
+    repair_state.add_argument("--date", required=True, help="YYYYMMDD")
+    repair_state.add_argument("--start-hour", type=int, required=True)
+    repair_state.add_argument("--end-hour", type=int, required=True)
+    repair_state.add_argument("--coins", nargs="+", default=None)
+    repair_state.add_argument(
+        "--chunk-size-hours",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE_HOURS,
+    )
+    repair_state.add_argument("--data-root", type=Path, default=orchestrator.DEFAULT_DATA_ROOT)
+    repair_state.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    repair_state.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR)
+
     live = subparsers.add_parser("live-long-session", help="Finite live recorder session")
     live.add_argument("--coins", nargs="+", required=True)
     live.add_argument("--duration-seconds", type=float, required=True)
@@ -1255,6 +1732,13 @@ def build_parser() -> argparse.ArgumentParser:
     launchd.add_argument("--coins", nargs="+", required=True)
     launchd.add_argument("--aws-profile", default=None)
     launchd.add_argument("--requester-pays", action="store_true")
+    launchd.add_argument(
+        "--chunk-size-hours",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE_HOURS,
+    )
+    launchd.add_argument("--train-interval", default="15s", choices=["15s", "1m"])
+    launchd.add_argument("--horizon", type=int, default=5)
     launchd.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
     launchd.add_argument("--project-root", type=Path, default=None)
 
@@ -1283,6 +1767,8 @@ def main(argv: list[str] | None = None) -> int:
             state = cmd_init_state(
                 historical_start_date=args.historical_start_date,
                 historical_end_date=args.historical_end_date,
+                historical_start_hour=args.historical_start_hour,
+                historical_end_hour=args.historical_end_hour,
                 coins=args.coins,
                 reset=args.reset,
                 confirm_large_range=args.confirm_large_range,
@@ -1290,6 +1776,9 @@ def main(argv: list[str] | None = None) -> int:
             )
             print(f"Initialized scheduler state at {args.state_path}")
             print(f"  next_historical_date: {state.next_historical_date}")
+            print(
+                f"  hour window: {state.historical_start_hour}-{state.historical_end_hour} UTC"
+            )
             print(f"  warning: {ARCHIVE_AVAILABILITY_WARNING}")
         elif args.command == "status":
             status = cmd_status(state_path=args.state_path)
@@ -1360,6 +1849,52 @@ def main(argv: list[str] | None = None) -> int:
             )
             if report.next_recommended_action:
                 print(f"Next: {report.next_recommended_action}")
+        elif args.command == "auto-backfill-next":
+            report = cmd_auto_backfill_next(
+                coins=args.coins,
+                chunk_size_hours=args.chunk_size_hours,
+                max_files=args.max_files,
+                allow_more=args.allow_more,
+                aws_profile=args.aws_profile,
+                requester_pays=args.requester_pays,
+                train_interval=args.train_interval,
+                horizon=args.horizon,
+                include_combined=args.include_combined,
+                data_root=args.data_root,
+                orchestrator_report_dir=args.report_dir,
+                state_path=args.state_path,
+                runs_dir=args.runs_dir,
+                daily_summary_dir=args.daily_summary_dir,
+            )
+            if any(AUTO_BACKFILL_COMPLETE_MESSAGE in w for w in report.warnings):
+                print(AUTO_BACKFILL_COMPLETE_MESSAGE)
+            else:
+                print(
+                    f"Auto backfill complete: date={report.historical_date} "
+                    f"hours={report.historical_hours} workflows={report.workflows_run}"
+                )
+            if report.next_recommended_action:
+                print(f"Next: {report.next_recommended_action}")
+        elif args.command == "repair-state-from-existing-data":
+            report = cmd_repair_state_from_existing_data(
+                date=args.date,
+                start_hour=args.start_hour,
+                end_hour=args.end_hour,
+                coins=args.coins,
+                chunk_size_hours=args.chunk_size_hours,
+                data_root=args.data_root,
+                state_path=args.state_path,
+                runs_dir=args.runs_dir,
+            )
+            print(
+                "Repair complete: "
+                f"repaired={report.row_counts.get('chunks_repaired', 0)} "
+                f"skipped={report.row_counts.get('chunks_skipped', 0)} "
+                f"failed={report.row_counts.get('chunks_failed', 0)}"
+            )
+            print(f"Warning: {REPAIR_INFERRED_WARNING}")
+            if report.next_recommended_action:
+                print(f"Next: {report.next_recommended_action}")
         elif args.command == "live-long-session":
             report = cmd_live_long_session(
                 coins=args.coins,
@@ -1379,6 +1914,9 @@ def main(argv: list[str] | None = None) -> int:
                 coins=args.coins,
                 aws_profile=args.aws_profile,
                 requester_pays=args.requester_pays,
+                chunk_size_hours=args.chunk_size_hours,
+                train_interval=args.train_interval,
+                horizon=args.horizon,
                 state_dir=args.state_dir,
                 project_root=args.project_root,
             )

@@ -355,8 +355,16 @@ on top of `bid_ask_research_orchestrator.py`. It tracks progress in
 python3 bid_ask_research_scheduler.py init-state \
   --historical-start-date 20230916 \
   --historical-end-date 20230930 \
-  --coins BTC ETH SOL
+  --coins BTC ETH SOL \
+  --historical-start-hour 0 \
+  --historical-end-hour 23
 ```
+
+Use `--historical-start-hour` and `--historical-end-hour` to bound the UTC hour
+window processed for every date (defaults `0`–`23`). For example, to backfill only
+market hours `9`–`14`, pass `--historical-start-hour 9 --historical-end-hour 14`.
+Existing state files without these fields default to `0`–`23` for backwards
+compatibility.
 
 Large date ranges require `--confirm-large-range`. Archive availability is not
 guaranteed.
@@ -439,6 +447,60 @@ Behavior:
 - Optional `--include-combined` runs combined dataset + train after each chunk (default off).
 - No `--all-time` support.
 
+### Automatic self-validating backfill (launchd/cron friendly)
+
+Run **one bounded chunk** per invocation: download → validate (1s/15s/1m) →
+train/evaluate → write report → update state → exit. Suitable for `launchd` or
+cron scheduling without manual hour selection.
+
+```bash
+python3 bid_ask_research_scheduler.py auto-backfill-next \
+  --coins BTC ETH SOL \
+  --aws-profile hyperliquid-research \
+  --requester-pays \
+  --chunk-size-hours 3 \
+  --train-interval 15s \
+  --horizon 5
+```
+
+Behavior:
+
+1. Reads `reports/bid_ask_research_scheduler/state.json`
+2. Uses `next_historical_date`, `historical_start_hour`, `historical_end_hour`, and
+   `completed_batches` to select the earliest incomplete chunk
+3. Runs the same workflow as `daily-cycle` for that date/hours
+4. Marks the chunk complete **only** when validation and training succeed
+5. Records failures in `failed_batches` without advancing completion state
+6. Advances `next_historical_date` when all hours in the day window are complete
+7. Prints a success message and exits when the configured date range is complete
+
+State fields (`state.json`):
+
+| Field | Purpose |
+| --- | --- |
+| `historical_start_hour` / `historical_end_hour` | UTC hour window per date (default 0–23) |
+| `completed_batches` | `{date, hours, completed_at, report_path}` entries |
+| `failed_batches` | `{date, hours, failed_at, reason, report_path}` entries |
+| `next_recommended_action` | Suggested next CLI command |
+
+### Repair state from existing data
+
+If you already imported hours manually, infer completed chunks from existing
+`historical_1s` CSVs without downloading or training:
+
+```bash
+python3 bid_ask_research_scheduler.py repair-state-from-existing-data \
+  --date 20230916 \
+  --coins BTC ETH SOL \
+  --start-hour 9 \
+  --end-hour 14 \
+  --chunk-size-hours 3
+```
+
+Validation per coin: CSV exists, nonzero rows in the requested hour range,
+`duplicate_timestamps == 0`, `invalid_bid_ask_rows == 0`. Writes a warning that
+repair is inferred from existing data.
+
 ### macOS launchd template (manual install)
 
 ```bash
@@ -446,11 +508,15 @@ python3 bid_ask_research_scheduler.py write-launchd-template \
   --time 02:00 \
   --coins BTC ETH SOL \
   --aws-profile hyperliquid-research \
-  --requester-pays
+  --requester-pays \
+  --chunk-size-hours 3 \
+  --train-interval 15s \
+  --horizon 5
 ```
 
 Writes `reports/bid_ask_research_scheduler/com.hyperliquid.research.daily.plist` and
-`launchd_setup.md`. Does **not** install or schedule automatically.
+`launchd_setup.md`. The plist runs `auto-backfill-next` (one chunk per schedule
+tick). Does **not** install or schedule automatically.
 
 ## Future Work (Not in This Phase)
 
