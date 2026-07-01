@@ -60,6 +60,23 @@ DEFAULT_MIN_EDGE_BPS = 0.0
 DEFAULT_COST_MULTIPLIER = 1.0
 DEFAULT_HORIZON_RETURN_SCALE_BPS = 10.0
 DEFAULT_TRADE_CLASSES = frozenset({"UP", "DOWN"})
+DEFAULT_DIAGNOSTICS_DETAIL = "basic"
+DEFAULT_ACCEPTED_TRADES_LIMIT = 1000
+
+ACCEPTED_TRADES_CSV_COLUMNS = (
+    "coin",
+    "window_index",
+    "row_index",
+    "timestamp_iso",
+    "predicted_class",
+    "actual_label",
+    "confidence",
+    "future_return_bps",
+    "gross_return_bps",
+    "cost_bps",
+    "net_return_bps",
+    "spread_bps",
+)
 
 MIN_ROWS_WARNING = 50
 DEFAULT_MIN_WINDOWS = 5
@@ -305,6 +322,90 @@ def evaluate_trade_filter(
     return True, "", total_cost_bps, required_edge_bps
 
 
+def empty_class_count() -> dict[str, int]:
+    """Return zero counts for UP/DOWN/FLAT prediction classes."""
+    return {label: 0 for label in LABELS}
+
+
+def empty_class_trade_metrics() -> dict[str, Any]:
+    """Return zeroed trade metrics for one predicted class."""
+    return {
+        "trades": 0,
+        "cumulative_net_return_bps": 0.0,
+        "average_net_return_bps": 0.0,
+        "win_rate_after_costs": 0.0,
+        "average_cost_bps": 0.0,
+        "average_confidence": 0.0,
+    }
+
+
+def empty_class_trade_diagnostics() -> dict[str, dict[str, Any]]:
+    """Return empty per-class trade diagnostics for UP/DOWN/FLAT."""
+    return {label: empty_class_trade_metrics() for label in LABELS}
+
+
+def _normalize_predicted_class(prediction: str) -> str:
+    normalized = str(prediction).upper()
+    if normalized in LABELS:
+        return normalized
+    return "FLAT"
+
+
+def aggregate_class_trade_diagnostics(
+    accepted_trade_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Compute per-class metrics from accepted filtered paper trade records."""
+    diagnostics = empty_class_trade_diagnostics()
+    grouped: dict[str, list[dict[str, Any]]] = {label: [] for label in LABELS}
+    for record in accepted_trade_records:
+        predicted_class = _normalize_predicted_class(record.get("predicted_class", "FLAT"))
+        grouped[predicted_class].append(record)
+
+    for label in LABELS:
+        records = grouped[label]
+        if not records:
+            continue
+        net_returns = [float(record["net_return_bps"]) for record in records]
+        costs = [float(record["cost_bps"]) for record in records]
+        confidences = [float(record["confidence"]) for record in records]
+        trades = len(records)
+        cumulative_net_return_bps = float(sum(net_returns))
+        wins = sum(1 for value in net_returns if value > 0)
+        diagnostics[label] = {
+            "trades": trades,
+            "cumulative_net_return_bps": cumulative_net_return_bps,
+            "average_net_return_bps": cumulative_net_return_bps / trades,
+            "win_rate_after_costs": wins / trades,
+            "average_cost_bps": float(np.mean(costs)),
+            "average_confidence": float(np.mean(confidences)),
+        }
+    return diagnostics
+
+
+def aggregate_coin_class_trade_diagnostics(
+    accepted_trade_records: list[dict[str, Any]],
+    *,
+    coins: list[str] | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Compute per-coin, per-class metrics from accepted filtered paper trade records."""
+    coin_set = {coin.upper() for coin in coins} if coins else None
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in accepted_trade_records:
+        coin = str(record.get("coin", "UNKNOWN")).upper()
+        if coin_set is not None and coin not in coin_set:
+            continue
+        grouped.setdefault(coin, []).append(record)
+
+    if coin_set is not None:
+        for coin in sorted(coin_set):
+            grouped.setdefault(coin, [])
+
+    return {
+        coin: aggregate_class_trade_diagnostics(records)
+        for coin, records in sorted(grouped.items())
+    }
+
+
 def simulate_paper_signal_returns(
     test_df: pd.DataFrame,
     predictions: list[str],
@@ -315,11 +416,14 @@ def simulate_paper_signal_returns(
     slippage_bps: float,
     default_spread_bps: float,
     trade_filter: TradeFilterConfig,
+    coin: str | None = None,
+    window_index: int | None = None,
 ) -> dict[str, Any]:
     """Simulate paper-only cost-adjusted returns with cost-aware filtering."""
     gross_returns: list[float] = []
     net_returns: list[float] = []
     trade_returns: list[float] = []
+    accepted_trade_records: list[dict[str, Any]] = []
     raw_predictions = 0
     filtered_paper_trades = 0
     blocked_by_confidence = 0
@@ -327,16 +431,21 @@ def simulate_paper_signal_returns(
     blocked_by_spread = 0
     blocked_by_volatility = 0
     blocked_by_trade_class = 0
+    blocked_by_class = empty_class_count()
+    accepted_by_class = empty_class_count()
     cost_samples: list[float] = []
     required_edge_samples: list[float] = []
 
     for index, (_, row) in enumerate(test_df.iterrows()):
         prediction = predictions[index] if index < len(predictions) else "FLAT"
+        predicted_class = _normalize_predicted_class(prediction)
         confidence = float(confidences[index]) if index < len(confidences) else 0.0
         confidence_edge = (
             float(confidence_edges[index]) if index < len(confidence_edges) else 0.0
         )
         future_return = float(row["future_return_bps"])
+        spread_bps = _spread_cost_bps(row, default_spread_bps)
+        actual_label = str(row["label"]) if "label" in row.index and pd.notna(row["label"]) else "FLAT"
 
         allowed, block_reason, total_cost_bps, required_edge_bps = evaluate_trade_filter(
             prediction=prediction,
@@ -355,6 +464,7 @@ def simulate_paper_signal_returns(
             required_edge_samples.append(required_edge_bps)
 
         if not allowed:
+            blocked_by_class[predicted_class] += 1
             if block_reason == "confidence":
                 blocked_by_confidence += 1
             elif block_reason == "cost":
@@ -379,14 +489,40 @@ def simulate_paper_signal_returns(
         net_returns.append(net)
         filtered_paper_trades += 1
         trade_returns.append(net)
+        accepted_by_class[predicted_class] += 1
+        accepted_trade_records.append(
+            {
+                "coin": str(coin).upper() if coin else "UNKNOWN",
+                "window_index": window_index,
+                "row_index": index,
+                "timestamp_iso": (
+                    str(row["timestamp_iso"])
+                    if "timestamp_iso" in row.index and pd.notna(row["timestamp_iso"])
+                    else ""
+                ),
+                "predicted_class": predicted_class,
+                "actual_label": actual_label,
+                "confidence": confidence,
+                "future_return_bps": future_return,
+                "gross_return_bps": gross,
+                "cost_bps": total_cost_bps,
+                "net_return_bps": net,
+                "spread_bps": spread_bps,
+            }
+        )
 
     trade_filter_summary = trade_filter_to_summary(trade_filter)
+    class_trade_diagnostics = aggregate_class_trade_diagnostics(accepted_trade_records)
 
     return {
         "gross_returns_bps": gross_returns,
         "net_returns_bps": net_returns,
         "accepted_trade_net_returns_bps": trade_returns,
         "trade_returns_bps": trade_returns,
+        "accepted_trade_records": accepted_trade_records,
+        "class_trade_diagnostics": class_trade_diagnostics,
+        "blocked_by_class": blocked_by_class,
+        "accepted_by_class": accepted_by_class,
         "raw_predictions": raw_predictions,
         "filtered_paper_trades": filtered_paper_trades,
         "blocked_by_confidence": blocked_by_confidence,
@@ -590,6 +726,67 @@ def _missing_data_warning(df: pd.DataFrame) -> str | None:
     return None
 
 
+def _merge_class_counts(*counts: dict[str, int]) -> dict[str, int]:
+    merged = empty_class_count()
+    for count_map in counts:
+        for label in LABELS:
+            merged[label] += int(count_map.get(label, 0))
+    return merged
+
+
+def _format_class_trade_diagnostics_section(
+    class_trade_diagnostics: dict[str, dict[str, Any]],
+    *,
+    heading: str,
+) -> list[str]:
+    lines = [heading, ""]
+    for label in LABELS:
+        metrics = class_trade_diagnostics.get(label, empty_class_trade_metrics())
+        lines.extend(
+            [
+                f"### {label}",
+                "",
+                f"- trades: {metrics.get('trades', 0)}",
+                f"- cumulative_net_return_bps: {metrics.get('cumulative_net_return_bps', 0.0):.4f}",
+                f"- average_net_return_bps: {metrics.get('average_net_return_bps', 0.0):.4f}",
+                f"- win_rate_after_costs: {metrics.get('win_rate_after_costs', 0.0):.4f}",
+                f"- average_cost_bps: {metrics.get('average_cost_bps', 0.0):.4f}",
+                f"- average_confidence: {metrics.get('average_confidence', 0.0):.4f}",
+                "",
+            ]
+        )
+    return lines
+
+
+def write_accepted_trades_csv(
+    accepted_trade_records: list[dict[str, Any]],
+    *,
+    reports_dir: Path = DEFAULT_REPORTS_DIR,
+    report: dict[str, Any],
+    limit: int = DEFAULT_ACCEPTED_TRADES_LIMIT,
+) -> Path | None:
+    """Write accepted filtered paper trades to CSV (research-only diagnostics)."""
+    if not accepted_trade_records:
+        return None
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    stamp = _report_stamp(report)
+    coins_label = "_".join(report.get("coins", ["UNKNOWN"]))
+    output_path = reports_dir / f"accepted_trades_{coins_label}_{stamp}.csv"
+
+    limited_records = accepted_trade_records[: max(0, limit)]
+    rows = [
+        {column: record.get(column, "") for column in ACCEPTED_TRADES_CSV_COLUMNS}
+        for record in limited_records
+    ]
+    pd.DataFrame(rows, columns=list(ACCEPTED_TRADES_CSV_COLUMNS)).to_csv(
+        output_path, index=False
+    )
+    report["accepted_trades_csv_path"] = str(output_path)
+    report["accepted_trades_saved_count"] = len(limited_records)
+    return output_path
+
+
 def evaluate_walk_forward_window(
     model_df: pd.DataFrame,
     window: tuple[int, int, int, int],
@@ -664,6 +861,8 @@ def evaluate_walk_forward_window(
         slippage_bps=slippage_bps,
         default_spread_bps=default_spread_bps,
         trade_filter=trade_filter,
+        coin=coin,
+        window_index=window_index,
     )
     accepted_trade_net_returns_bps = list(
         paper_simulation["accepted_trade_net_returns_bps"]
@@ -721,6 +920,10 @@ def evaluate_walk_forward_window(
         "blocked_by_spread": paper_simulation["blocked_by_spread"],
         "blocked_by_volatility": paper_simulation["blocked_by_volatility"],
         "blocked_by_trade_class": paper_simulation["blocked_by_trade_class"],
+        "blocked_by_class": paper_simulation["blocked_by_class"],
+        "accepted_by_class": paper_simulation["accepted_by_class"],
+        "class_trade_diagnostics": paper_simulation["class_trade_diagnostics"],
+        "accepted_trade_records": paper_simulation["accepted_trade_records"],
         "trade_filter_summary": paper_simulation["trade_filter_summary"],
         "average_cost_bps": paper_simulation["average_cost_bps"],
         "average_required_edge_bps": paper_simulation["average_required_edge_bps"],
@@ -868,6 +1071,9 @@ def evaluate_coin_walk_forward(
     average_required_edge_bps = float(np.mean(required_edge_values)) if required_edge_values else 0.0
 
     accepted_trade_net_returns_bps: list[float] = []
+    accepted_trade_records: list[dict[str, Any]] = []
+    blocked_by_class = empty_class_count()
+    accepted_by_class = empty_class_count()
     for window in completed:
         accepted_trade_net_returns_bps.extend(
             float(value)
@@ -876,8 +1082,19 @@ def evaluate_coin_walk_forward(
                 window.get("trade_returns_bps", []),
             )
         )
+        accepted_trade_records.extend(window.get("accepted_trade_records", []))
+        blocked_by_class = _merge_class_counts(
+            blocked_by_class, window.get("blocked_by_class", empty_class_count())
+        )
+        accepted_by_class = _merge_class_counts(
+            accepted_by_class, window.get("accepted_by_class", empty_class_count())
+        )
 
     trade_metrics = aggregate_accepted_trade_metrics(accepted_trade_net_returns_bps)
+    class_trade_diagnostics = aggregate_class_trade_diagnostics(accepted_trade_records)
+    coin_class_trade_diagnostics = {
+        coin: class_trade_diagnostics,
+    }
     cumulative_net_return_bps = trade_metrics["cumulative_net_return_bps"]
     average_net_return_bps = trade_metrics["average_net_return_bps"]
     win_rate_after_costs = trade_metrics["win_rate_after_costs"]
@@ -935,6 +1152,11 @@ def evaluate_coin_walk_forward(
         "blocked_by_spread": blocked_by_spread,
         "blocked_by_volatility": blocked_by_volatility,
         "blocked_by_trade_class": blocked_by_trade_class,
+        "blocked_by_class": blocked_by_class,
+        "accepted_by_class": accepted_by_class,
+        "class_trade_diagnostics": class_trade_diagnostics,
+        "coin_class_trade_diagnostics": coin_class_trade_diagnostics,
+        "accepted_trade_records": accepted_trade_records,
         "trade_filter_summary": trade_filter_to_summary(trade_filter),
         "average_cost_bps": average_cost_bps,
         "average_required_edge_bps": average_required_edge_bps,
@@ -1023,6 +1245,9 @@ def build_walk_forward_report(
     )
 
     accepted_trade_net_returns_bps: list[float] = []
+    accepted_trade_records: list[dict[str, Any]] = []
+    blocked_by_class = empty_class_count()
+    accepted_by_class = empty_class_count()
     for item in completed_coins:
         accepted_trade_net_returns_bps.extend(
             float(value)
@@ -1031,8 +1256,20 @@ def build_walk_forward_report(
                 item.get("trade_returns_bps", []),
             )
         )
+        accepted_trade_records.extend(item.get("accepted_trade_records", []))
+        blocked_by_class = _merge_class_counts(
+            blocked_by_class, item.get("blocked_by_class", empty_class_count())
+        )
+        accepted_by_class = _merge_class_counts(
+            accepted_by_class, item.get("accepted_by_class", empty_class_count())
+        )
 
     trade_metrics = aggregate_accepted_trade_metrics(accepted_trade_net_returns_bps)
+    class_trade_diagnostics = aggregate_class_trade_diagnostics(accepted_trade_records)
+    coin_class_trade_diagnostics = aggregate_coin_class_trade_diagnostics(
+        accepted_trade_records,
+        coins=coins,
+    )
     cumulative_net_return_bps = trade_metrics["cumulative_net_return_bps"]
     average_net_return_bps = trade_metrics["average_net_return_bps"]
     win_rate_after_costs = trade_metrics["win_rate_after_costs"]
@@ -1133,6 +1370,11 @@ def build_walk_forward_report(
         "blocked_by_spread": blocked_by_spread,
         "blocked_by_volatility": blocked_by_volatility,
         "blocked_by_trade_class": blocked_by_trade_class,
+        "blocked_by_class": blocked_by_class,
+        "accepted_by_class": accepted_by_class,
+        "class_trade_diagnostics": class_trade_diagnostics,
+        "coin_class_trade_diagnostics": coin_class_trade_diagnostics,
+        "accepted_trade_records": accepted_trade_records,
         "average_cost_bps": average_cost_bps,
         "average_required_edge_bps": average_required_edge_bps,
         "accepted_trade_net_returns_bps": accepted_trade_net_returns_bps,
@@ -1291,6 +1533,41 @@ def write_walk_forward_markdown(
             f"{summary.get('cumulative_net_return_bps', 0.0):.4f} |"
         )
 
+    lines.extend(
+        _format_class_trade_diagnostics_section(
+            report.get("class_trade_diagnostics", empty_class_trade_diagnostics()),
+            heading="## Trade Diagnostics",
+        )
+    )
+
+    blocked_by_class = report.get("blocked_by_class", empty_class_count())
+    accepted_by_class = report.get("accepted_by_class", empty_class_count())
+    lines.extend(
+        [
+            "### Accepted vs blocked by class",
+            "",
+            f"- accepted UP: {accepted_by_class.get('UP', 0)}",
+            f"- accepted DOWN: {accepted_by_class.get('DOWN', 0)}",
+            f"- accepted FLAT: {accepted_by_class.get('FLAT', 0)}",
+            f"- blocked UP: {blocked_by_class.get('UP', 0)}",
+            f"- blocked DOWN: {blocked_by_class.get('DOWN', 0)}",
+            f"- blocked FLAT: {blocked_by_class.get('FLAT', 0)}",
+            "",
+            "### Coin-class trade diagnostics",
+            "",
+        ]
+    )
+    coin_class_trade_diagnostics = report.get(
+        "coin_class_trade_diagnostics", {}
+    )
+    for coin in sorted(coin_class_trade_diagnostics):
+        lines.extend(
+            _format_class_trade_diagnostics_section(
+                coin_class_trade_diagnostics[coin],
+                heading=f"#### {coin}",
+            )
+        )
+
     lines.extend(["", "## Warnings", ""])
     warning_items = report.get("warnings", [])
     if not warning_items:
@@ -1313,6 +1590,29 @@ def write_walk_forward_markdown(
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     report["markdown_report_path"] = str(output_path)
     return output_path
+
+
+def apply_diagnostics_detail(
+    report: dict[str, Any],
+    *,
+    diagnostics_detail: str = DEFAULT_DIAGNOSTICS_DETAIL,
+    accepted_trades_limit: int = DEFAULT_ACCEPTED_TRADES_LIMIT,
+) -> dict[str, Any]:
+    """Trim report payload according to diagnostics detail level."""
+    detail = diagnostics_detail.lower()
+    report["diagnostics_detail"] = detail
+    accepted_trade_records = list(report.get("accepted_trade_records", []))
+    report["accepted_trade_records_count"] = len(accepted_trade_records)
+
+    if detail == "full":
+        report["accepted_trade_records"] = accepted_trade_records[:accepted_trades_limit]
+    else:
+        report.pop("accepted_trade_records", None)
+        for coin_detail in report.get("per_coin_details", []):
+            coin_detail.pop("accepted_trade_records", None)
+            for window in coin_detail.get("windows", []):
+                window.pop("accepted_trade_records", None)
+    return report
 
 
 def run_walk_forward_evaluation(
@@ -1345,6 +1645,9 @@ def run_walk_forward_evaluation(
     save_reports: bool = True,
     min_windows: int = DEFAULT_MIN_WINDOWS,
     min_trades: int = DEFAULT_MIN_TRADES,
+    diagnostics_detail: str = DEFAULT_DIAGNOSTICS_DETAIL,
+    save_accepted_trades: bool = False,
+    accepted_trades_limit: int = DEFAULT_ACCEPTED_TRADES_LIMIT,
 ) -> dict[str, Any]:
     """Run walk-forward evaluation for one or more coins and write reports."""
     trade_filter = build_trade_filter(
@@ -1401,6 +1704,21 @@ def run_walk_forward_evaluation(
         min_windows=min_windows,
         min_trades=min_trades,
     )
+
+    all_accepted_trade_records = list(report.get("accepted_trade_records", []))
+    report = apply_diagnostics_detail(
+        report,
+        diagnostics_detail=diagnostics_detail,
+        accepted_trades_limit=accepted_trades_limit,
+    )
+
+    if save_accepted_trades and all_accepted_trade_records:
+        write_accepted_trades_csv(
+            all_accepted_trade_records,
+            reports_dir=reports_dir,
+            report=report,
+            limit=accepted_trades_limit,
+        )
 
     if save_reports:
         write_walk_forward_json(report, reports_dir=reports_dir)
@@ -1579,6 +1897,23 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=None,
         help="Optional cap on rows loaded per coin (research/debug)",
     )
+    parser.add_argument(
+        "--diagnostics-detail",
+        default=DEFAULT_DIAGNOSTICS_DETAIL,
+        choices=("basic", "full"),
+        help="Diagnostics payload detail level (default: basic)",
+    )
+    parser.add_argument(
+        "--save-accepted-trades",
+        action="store_true",
+        help="Save accepted filtered paper trades CSV under reports dir",
+    )
+    parser.add_argument(
+        "--accepted-trades-limit",
+        type=int,
+        default=DEFAULT_ACCEPTED_TRADES_LIMIT,
+        help=f"Max accepted trades in CSV/full diagnostics (default: {DEFAULT_ACCEPTED_TRADES_LIMIT})",
+    )
     return parser
 
 
@@ -1614,6 +1949,9 @@ def main(argv: list[str] | None = None) -> int:
         max_rows=args.max_rows,
         min_windows=args.min_windows,
         min_trades=args.min_trades,
+        diagnostics_detail=args.diagnostics_detail,
+        save_accepted_trades=args.save_accepted_trades,
+        accepted_trades_limit=args.accepted_trades_limit,
     )
 
     readiness = report["readiness"]
@@ -1635,6 +1973,8 @@ def main(argv: list[str] | None = None) -> int:
         print(f"json_report_path={report['json_report_path']}")
     if report.get("markdown_report_path"):
         print(f"markdown_report_path={report['markdown_report_path']}")
+    if report.get("accepted_trades_csv_path"):
+        print(f"accepted_trades_csv_path={report['accepted_trades_csv_path']}")
     for warning in report.get("warnings", []):
         if warning != SAFETY_NOTE:
             print(f"warning: {warning}")

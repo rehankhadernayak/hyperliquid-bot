@@ -12,6 +12,9 @@ import pytest
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 from bid_ask_walk_forward_evaluator import (
+    ACCEPTED_TRADES_CSV_COLUMNS,
+    DEFAULT_ACCEPTED_TRADES_LIMIT,
+    DEFAULT_DIAGNOSTICS_DETAIL,
     DEFAULT_MIN_TRADES,
     DEFAULT_MIN_WINDOWS,
     DEFAULT_REPORTS_DIR,
@@ -19,6 +22,9 @@ from bid_ask_walk_forward_evaluator import (
     TradeFilterConfig,
     _build_arg_parser,
     aggregate_accepted_trade_metrics,
+    aggregate_class_trade_diagnostics,
+    aggregate_coin_class_trade_diagnostics,
+    apply_diagnostics_detail,
     build_trade_filter,
     build_walk_forward_report,
     compute_readiness_flags,
@@ -37,6 +43,20 @@ from bid_ask_walk_forward_evaluator import (
 )
 
 EVALUATOR_FILE = Path(__file__).resolve().parent.parent / "bid_ask_walk_forward_evaluator.py"
+
+FORBIDDEN_ACCEPTED_TRADES_COLUMNS = frozenset(
+    {
+        "order_id",
+        "wallet",
+        "private_key",
+        "signature",
+        "execution",
+        "leverage",
+        "margin",
+        "deposit",
+        "withdrawal",
+    }
+)
 
 BASE_MS = 1_718_000_040_000
 
@@ -1183,6 +1203,278 @@ class TestCLI:
         assert exit_code == 0
         assert any(reports_dir.glob("walk_forward_*.json"))
         assert any(reports_dir.glob("walk_forward_*.md"))
+
+
+class TestTradeDiagnostics:
+    def test_simulate_tracks_blocked_and_accepted_by_class(self) -> None:
+        rows = [
+            {"future_return_bps": 10.0, "avg_spread_bps": 2.0, "label": "UP"},
+            {"future_return_bps": -8.0, "avg_spread_bps": 2.0, "label": "DOWN"},
+            {"future_return_bps": 5.0, "avg_spread_bps": 2.0, "label": "FLAT"},
+        ]
+        test_df = pd.DataFrame(rows)
+        result = simulate_paper_signal_returns(
+            test_df,
+            ["UP", "DOWN", "FLAT"],
+            [1.0, 0.2, 1.0],
+            [1.0, 1.0, 1.0],
+            fee_bps=1.0,
+            slippage_bps=1.0,
+            default_spread_bps=1.0,
+            trade_filter=build_trade_filter(
+                min_confidence=0.5,
+                threshold_bps=1.0,
+                horizon_return_scale_bps=100.0,
+            ),
+            coin="BTC",
+            window_index=0,
+        )
+
+        assert result["accepted_by_class"]["UP"] == 1
+        assert result["accepted_by_class"]["DOWN"] == 0
+        assert result["accepted_by_class"]["FLAT"] == 0
+        assert result["blocked_by_class"]["DOWN"] == 1
+        assert result["blocked_by_class"]["FLAT"] == 1
+        assert "class_trade_diagnostics" in result
+        assert result["class_trade_diagnostics"]["UP"]["trades"] == 1
+        assert result["class_trade_diagnostics"]["DOWN"]["trades"] == 0
+        assert result["class_trade_diagnostics"]["FLAT"]["trades"] == 0
+
+    def test_aggregate_class_trade_diagnostics_separates_up_and_down(self) -> None:
+        records = [
+            {
+                "predicted_class": "UP",
+                "net_return_bps": 5.0,
+                "cost_bps": 2.0,
+                "confidence": 0.9,
+            },
+            {
+                "predicted_class": "UP",
+                "net_return_bps": -1.0,
+                "cost_bps": 2.0,
+                "confidence": 0.8,
+            },
+            {
+                "predicted_class": "DOWN",
+                "net_return_bps": 3.0,
+                "cost_bps": 2.5,
+                "confidence": 0.7,
+            },
+        ]
+        diagnostics = aggregate_class_trade_diagnostics(records)
+
+        assert diagnostics["UP"]["trades"] == 2
+        assert diagnostics["UP"]["cumulative_net_return_bps"] == pytest.approx(4.0)
+        assert diagnostics["UP"]["average_net_return_bps"] == pytest.approx(2.0)
+        assert diagnostics["UP"]["win_rate_after_costs"] == pytest.approx(0.5)
+        assert diagnostics["DOWN"]["trades"] == 1
+        assert diagnostics["DOWN"]["cumulative_net_return_bps"] == pytest.approx(3.0)
+        assert diagnostics["FLAT"]["trades"] == 0
+
+    def test_aggregate_coin_class_trade_diagnostics_separates_coins(self) -> None:
+        records = [
+            {
+                "coin": "BTC",
+                "predicted_class": "UP",
+                "net_return_bps": 4.0,
+                "cost_bps": 1.0,
+                "confidence": 0.9,
+            },
+            {
+                "coin": "ETH",
+                "predicted_class": "DOWN",
+                "net_return_bps": -2.0,
+                "cost_bps": 1.0,
+                "confidence": 0.8,
+            },
+            {
+                "coin": "SOL",
+                "predicted_class": "DOWN",
+                "net_return_bps": 1.0,
+                "cost_bps": 1.0,
+                "confidence": 0.75,
+            },
+        ]
+        diagnostics = aggregate_coin_class_trade_diagnostics(
+            records,
+            coins=["BTC", "ETH", "SOL"],
+        )
+
+        assert set(diagnostics) == {"BTC", "ETH", "SOL"}
+        assert diagnostics["BTC"]["UP"]["trades"] == 1
+        assert diagnostics["ETH"]["DOWN"]["trades"] == 1
+        assert diagnostics["SOL"]["DOWN"]["trades"] == 1
+        assert diagnostics["BTC"]["DOWN"]["trades"] == 0
+
+    def test_walk_forward_report_includes_trade_diagnostics(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        for coin in ("BTC", "ETH", "SOL"):
+            path = resampled_csv_path(coin, "15s", data_root)
+            _write_resampled_csv(
+                path,
+                _make_resampled_rows(coin=coin, count=80, mid_step=1.5),
+            )
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC", "ETH", "SOL"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=1.0,
+            slippage_bps=1.0,
+            default_spread_bps=1.0,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert "class_trade_diagnostics" in report
+        assert "coin_class_trade_diagnostics" in report
+        assert "blocked_by_class" in report
+        assert "accepted_by_class" in report
+        for label in ("UP", "DOWN", "FLAT"):
+            assert label in report["class_trade_diagnostics"]
+            assert label in report["blocked_by_class"]
+            assert label in report["accepted_by_class"]
+        for coin in ("BTC", "ETH", "SOL"):
+            assert coin in report["coin_class_trade_diagnostics"]
+
+        md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "## Trade Diagnostics" in md_text
+        assert "### Coin-class trade diagnostics" in md_text
+        assert "accepted UP:" in md_text
+
+    def test_save_accepted_trades_writes_paper_only_csv(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            save_accepted_trades=True,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        csv_path = Path(report["accepted_trades_csv_path"])
+        assert csv_path.is_file()
+        assert csv_path.parent == reports_dir
+        saved = pd.read_csv(csv_path)
+        assert list(saved.columns) == list(ACCEPTED_TRADES_CSV_COLUMNS)
+        for column in FORBIDDEN_ACCEPTED_TRADES_COLUMNS:
+            assert column not in saved.columns
+        if len(saved) > 0:
+            assert saved["predicted_class"].isin(["UP", "DOWN"]).any()
+
+    def test_diagnostics_detail_basic_strips_trade_records(self) -> None:
+        report = {
+            "generated_at": "2024-06-10T00:00:00+00:00",
+            "accepted_trade_records": [{"coin": "BTC", "net_return_bps": 1.0}],
+            "per_coin_details": [
+                {
+                    "accepted_trade_records": [{"coin": "BTC"}],
+                    "windows": [{"accepted_trade_records": [{"coin": "BTC"}]}],
+                }
+            ],
+        }
+        trimmed = apply_diagnostics_detail(
+            report,
+            diagnostics_detail="basic",
+            accepted_trades_limit=100,
+        )
+        assert trimmed["diagnostics_detail"] == "basic"
+        assert trimmed["accepted_trade_records_count"] == 1
+        assert "accepted_trade_records" not in trimmed
+        assert "accepted_trade_records" not in trimmed["per_coin_details"][0]
+
+    def test_diagnostics_detail_full_keeps_limited_records(self) -> None:
+        records = [{"coin": "BTC", "net_return_bps": float(index)} for index in range(5)]
+        report = {"generated_at": "2024-06-10T00:00:00+00:00", "accepted_trade_records": records}
+        full = apply_diagnostics_detail(
+            report,
+            diagnostics_detail="full",
+            accepted_trades_limit=3,
+        )
+        assert full["diagnostics_detail"] == "full"
+        assert len(full["accepted_trade_records"]) == 3
+
+    def test_cli_parses_diagnostics_options(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--diagnostics-detail",
+                "full",
+                "--save-accepted-trades",
+                "--accepted-trades-limit",
+                "250",
+            ]
+        )
+        assert args.diagnostics_detail == "full"
+        assert args.save_accepted_trades is True
+        assert args.accepted_trades_limit == 250
+
+    def test_cli_diagnostics_defaults(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args([])
+        assert args.diagnostics_detail == DEFAULT_DIAGNOSTICS_DETAIL
+        assert args.save_accepted_trades is False
+        assert args.accepted_trades_limit == DEFAULT_ACCEPTED_TRADES_LIMIT
+
+    def test_trade_diagnostics_safety_flags_preserved(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=60))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=True,
+            save_accepted_trades=True,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+        loaded = json.loads(Path(report["json_report_path"]).read_text(encoding="utf-8"))
+        assert loaded["paper_only"] is True
+        assert loaded["execution_enabled"] is False
+        assert "class_trade_diagnostics" in loaded
 
 
 class TestSafety:
