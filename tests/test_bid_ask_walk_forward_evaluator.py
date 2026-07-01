@@ -11,10 +11,14 @@ import pytest
 
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
+from bid_ask_train import create_features, create_labels
 from bid_ask_walk_forward_evaluator import (
     ACCEPTED_TRADES_CSV_COLUMNS,
     DEFAULT_ACCEPTED_TRADES_LIMIT,
     DEFAULT_DIAGNOSTICS_DETAIL,
+    DEFAULT_LABEL_COST_MULTIPLIER,
+    DEFAULT_LABEL_MIN_EDGE_BPS,
+    DEFAULT_LABEL_MODE,
     DEFAULT_MIN_TRADES,
     DEFAULT_MIN_WINDOWS,
     DEFAULT_REPORTS_DIR,
@@ -27,17 +31,23 @@ from bid_ask_walk_forward_evaluator import (
     apply_diagnostics_detail,
     build_trade_filter,
     build_walk_forward_report,
+    compute_label_distribution,
     compute_readiness_flags,
+    cost_aware_label_warnings,
+    create_cost_aware_labels,
+    create_walk_forward_labels,
     evaluate_coin_walk_forward,
     evaluate_trade_filter,
     generate_walk_forward_windows,
     longest_losing_streak,
     main,
     max_drawdown_bps,
+    parse_label_mode,
     parse_trade_classes,
     resolve_coins,
     run_walk_forward_evaluation,
     simulate_paper_signal_returns,
+    summarize_label_required_edge_bps,
     write_walk_forward_json,
     write_walk_forward_markdown,
 )
@@ -160,6 +170,315 @@ def _assert_readiness_booleans(report: dict, *, prefix: str = "") -> None:
         assert nested[field] is not None, field
         assert isinstance(nested[field], bool), field
         assert nested[field] == report[field], field
+
+
+def _make_labeled_feature_rows(
+    *,
+    count: int,
+    future_returns_bps: list[float] | None = None,
+    spread_bps: float = 2.0,
+    mid_start: float = 100.0,
+) -> pd.DataFrame:
+    rows = _make_resampled_rows(count=count, mid_start=mid_start, spread_bps=spread_bps)
+    featured = create_features(pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS)))
+    if future_returns_bps is not None:
+        featured["future_return_bps"] = future_returns_bps + [float("nan")] * (
+            len(featured) - len(future_returns_bps)
+        )
+    return featured
+
+
+class TestCostAwareLabels:
+    def test_direction_mode_matches_create_labels(self) -> None:
+        featured = _make_labeled_feature_rows(count=12, mid_start=100.0)
+        labeled, meta = create_walk_forward_labels(
+            featured,
+            label_mode="direction",
+            horizon=2,
+            threshold_bps=1.0,
+        )
+        expected = create_labels(featured, horizon=2, threshold_bps=1.0)
+
+        assert labeled["label"].tolist() == expected["label"].tolist()
+        assert meta["label_mode"] == "direction"
+        assert meta["label_cost_multiplier"] == DEFAULT_LABEL_COST_MULTIPLIER
+        assert meta["label_min_edge_bps"] == DEFAULT_LABEL_MIN_EDGE_BPS
+        assert meta["label_required_edge_summary"]["average_label_required_edge_bps"] == 1.0
+
+    def test_cost_aware_converts_small_moves_to_flat(self) -> None:
+        featured = _make_labeled_feature_rows(
+            count=6,
+            spread_bps=2.0,
+            mid_start=100.0,
+        )
+        featured = create_features(
+            pd.DataFrame(
+                _make_resampled_rows(count=6, mid_start=100.0, mid_step=0.001, spread_bps=2.0),
+                columns=list(RESAMPLED_COLUMNS),
+            )
+        )
+        labeled, _ = create_walk_forward_labels(
+            featured,
+            label_mode="cost_aware",
+            horizon=1,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            label_cost_multiplier=1.0,
+            label_min_edge_bps=0.0,
+        )
+        ready = labeled.dropna(subset=["future_return_bps"]).head(3)
+
+        # Required edge is fee + slippage + spread ~= 5 bps; small moves become FLAT.
+        assert (ready["label"] == "FLAT").all()
+
+    def test_cost_aware_keeps_large_up_and_down_moves(self) -> None:
+        rows = _make_resampled_rows(count=6, mid_start=100.0, mid_step=0.0, spread_bps=2.0)
+        mids = [100.0, 110.0, 90.0, 120.0, 80.0, 100.0]
+        for index, mid in enumerate(mids):
+            rows[index]["close_mid"] = mid
+            rows[index]["open_mid"] = mid
+            rows[index]["high_mid"] = mid + 0.1
+            rows[index]["low_mid"] = mid - 0.1
+            rows[index]["avg_mid"] = mid
+        featured = create_features(pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS)))
+        labeled, meta = create_walk_forward_labels(
+            featured,
+            label_mode="cost_aware",
+            horizon=1,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            label_cost_multiplier=1.0,
+            label_min_edge_bps=0.0,
+        )
+        labels = labeled["label"].dropna().tolist()
+
+        assert "UP" in labels
+        assert "DOWN" in labels
+        assert meta["label_distribution_by_mode"]["UP"]["count"] >= 1
+        assert meta["label_distribution_by_mode"]["DOWN"]["count"] >= 1
+
+    def test_label_cost_multiplier_increases_required_edge(self) -> None:
+        rows = _make_resampled_rows(count=3, mid_start=100.0, mid_step=0.8, spread_bps=2.0)
+        featured = create_features(pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS)))
+
+        base = create_cost_aware_labels(
+            featured,
+            horizon=1,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            label_cost_multiplier=1.0,
+        )
+        scaled = create_cost_aware_labels(
+            featured,
+            horizon=1,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            label_cost_multiplier=3.0,
+        )
+
+        assert (
+            scaled["label_required_edge_bps"].iloc[0]
+            > base["label_required_edge_bps"].iloc[0]
+        )
+        assert base["label"].tolist().count("UP") >= scaled["label"].tolist().count("UP")
+
+    def test_label_min_edge_bps_increases_required_edge(self) -> None:
+        rows = _make_resampled_rows(count=3, mid_start=100.0, mid_step=1.0, spread_bps=2.0)
+        featured = create_features(pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS)))
+
+        no_min = create_cost_aware_labels(
+            featured,
+            horizon=1,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            label_min_edge_bps=0.0,
+        )
+        with_min = create_cost_aware_labels(
+            featured,
+            horizon=1,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            label_min_edge_bps=20.0,
+        )
+
+        assert (
+            with_min["label_required_edge_bps"].iloc[0]
+            > no_min["label_required_edge_bps"].iloc[0]
+        )
+        assert with_min["label"].tolist().count("UP") <= no_min["label"].tolist().count("UP")
+
+    def test_label_summary_fields_in_report(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            label_mode="cost_aware",
+            label_cost_multiplier=1.5,
+            label_min_edge_bps=1.0,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["label_mode"] == "cost_aware"
+        assert report["label_cost_multiplier"] == 1.5
+        assert report["label_min_edge_bps"] == 1.0
+        summary = report["label_required_edge_summary"]
+        assert "average_label_required_edge_bps" in summary
+        assert "min_label_required_edge_bps" in summary
+        assert "max_label_required_edge_bps" in summary
+        assert summary["min_label_required_edge_bps"] <= summary["average_label_required_edge_bps"]
+        assert summary["average_label_required_edge_bps"] <= summary["max_label_required_edge_bps"]
+        for label in ("UP", "DOWN", "FLAT"):
+            assert label in report["label_distribution_by_mode"]
+
+    def test_markdown_includes_label_fields(self, data_root: Path, reports_dir: Path) -> None:
+        report = build_walk_forward_report(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=_permissive_filter(),
+            per_coin_results=[
+                {
+                    "coin": "BTC",
+                    "status": "completed",
+                    "completed_windows": 1,
+                    "total_windows": 1,
+                    "skipped_windows": 0,
+                    "model_accuracy_mean": 0.5,
+                    "baseline_accuracy_mean": 0.5,
+                    "accuracy_edge_vs_baseline": 0.0,
+                    "label_mode": "cost_aware",
+                    "label_cost_multiplier": 1.0,
+                    "label_min_edge_bps": 0.0,
+                    "label_required_edge_summary": summarize_label_required_edge_bps([5.0, 6.0]),
+                    "label_distribution_by_mode": compute_label_distribution(["UP", "FLAT", "FLAT"]),
+                    "warnings": [],
+                    "windows": [],
+                }
+            ],
+            data_root=data_root,
+            label_mode="cost_aware",
+        )
+        md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "## Labels" in md_text
+        assert "label_mode: cost_aware" in md_text
+        assert "average_label_required_edge_bps" in md_text
+        assert "label UP:" in md_text
+
+    def test_cost_aware_labels_all_flat_warning(self) -> None:
+        warnings = cost_aware_label_warnings(["FLAT"] * 20, label_mode="cost_aware")
+        assert any("cost_aware_labels_all_flat" in warning for warning in warnings)
+
+    def test_cost_aware_labels_sparse_warning(self) -> None:
+        labels = ["FLAT"] * 19 + ["UP"]
+        warnings = cost_aware_label_warnings(labels, label_mode="cost_aware")
+        assert any("cost_aware_labels_sparse" in warning for warning in warnings)
+
+    def test_direction_mode_has_no_cost_aware_warnings(self) -> None:
+        warnings = cost_aware_label_warnings(["FLAT"] * 10, label_mode="direction")
+        assert warnings == []
+
+    def test_class_imbalance_warnings_still_apply(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=0.01, spread_bps=0.1))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            label_mode="cost_aware",
+            label_cost_multiplier=2.0,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+        assert any("class_imbalance" in warning for warning in report["warnings"])
+
+    def test_cost_aware_walk_forward_safety_flags(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=60, mid_step=1.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            label_mode="cost_aware",
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+
+    def test_cli_parses_label_options(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--label-mode",
+                "cost_aware",
+                "--label-cost-multiplier",
+                "1.25",
+                "--label-min-edge-bps",
+                "2.0",
+            ]
+        )
+        assert args.label_mode == "cost_aware"
+        assert args.label_cost_multiplier == 1.25
+        assert args.label_min_edge_bps == 2.0
+
+    def test_cli_label_defaults(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args([])
+        assert args.label_mode == DEFAULT_LABEL_MODE
+        assert args.label_cost_multiplier == DEFAULT_LABEL_COST_MULTIPLIER
+        assert args.label_min_edge_bps == DEFAULT_LABEL_MIN_EDGE_BPS
+
+    def test_parse_label_mode(self) -> None:
+        assert parse_label_mode("direction") == "direction"
+        assert parse_label_mode("cost_aware") == "cost_aware"
+        with pytest.raises(ValueError):
+            parse_label_mode("invalid")
 
 
 class TestComputeReadinessFlags:

@@ -59,9 +59,14 @@ DEFAULT_HORIZON = 5
 DEFAULT_MIN_EDGE_BPS = 0.0
 DEFAULT_COST_MULTIPLIER = 1.0
 DEFAULT_HORIZON_RETURN_SCALE_BPS = 10.0
+DEFAULT_LABEL_MODE = "direction"
+DEFAULT_LABEL_COST_MULTIPLIER = 1.0
+DEFAULT_LABEL_MIN_EDGE_BPS = 0.0
 DEFAULT_TRADE_CLASSES = frozenset({"UP", "DOWN"})
 DEFAULT_DIAGNOSTICS_DETAIL = "basic"
 DEFAULT_ACCEPTED_TRADES_LIMIT = 1000
+
+SUPPORTED_LABEL_MODES = frozenset({"direction", "cost_aware"})
 
 ACCEPTED_TRADES_CSV_COLUMNS = (
     "coin",
@@ -151,6 +156,156 @@ def parse_trade_classes(value: str) -> frozenset[str]:
     if not classes:
         return DEFAULT_TRADE_CLASSES
     return classes
+
+
+def parse_label_mode(value: str) -> str:
+    """Parse label mode: direction (default) or cost_aware."""
+    mode = str(value).strip().lower()
+    if mode not in SUPPORTED_LABEL_MODES:
+        supported = ", ".join(sorted(SUPPORTED_LABEL_MODES))
+        raise ValueError(f"Unsupported label_mode {value!r}; use one of: {supported}")
+    return mode
+
+
+def compute_label_distribution(labels: list[str]) -> dict[str, dict[str, float | int]]:
+    """Return UP/DOWN/FLAT counts and fractions for report payloads."""
+    total = len(labels)
+    counts = {label: 0 for label in LABELS}
+    for label in labels:
+        normalized = str(label).upper()
+        if normalized in counts:
+            counts[normalized] += 1
+    if total == 0:
+        return {label: {"count": 0, "fraction": 0.0} for label in LABELS}
+    return {
+        label: {"count": counts[label], "fraction": counts[label] / total}
+        for label in LABELS
+    }
+
+
+def summarize_label_required_edge_bps(values: pd.Series | list[float]) -> dict[str, float]:
+    """Summarize per-row label required edge values in bps."""
+    series = pd.Series(values, dtype=float)
+    if series.empty:
+        return {
+            "average_label_required_edge_bps": 0.0,
+            "min_label_required_edge_bps": 0.0,
+            "max_label_required_edge_bps": 0.0,
+        }
+    return {
+        "average_label_required_edge_bps": float(series.mean()),
+        "min_label_required_edge_bps": float(series.min()),
+        "max_label_required_edge_bps": float(series.max()),
+    }
+
+
+def create_cost_aware_labels(
+    df: pd.DataFrame,
+    *,
+    horizon: int,
+    fee_bps: float,
+    slippage_bps: float,
+    default_spread_bps: float,
+    label_cost_multiplier: float = DEFAULT_LABEL_COST_MULTIPLIER,
+    label_min_edge_bps: float = DEFAULT_LABEL_MIN_EDGE_BPS,
+) -> pd.DataFrame:
+    """Add future_return_bps and cost-aware UP/DOWN/FLAT labels (labels only, not execution)."""
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+
+    out = df.copy()
+    mid = out["close_mid"].astype(float)
+    future_mid = mid.shift(-horizon)
+    out["future_return_bps"] = (future_mid - mid) / mid.replace(0, np.nan) * 10_000.0
+
+    spread_bps = out.apply(lambda row: _spread_cost_bps(row, default_spread_bps), axis=1)
+    estimated_cost_bps = fee_bps + slippage_bps + spread_bps
+    label_required_edge_bps = estimated_cost_bps * label_cost_multiplier + label_min_edge_bps
+    out["label_required_edge_bps"] = label_required_edge_bps
+
+    future_return = out["future_return_bps"]
+    labels = np.full(len(out), "FLAT", dtype=object)
+    valid = future_return.notna()
+    labels[valid & (future_return > label_required_edge_bps)] = "UP"
+    labels[valid & (future_return < -label_required_edge_bps)] = "DOWN"
+    out["label"] = labels
+    return out
+
+
+def create_walk_forward_labels(
+    df: pd.DataFrame,
+    *,
+    label_mode: str = DEFAULT_LABEL_MODE,
+    horizon: int = DEFAULT_HORIZON,
+    threshold_bps: float = DEFAULT_THRESHOLD_BPS,
+    fee_bps: float = DEFAULT_FEE_BPS,
+    slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
+    default_spread_bps: float = DEFAULT_SPREAD_BPS,
+    label_cost_multiplier: float = DEFAULT_LABEL_COST_MULTIPLIER,
+    label_min_edge_bps: float = DEFAULT_LABEL_MIN_EDGE_BPS,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Create training labels for walk-forward evaluation."""
+    mode = parse_label_mode(label_mode)
+    if mode == "direction":
+        labeled_df = create_labels(df, horizon=horizon, threshold_bps=threshold_bps)
+        distribution = compute_label_distribution(labeled_df["label"].tolist())
+        summary = {
+            "average_label_required_edge_bps": float(threshold_bps),
+            "min_label_required_edge_bps": float(threshold_bps),
+            "max_label_required_edge_bps": float(threshold_bps),
+        }
+        return labeled_df, {
+            "label_mode": mode,
+            "label_cost_multiplier": label_cost_multiplier,
+            "label_min_edge_bps": label_min_edge_bps,
+            "label_required_edge_summary": summary,
+            "label_distribution_by_mode": distribution,
+        }
+
+    labeled_df = create_cost_aware_labels(
+        df,
+        horizon=horizon,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        default_spread_bps=default_spread_bps,
+        label_cost_multiplier=label_cost_multiplier,
+        label_min_edge_bps=label_min_edge_bps,
+    )
+    distribution = compute_label_distribution(labeled_df["label"].tolist())
+    summary = summarize_label_required_edge_bps(labeled_df["label_required_edge_bps"])
+    return labeled_df, {
+        "label_mode": mode,
+        "label_cost_multiplier": label_cost_multiplier,
+        "label_min_edge_bps": label_min_edge_bps,
+        "label_required_edge_summary": summary,
+        "label_distribution_by_mode": distribution,
+    }
+
+
+def cost_aware_label_warnings(labels: list[str], *, label_mode: str) -> list[str]:
+    """Return warnings when cost-aware labels are sparse or entirely FLAT."""
+    if parse_label_mode(label_mode) != "cost_aware":
+        return []
+
+    warnings: list[str] = []
+    total = len(labels)
+    if total == 0:
+        return warnings
+
+    up_down_count = sum(1 for label in labels if label in ("UP", "DOWN"))
+    if up_down_count == 0:
+        warnings.append(
+            "cost_aware_labels_all_flat: no UP or DOWN labels after cost-aware labeling"
+        )
+        return warnings
+
+    up_down_fraction = up_down_count / total
+    if up_down_fraction < MIN_CLASS_FRACTION:
+        warnings.append(
+            f"cost_aware_labels_sparse: UP+DOWN labels are {up_down_fraction:.1%} "
+            f"(under {MIN_CLASS_FRACTION:.0%})"
+        )
+    return warnings
 
 
 def _spread_cost_bps(row: pd.Series, default_spread_bps: float) -> float:
@@ -968,6 +1123,9 @@ def evaluate_coin_walk_forward(
     max_rows: int | None = None,
     min_windows: int = DEFAULT_MIN_WINDOWS,
     min_trades: int = DEFAULT_MIN_TRADES,
+    label_mode: str = DEFAULT_LABEL_MODE,
+    label_cost_multiplier: float = DEFAULT_LABEL_COST_MULTIPLIER,
+    label_min_edge_bps: float = DEFAULT_LABEL_MIN_EDGE_BPS,
 ) -> dict[str, Any]:
     """Run walk-forward evaluation for one coin."""
     normalized_source = normalize_source(source)
@@ -1006,7 +1164,17 @@ def evaluate_coin_walk_forward(
         warnings.append(missing_warning)
 
     featured_df = create_features(raw_df)
-    labeled_df = create_labels(featured_df, horizon=horizon, threshold_bps=threshold_bps)
+    labeled_df, label_meta = create_walk_forward_labels(
+        featured_df,
+        label_mode=label_mode,
+        horizon=horizon,
+        threshold_bps=threshold_bps,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+        default_spread_bps=default_spread_bps,
+        label_cost_multiplier=label_cost_multiplier,
+        label_min_edge_bps=label_min_edge_bps,
+    )
     model_df = _rows_ready_for_model(labeled_df)
 
     if len(model_df) < MIN_ROWS_WARNING:
@@ -1120,6 +1288,7 @@ def evaluate_coin_walk_forward(
 
     train_labels = model_df["label"].tolist() if not model_df.empty else []
     warnings.extend(_label_imbalance_warnings(train_labels, "all"))
+    warnings.extend(cost_aware_label_warnings(train_labels, label_mode=label_mode))
 
     readiness = compute_readiness_flags(
         accuracy_edge_vs_baseline=accuracy_edge_vs_baseline,
@@ -1174,6 +1343,58 @@ def evaluate_coin_walk_forward(
         "readiness": readiness,
         "windows": window_results,
         "warnings": warnings,
+        **label_meta,
+    }
+
+
+def _aggregate_label_distribution(
+    per_coin_results: list[dict[str, Any]],
+) -> dict[str, dict[str, float | int]]:
+    """Merge per-coin label distributions into one aggregate distribution."""
+    totals = {label: 0 for label in LABELS}
+    for item in per_coin_results:
+        distribution = item.get("label_distribution_by_mode", {})
+        for label in LABELS:
+            label_stats = distribution.get(label, {})
+            totals[label] += int(label_stats.get("count", 0))
+    total_rows = sum(totals.values())
+    if total_rows == 0:
+        return {label: {"count": 0, "fraction": 0.0} for label in LABELS}
+    return {
+        label: {"count": totals[label], "fraction": totals[label] / total_rows}
+        for label in LABELS
+    }
+
+
+def _aggregate_label_required_edge_summary(
+    per_coin_results: list[dict[str, Any]],
+    *,
+    label_mode: str,
+    threshold_bps: float,
+) -> dict[str, float]:
+    """Merge per-coin label required-edge summaries for the combined report."""
+    if parse_label_mode(label_mode) == "direction":
+        return {
+            "average_label_required_edge_bps": float(threshold_bps),
+            "min_label_required_edge_bps": float(threshold_bps),
+            "max_label_required_edge_bps": float(threshold_bps),
+        }
+
+    summaries = [
+        item["label_required_edge_summary"]
+        for item in per_coin_results
+        if item.get("label_required_edge_summary")
+    ]
+    if not summaries:
+        return summarize_label_required_edge_bps([])
+
+    averages = [float(item["average_label_required_edge_bps"]) for item in summaries]
+    mins = [float(item["min_label_required_edge_bps"]) for item in summaries]
+    maxes = [float(item["max_label_required_edge_bps"]) for item in summaries]
+    return {
+        "average_label_required_edge_bps": float(np.mean(averages)),
+        "min_label_required_edge_bps": float(min(mins)),
+        "max_label_required_edge_bps": float(max(maxes)),
     }
 
 
@@ -1195,6 +1416,9 @@ def build_walk_forward_report(
     data_root: Path,
     min_windows: int = DEFAULT_MIN_WINDOWS,
     min_trades: int = DEFAULT_MIN_TRADES,
+    label_mode: str = DEFAULT_LABEL_MODE,
+    label_cost_multiplier: float = DEFAULT_LABEL_COST_MULTIPLIER,
+    label_min_edge_bps: float = DEFAULT_LABEL_MIN_EDGE_BPS,
 ) -> dict[str, Any]:
     """Aggregate per-coin walk-forward results into one combined report."""
     normalized_source = normalize_source(source)
@@ -1327,6 +1551,13 @@ def build_walk_forward_report(
         for item in per_coin_results
     }
 
+    label_distribution_by_mode = _aggregate_label_distribution(per_coin_results)
+    label_required_edge_summary = _aggregate_label_required_edge_summary(
+        per_coin_results,
+        label_mode=label_mode,
+        threshold_bps=threshold_bps,
+    )
+
     return {
         "report_id": uuid.uuid4().hex,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1337,6 +1568,11 @@ def build_walk_forward_report(
         "data_root": str(data_root),
         "horizon": horizon,
         "threshold_bps": threshold_bps,
+        "label_mode": parse_label_mode(label_mode),
+        "label_cost_multiplier": label_cost_multiplier,
+        "label_min_edge_bps": label_min_edge_bps,
+        "label_required_edge_summary": label_required_edge_summary,
+        "label_distribution_by_mode": label_distribution_by_mode,
         "train_bars": train_bars,
         "test_bars": test_bars,
         "step_bars": step_bars,
@@ -1455,48 +1691,78 @@ def write_walk_forward_markdown(
         f"- execution_enabled: {str(report.get('execution_enabled', False)).lower()}",
         f"- real_execution_ready: {str(real_execution_ready).lower()}",
         "",
-        "## Aggregate metrics",
+        "## Labels",
         "",
-        f"- total_windows: {report.get('total_windows', 0)}",
-        f"- completed_windows: {report.get('completed_windows', 0)}",
-        f"- skipped_windows: {report.get('skipped_windows', 0)}",
-        f"- model_accuracy_mean: {report.get('model_accuracy_mean', 0.0):.4f}",
-        f"- baseline_accuracy_mean: {report.get('baseline_accuracy_mean', 0.0):.4f}",
-        f"- accuracy_edge_vs_baseline: {report.get('accuracy_edge_vs_baseline', 0.0):.4f}",
-        f"- total_paper_signals: {report.get('total_paper_signals', 0)}",
-        f"- total_paper_trades: {report.get('total_paper_trades', 0)}",
-        f"- raw_predictions: {report.get('raw_predictions', 0)}",
-        f"- filtered_paper_trades: {report.get('filtered_paper_trades', 0)}",
-        f"- blocked_by_confidence: {report.get('blocked_by_confidence', 0)}",
-        f"- blocked_by_cost: {report.get('blocked_by_cost', 0)}",
-        f"- blocked_by_spread: {report.get('blocked_by_spread', 0)}",
-        f"- blocked_by_volatility: {report.get('blocked_by_volatility', 0)}",
-        f"- blocked_by_trade_class: {report.get('blocked_by_trade_class', 0)}",
-        f"- average_cost_bps: {report.get('average_cost_bps', 0.0):.4f}",
-        f"- average_required_edge_bps: {report.get('average_required_edge_bps', 0.0):.4f}",
-        f"- average_gross_return_bps: {report.get('average_gross_return_bps', 0.0):.4f}",
-        f"- filtered_paper_trades (accepted): {report.get('filtered_paper_trades', 0)}",
-        f"- cumulative_net_return_bps: {report.get('cumulative_net_return_bps', 0.0):.4f}",
-        f"- average_net_return_bps: {report.get('average_net_return_bps', 0.0):.4f}",
-        f"- expected_average_from_cumulative: {report.get('expected_average_from_cumulative', 0.0):.4f}",
-        f"- average_net_return_difference_abs: {report.get('average_net_return_difference_abs', 0.0):.6f}",
-        f"- net_return_consistency_check: {str(report.get('net_return_consistency_check', True)).lower()}",
-        f"- max_drawdown_bps: {report.get('max_drawdown_bps', 0.0):.4f}",
-        f"- win_rate_after_costs: {report.get('win_rate_after_costs', 0.0):.4f}",
-        f"- longest_losing_streak: {report.get('longest_losing_streak', 0)}",
-        "",
-        "## Readiness",
-        "",
-        f"- beats_baseline_accuracy: {beats_baseline}",
-        f"- positive_after_costs: {positive_after_costs}",
-        f"- enough_windows: {enough_windows}",
-        f"- enough_trades: {enough_trades}",
-        f"- ready_for_more_research: {ready_for_more_research}",
-        f"- real_execution_ready: {real_execution_ready}",
-        "",
-        "## Model vs baseline after costs",
-        "",
+        f"- label_mode: {report.get('label_mode', DEFAULT_LABEL_MODE)}",
+        f"- label_cost_multiplier: {report.get('label_cost_multiplier', DEFAULT_LABEL_COST_MULTIPLIER)}",
+        f"- label_min_edge_bps: {report.get('label_min_edge_bps', DEFAULT_LABEL_MIN_EDGE_BPS)}",
     ]
+
+    label_summary = report.get("label_required_edge_summary", {})
+    lines.extend(
+        [
+            f"- average_label_required_edge_bps: "
+            f"{label_summary.get('average_label_required_edge_bps', 0.0):.4f}",
+            f"- min_label_required_edge_bps: "
+            f"{label_summary.get('min_label_required_edge_bps', 0.0):.4f}",
+            f"- max_label_required_edge_bps: "
+            f"{label_summary.get('max_label_required_edge_bps', 0.0):.4f}",
+        ]
+    )
+    label_distribution = report.get("label_distribution_by_mode", {})
+    for label in LABELS:
+        stats = label_distribution.get(label, {})
+        lines.append(
+            f"- label {label}: count={stats.get('count', 0)} "
+            f"fraction={stats.get('fraction', 0.0):.4f}"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Aggregate metrics",
+            "",
+            f"- total_windows: {report.get('total_windows', 0)}",
+            f"- completed_windows: {report.get('completed_windows', 0)}",
+            f"- skipped_windows: {report.get('skipped_windows', 0)}",
+            f"- model_accuracy_mean: {report.get('model_accuracy_mean', 0.0):.4f}",
+            f"- baseline_accuracy_mean: {report.get('baseline_accuracy_mean', 0.0):.4f}",
+            f"- accuracy_edge_vs_baseline: {report.get('accuracy_edge_vs_baseline', 0.0):.4f}",
+            f"- total_paper_signals: {report.get('total_paper_signals', 0)}",
+            f"- total_paper_trades: {report.get('total_paper_trades', 0)}",
+            f"- raw_predictions: {report.get('raw_predictions', 0)}",
+            f"- filtered_paper_trades: {report.get('filtered_paper_trades', 0)}",
+            f"- blocked_by_confidence: {report.get('blocked_by_confidence', 0)}",
+            f"- blocked_by_cost: {report.get('blocked_by_cost', 0)}",
+            f"- blocked_by_spread: {report.get('blocked_by_spread', 0)}",
+            f"- blocked_by_volatility: {report.get('blocked_by_volatility', 0)}",
+            f"- blocked_by_trade_class: {report.get('blocked_by_trade_class', 0)}",
+            f"- average_cost_bps: {report.get('average_cost_bps', 0.0):.4f}",
+            f"- average_required_edge_bps: {report.get('average_required_edge_bps', 0.0):.4f}",
+            f"- average_gross_return_bps: {report.get('average_gross_return_bps', 0.0):.4f}",
+            f"- filtered_paper_trades (accepted): {report.get('filtered_paper_trades', 0)}",
+            f"- cumulative_net_return_bps: {report.get('cumulative_net_return_bps', 0.0):.4f}",
+            f"- average_net_return_bps: {report.get('average_net_return_bps', 0.0):.4f}",
+            f"- expected_average_from_cumulative: {report.get('expected_average_from_cumulative', 0.0):.4f}",
+            f"- average_net_return_difference_abs: {report.get('average_net_return_difference_abs', 0.0):.6f}",
+            f"- net_return_consistency_check: {str(report.get('net_return_consistency_check', True)).lower()}",
+            f"- max_drawdown_bps: {report.get('max_drawdown_bps', 0.0):.4f}",
+            f"- win_rate_after_costs: {report.get('win_rate_after_costs', 0.0):.4f}",
+            f"- longest_losing_streak: {report.get('longest_losing_streak', 0)}",
+            "",
+            "## Readiness",
+            "",
+            f"- beats_baseline_accuracy: {beats_baseline}",
+            f"- positive_after_costs: {positive_after_costs}",
+            f"- enough_windows: {enough_windows}",
+            f"- enough_trades: {enough_trades}",
+            f"- ready_for_more_research: {ready_for_more_research}",
+            f"- real_execution_ready: {real_execution_ready}",
+            "",
+            "## Model vs baseline after costs",
+            "",
+        ]
+    )
 
     if beats_baseline and positive_after_costs:
         lines.append(
@@ -1637,6 +1903,9 @@ def run_walk_forward_evaluation(
     cost_multiplier: float = DEFAULT_COST_MULTIPLIER,
     horizon_return_scale_bps: float = DEFAULT_HORIZON_RETURN_SCALE_BPS,
     min_absolute_future_label_bps: float | None = None,
+    label_mode: str = DEFAULT_LABEL_MODE,
+    label_cost_multiplier: float = DEFAULT_LABEL_COST_MULTIPLIER,
+    label_min_edge_bps: float = DEFAULT_LABEL_MIN_EDGE_BPS,
     data_root: Path = DEFAULT_DATA_ROOT,
     reports_dir: Path = DEFAULT_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
@@ -1682,6 +1951,9 @@ def run_walk_forward_evaluation(
             max_rows=max_rows,
             min_windows=min_windows,
             min_trades=min_trades,
+            label_mode=label_mode,
+            label_cost_multiplier=label_cost_multiplier,
+            label_min_edge_bps=label_min_edge_bps,
         )
         for coin in coins
     ]
@@ -1703,6 +1975,9 @@ def run_walk_forward_evaluation(
         data_root=data_root,
         min_windows=min_windows,
         min_trades=min_trades,
+        label_mode=label_mode,
+        label_cost_multiplier=label_cost_multiplier,
+        label_min_edge_bps=label_min_edge_bps,
     )
 
     all_accepted_trade_records = list(report.get("accepted_trade_records", []))
@@ -1762,7 +2037,31 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--threshold-bps",
         type=float,
         default=DEFAULT_THRESHOLD_BPS,
-        help=f"UP/DOWN label threshold in bps (default: {DEFAULT_THRESHOLD_BPS})",
+        help=f"UP/DOWN label threshold in bps for direction mode (default: {DEFAULT_THRESHOLD_BPS})",
+    )
+    parser.add_argument(
+        "--label-mode",
+        default=DEFAULT_LABEL_MODE,
+        choices=sorted(SUPPORTED_LABEL_MODES),
+        help="Label mode: direction (threshold) or cost_aware (default: direction)",
+    )
+    parser.add_argument(
+        "--label-cost-multiplier",
+        type=float,
+        default=DEFAULT_LABEL_COST_MULTIPLIER,
+        help=(
+            "Multiplier on estimated row cost when creating cost_aware labels "
+            f"(default: {DEFAULT_LABEL_COST_MULTIPLIER})"
+        ),
+    )
+    parser.add_argument(
+        "--label-min-edge-bps",
+        type=float,
+        default=DEFAULT_LABEL_MIN_EDGE_BPS,
+        help=(
+            "Minimum edge above estimated row cost for cost_aware labels "
+            f"(default: {DEFAULT_LABEL_MIN_EDGE_BPS})"
+        ),
     )
     parser.add_argument(
         "--train-bars",
@@ -1927,6 +2226,9 @@ def main(argv: list[str] | None = None) -> int:
         source=args.source,
         horizon=args.horizon,
         threshold_bps=args.threshold_bps,
+        label_mode=args.label_mode,
+        label_cost_multiplier=args.label_cost_multiplier,
+        label_min_edge_bps=args.label_min_edge_bps,
         train_bars=args.train_bars,
         test_bars=args.test_bars,
         step_bars=args.step_bars,
