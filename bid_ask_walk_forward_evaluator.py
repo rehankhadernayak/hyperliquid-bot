@@ -385,6 +385,7 @@ def simulate_paper_signal_returns(
     return {
         "gross_returns_bps": gross_returns,
         "net_returns_bps": net_returns,
+        "accepted_trade_net_returns_bps": trade_returns,
         "trade_returns_bps": trade_returns,
         "raw_predictions": raw_predictions,
         "filtered_paper_trades": filtered_paper_trades,
@@ -444,6 +445,55 @@ def build_trade_filter(
         min_confidence=min_confidence,
         threshold_bps=threshold_bps,
     )
+
+
+NET_RETURN_CONSISTENCY_TOLERANCE_BPS = 1e-9
+
+
+def aggregate_accepted_trade_metrics(
+    accepted_trade_net_returns_bps: list[float],
+) -> dict[str, Any]:
+    """Compute net-return metrics from one accepted filtered-trade return list."""
+    filtered_paper_trades = len(accepted_trade_net_returns_bps)
+    if filtered_paper_trades == 0:
+        return {
+            "accepted_trade_net_returns_bps": [],
+            "filtered_paper_trades": 0,
+            "cumulative_net_return_bps": 0.0,
+            "average_net_return_bps": 0.0,
+            "win_rate_after_costs": 0.0,
+            "max_drawdown_bps": 0.0,
+            "longest_losing_streak": 0,
+            "positive_after_costs": False,
+            "expected_average_from_cumulative": 0.0,
+            "average_net_return_difference_abs": 0.0,
+            "net_return_consistency_check": True,
+        }
+
+    cumulative_net_return_bps = float(sum(accepted_trade_net_returns_bps))
+    average_net_return_bps = cumulative_net_return_bps / filtered_paper_trades
+    expected_average_from_cumulative = cumulative_net_return_bps / filtered_paper_trades
+    average_net_return_difference_abs = abs(
+        average_net_return_bps - expected_average_from_cumulative
+    )
+    net_return_consistency_check = (
+        average_net_return_difference_abs <= NET_RETURN_CONSISTENCY_TOLERANCE_BPS
+    )
+    wins = sum(1 for value in accepted_trade_net_returns_bps if value > 0)
+
+    return {
+        "accepted_trade_net_returns_bps": list(accepted_trade_net_returns_bps),
+        "filtered_paper_trades": filtered_paper_trades,
+        "cumulative_net_return_bps": cumulative_net_return_bps,
+        "average_net_return_bps": average_net_return_bps,
+        "win_rate_after_costs": wins / filtered_paper_trades,
+        "max_drawdown_bps": max_drawdown_bps(accepted_trade_net_returns_bps),
+        "longest_losing_streak": longest_losing_streak(accepted_trade_net_returns_bps),
+        "positive_after_costs": cumulative_net_return_bps > 0,
+        "expected_average_from_cumulative": expected_average_from_cumulative,
+        "average_net_return_difference_abs": average_net_return_difference_abs,
+        "net_return_consistency_check": net_return_consistency_check,
+    }
 
 
 def max_drawdown_bps(net_returns: list[float]) -> float:
@@ -615,9 +665,10 @@ def evaluate_walk_forward_window(
         default_spread_bps=default_spread_bps,
         trade_filter=trade_filter,
     )
-    trade_returns = paper_simulation["trade_returns_bps"]
-    wins = sum(1 for value in trade_returns if value > 0)
-    win_rate = wins / len(trade_returns) if trade_returns else 0.0
+    accepted_trade_net_returns_bps = list(
+        paper_simulation["accepted_trade_net_returns_bps"]
+    )
+    trade_metrics = aggregate_accepted_trade_metrics(accepted_trade_net_returns_bps)
 
     model_artifact_path: str | None = None
     if save_window_models and sklearn_result.get("model") is not None:
@@ -678,14 +729,17 @@ def evaluate_walk_forward_window(
             if paper_simulation["gross_returns_bps"]
             else 0.0
         ),
-        "average_net_return_bps": (
-            float(np.mean(trade_returns)) if trade_returns else 0.0
-        ),
-        "cumulative_net_return_bps": float(sum(trade_returns)),
-        "win_rate_after_costs": win_rate,
-        "longest_losing_streak": longest_losing_streak(trade_returns),
-        "max_drawdown_bps": max_drawdown_bps(trade_returns),
-        "trade_returns_bps": trade_returns,
+        "accepted_trade_net_returns_bps": accepted_trade_net_returns_bps,
+        "average_net_return_bps": trade_metrics["average_net_return_bps"],
+        "cumulative_net_return_bps": trade_metrics["cumulative_net_return_bps"],
+        "win_rate_after_costs": trade_metrics["win_rate_after_costs"],
+        "longest_losing_streak": trade_metrics["longest_losing_streak"],
+        "max_drawdown_bps": trade_metrics["max_drawdown_bps"],
+        "positive_after_costs": trade_metrics["positive_after_costs"],
+        "expected_average_from_cumulative": trade_metrics["expected_average_from_cumulative"],
+        "average_net_return_difference_abs": trade_metrics["average_net_return_difference_abs"],
+        "net_return_consistency_check": trade_metrics["net_return_consistency_check"],
+        "trade_returns_bps": accepted_trade_net_returns_bps,
         "model_artifact_path": model_artifact_path,
         "warnings": _label_imbalance_warnings(y_true, "test"),
     }
@@ -813,24 +867,28 @@ def evaluate_coin_walk_forward(
     average_cost_bps = float(np.mean(cost_values)) if cost_values else 0.0
     average_required_edge_bps = float(np.mean(required_edge_values)) if required_edge_values else 0.0
 
-    per_trade_returns: list[float] = []
+    accepted_trade_net_returns_bps: list[float] = []
     for window in completed:
-        per_trade_returns.extend(float(value) for value in window.get("trade_returns_bps", []))
+        accepted_trade_net_returns_bps.extend(
+            float(value)
+            for value in window.get(
+                "accepted_trade_net_returns_bps",
+                window.get("trade_returns_bps", []),
+            )
+        )
 
-    cumulative_net_return_bps = float(sum(item.get("cumulative_net_return_bps", 0.0) for item in completed))
+    trade_metrics = aggregate_accepted_trade_metrics(accepted_trade_net_returns_bps)
+    cumulative_net_return_bps = trade_metrics["cumulative_net_return_bps"]
+    average_net_return_bps = trade_metrics["average_net_return_bps"]
+    win_rate_after_costs = trade_metrics["win_rate_after_costs"]
     average_gross_return_bps = (
         float(np.mean([item.get("average_gross_return_bps", 0.0) for item in completed]))
         if completed
         else 0.0
     )
-    average_net_return_bps = (
-        float(np.mean(per_trade_returns)) if per_trade_returns else 0.0
-    )
-    win_rate_after_costs = (
-        sum(1 for value in per_trade_returns if value > 0) / len(per_trade_returns)
-        if per_trade_returns
-        else 0.0
-    )
+
+    if not trade_metrics["net_return_consistency_check"]:
+        warnings.append("net_return_aggregation_inconsistent")
 
     if len(windows) < min_windows:
         warnings.append(
@@ -881,11 +939,15 @@ def evaluate_coin_walk_forward(
         "average_cost_bps": average_cost_bps,
         "average_required_edge_bps": average_required_edge_bps,
         "average_gross_return_bps": average_gross_return_bps,
+        "accepted_trade_net_returns_bps": accepted_trade_net_returns_bps,
         "average_net_return_bps": average_net_return_bps,
         "cumulative_net_return_bps": cumulative_net_return_bps,
-        "max_drawdown_bps": max_drawdown_bps(per_trade_returns),
+        "max_drawdown_bps": trade_metrics["max_drawdown_bps"],
         "win_rate_after_costs": win_rate_after_costs,
-        "longest_losing_streak": longest_losing_streak(per_trade_returns),
+        "longest_losing_streak": trade_metrics["longest_losing_streak"],
+        "expected_average_from_cumulative": trade_metrics["expected_average_from_cumulative"],
+        "average_net_return_difference_abs": trade_metrics["average_net_return_difference_abs"],
+        "net_return_consistency_check": trade_metrics["net_return_consistency_check"],
         **readiness,
         "readiness": readiness,
         "windows": window_results,
@@ -960,29 +1022,24 @@ def build_walk_forward_report(
         float(np.mean(baseline_accuracy_values)) if baseline_accuracy_values else 0.0
     )
 
-    cumulative_net_return_bps = float(
-        sum(float(item.get("cumulative_net_return_bps", 0.0)) for item in completed_coins)
-    )
+    accepted_trade_net_returns_bps: list[float] = []
+    for item in completed_coins:
+        accepted_trade_net_returns_bps.extend(
+            float(value)
+            for value in item.get(
+                "accepted_trade_net_returns_bps",
+                item.get("trade_returns_bps", []),
+            )
+        )
+
+    trade_metrics = aggregate_accepted_trade_metrics(accepted_trade_net_returns_bps)
+    cumulative_net_return_bps = trade_metrics["cumulative_net_return_bps"]
+    average_net_return_bps = trade_metrics["average_net_return_bps"]
+    win_rate_after_costs = trade_metrics["win_rate_after_costs"]
     gross_values = [
         float(item.get("average_gross_return_bps", 0.0))
         for item in completed_coins
         if item.get("total_paper_trades", 0) > 0
-    ]
-    net_values = [
-        float(item.get("average_net_return_bps", 0.0))
-        for item in completed_coins
-        if item.get("total_paper_trades", 0) > 0
-    ]
-    drawdown_values = [
-        float(item.get("max_drawdown_bps", 0.0)) for item in completed_coins
-    ]
-    win_rates = [
-        float(item.get("win_rate_after_costs", 0.0))
-        for item in completed_coins
-        if item.get("total_paper_trades", 0) > 0
-    ]
-    losing_streaks = [
-        int(item.get("longest_losing_streak", 0)) for item in completed_coins
     ]
 
     for item in per_coin_results:
@@ -998,6 +1055,8 @@ def build_walk_forward_report(
         warnings.append("model_not_better_than_baseline")
     if cumulative_net_return_bps <= 0 and total_paper_trades > 0:
         warnings.append("negative_after_costs")
+    if not trade_metrics["net_return_consistency_check"]:
+        warnings.append("net_return_aggregation_inconsistent")
 
     readiness = compute_readiness_flags(
         accuracy_edge_vs_baseline=accuracy_edge_vs_baseline,
@@ -1076,12 +1135,16 @@ def build_walk_forward_report(
         "blocked_by_trade_class": blocked_by_trade_class,
         "average_cost_bps": average_cost_bps,
         "average_required_edge_bps": average_required_edge_bps,
+        "accepted_trade_net_returns_bps": accepted_trade_net_returns_bps,
         "average_gross_return_bps": float(np.mean(gross_values)) if gross_values else 0.0,
-        "average_net_return_bps": float(np.mean(net_values)) if net_values else 0.0,
+        "average_net_return_bps": average_net_return_bps,
         "cumulative_net_return_bps": cumulative_net_return_bps,
-        "max_drawdown_bps": float(max(drawdown_values)) if drawdown_values else 0.0,
-        "win_rate_after_costs": float(np.mean(win_rates)) if win_rates else 0.0,
-        "longest_losing_streak": max(losing_streaks) if losing_streaks else 0,
+        "max_drawdown_bps": trade_metrics["max_drawdown_bps"],
+        "win_rate_after_costs": win_rate_after_costs,
+        "longest_losing_streak": trade_metrics["longest_losing_streak"],
+        "expected_average_from_cumulative": trade_metrics["expected_average_from_cumulative"],
+        "average_net_return_difference_abs": trade_metrics["average_net_return_difference_abs"],
+        "net_return_consistency_check": trade_metrics["net_return_consistency_check"],
         "per_coin": per_coin_summary,
         "per_coin_details": per_coin_results,
         **readiness,
@@ -1170,8 +1233,12 @@ def write_walk_forward_markdown(
         f"- average_cost_bps: {report.get('average_cost_bps', 0.0):.4f}",
         f"- average_required_edge_bps: {report.get('average_required_edge_bps', 0.0):.4f}",
         f"- average_gross_return_bps: {report.get('average_gross_return_bps', 0.0):.4f}",
-        f"- average_net_return_bps: {report.get('average_net_return_bps', 0.0):.4f}",
+        f"- filtered_paper_trades (accepted): {report.get('filtered_paper_trades', 0)}",
         f"- cumulative_net_return_bps: {report.get('cumulative_net_return_bps', 0.0):.4f}",
+        f"- average_net_return_bps: {report.get('average_net_return_bps', 0.0):.4f}",
+        f"- expected_average_from_cumulative: {report.get('expected_average_from_cumulative', 0.0):.4f}",
+        f"- average_net_return_difference_abs: {report.get('average_net_return_difference_abs', 0.0):.6f}",
+        f"- net_return_consistency_check: {str(report.get('net_return_consistency_check', True)).lower()}",
         f"- max_drawdown_bps: {report.get('max_drawdown_bps', 0.0):.4f}",
         f"- win_rate_after_costs: {report.get('win_rate_after_costs', 0.0):.4f}",
         f"- longest_losing_streak: {report.get('longest_losing_streak', 0)}",

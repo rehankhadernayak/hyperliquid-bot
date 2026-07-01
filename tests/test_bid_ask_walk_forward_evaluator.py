@@ -18,6 +18,7 @@ from bid_ask_walk_forward_evaluator import (
     SAFETY_NOTE,
     TradeFilterConfig,
     _build_arg_parser,
+    aggregate_accepted_trade_metrics,
     build_trade_filter,
     build_walk_forward_report,
     compute_readiness_flags,
@@ -448,6 +449,230 @@ class TestDrawdownAndStreak:
     def test_longest_losing_streak(self) -> None:
         returns = [1.0, -1.0, -2.0, 3.0, -1.0]
         assert longest_losing_streak(returns) == 2
+
+
+class TestAcceptedTradeNetReturnAggregation:
+    def test_average_equals_cumulative_over_trade_count(self) -> None:
+        accepted = [10.0, -4.0, 6.0, -2.0]
+        metrics = aggregate_accepted_trade_metrics(accepted)
+
+        assert metrics["filtered_paper_trades"] == 4
+        assert metrics["cumulative_net_return_bps"] == pytest.approx(10.0)
+        assert metrics["average_net_return_bps"] == pytest.approx(2.5)
+        assert metrics["expected_average_from_cumulative"] == pytest.approx(2.5)
+        assert metrics["average_net_return_difference_abs"] == pytest.approx(0.0)
+        assert metrics["net_return_consistency_check"] is True
+
+    def test_positive_average_cannot_coexist_with_negative_cumulative(self) -> None:
+        accepted = [5.0, -3.0, 2.0, -10.0]
+        metrics = aggregate_accepted_trade_metrics(accepted)
+
+        assert metrics["cumulative_net_return_bps"] < 0
+        assert metrics["average_net_return_bps"] < 0
+        assert metrics["positive_after_costs"] is False
+        assert metrics["net_return_consistency_check"] is True
+
+    def test_zero_trades_produce_zero_return_metrics(self) -> None:
+        metrics = aggregate_accepted_trade_metrics([])
+
+        assert metrics["filtered_paper_trades"] == 0
+        assert metrics["cumulative_net_return_bps"] == 0.0
+        assert metrics["average_net_return_bps"] == 0.0
+        assert metrics["win_rate_after_costs"] == 0.0
+        assert metrics["max_drawdown_bps"] == 0.0
+        assert metrics["longest_losing_streak"] == 0
+        assert metrics["positive_after_costs"] is False
+        assert metrics["net_return_consistency_check"] is True
+
+    def test_win_rate_uses_only_accepted_filtered_trades(self) -> None:
+        accepted = [3.0, -1.0, 2.0, -4.0]
+        metrics = aggregate_accepted_trade_metrics(accepted)
+
+        assert metrics["win_rate_after_costs"] == pytest.approx(0.5)
+
+    def test_drawdown_uses_accepted_trade_cumulative_curve(self) -> None:
+        accepted = [5.0, -10.0, 3.0, -2.0]
+        metrics = aggregate_accepted_trade_metrics(accepted)
+
+        assert metrics["max_drawdown_bps"] == pytest.approx(max_drawdown_bps(accepted))
+        assert metrics["longest_losing_streak"] == longest_losing_streak(accepted)
+
+    def test_report_aggregation_uses_single_accepted_trade_list(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        coin_a = {
+            "coin": "BTC",
+            "status": "completed",
+            "completed_windows": 1,
+            "total_windows": 1,
+            "skipped_windows": 0,
+            "model_accuracy_mean": 0.6,
+            "baseline_accuracy_mean": 0.5,
+            "accuracy_edge_vs_baseline": 0.1,
+            "total_paper_signals": 2,
+            "raw_predictions": 2,
+            "filtered_paper_trades": 2,
+            "total_paper_trades": 2,
+            "accepted_trade_net_returns_bps": [100.0, 100.0],
+            "trade_returns_bps": [100.0, 100.0],
+            "cumulative_net_return_bps": 200.0,
+            "average_net_return_bps": 100.0,
+            "average_gross_return_bps": 100.0,
+            "average_cost_bps": 0.0,
+            "average_required_edge_bps": 0.0,
+            "blocked_by_confidence": 0,
+            "blocked_by_cost": 0,
+            "blocked_by_spread": 0,
+            "blocked_by_volatility": 0,
+            "blocked_by_trade_class": 0,
+            "warnings": [],
+            "windows": [],
+        }
+        coin_b = {
+            **coin_a,
+            "coin": "ETH",
+            "accepted_trade_net_returns_bps": [-0.5] * 1000,
+            "trade_returns_bps": [-0.5] * 1000,
+            "filtered_paper_trades": 1000,
+            "total_paper_trades": 1000,
+            "raw_predictions": 1000,
+            "total_paper_signals": 1000,
+            "cumulative_net_return_bps": -500.0,
+            "average_net_return_bps": -0.5,
+        }
+
+        report = build_walk_forward_report(
+            coins=["BTC", "ETH"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            trade_filter=_permissive_filter(),
+            per_coin_results=[coin_a, coin_b],
+            data_root=data_root,
+        )
+
+        assert report["filtered_paper_trades"] == 1002
+        assert report["cumulative_net_return_bps"] == pytest.approx(-300.0)
+        assert report["average_net_return_bps"] == pytest.approx(-300.0 / 1002)
+        assert report["expected_average_from_cumulative"] == pytest.approx(-300.0 / 1002)
+        assert report["net_return_consistency_check"] is True
+        assert not (
+            report["average_net_return_bps"] > 0 and report["cumulative_net_return_bps"] < 0
+        )
+
+    def test_consistency_check_passes_on_normal_reports(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["net_return_consistency_check"] is True
+        assert report["average_net_return_difference_abs"] == pytest.approx(0.0)
+        if report["filtered_paper_trades"] > 0:
+            assert report["average_net_return_bps"] == pytest.approx(
+                report["cumulative_net_return_bps"] / report["filtered_paper_trades"]
+            )
+
+    def test_markdown_includes_consistency_fields(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        report = build_walk_forward_report(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            trade_filter=_permissive_filter(),
+            per_coin_results=[
+                {
+                    "coin": "BTC",
+                    "status": "completed",
+                    "completed_windows": 1,
+                    "total_windows": 1,
+                    "skipped_windows": 0,
+                    "model_accuracy_mean": 0.5,
+                    "baseline_accuracy_mean": 0.5,
+                    "accuracy_edge_vs_baseline": 0.0,
+                    "total_paper_signals": 3,
+                    "raw_predictions": 3,
+                    "filtered_paper_trades": 3,
+                    "total_paper_trades": 3,
+                    "accepted_trade_net_returns_bps": [2.0, -1.0, 3.0],
+                    "trade_returns_bps": [2.0, -1.0, 3.0],
+                    "cumulative_net_return_bps": 4.0,
+                    "average_net_return_bps": 4.0 / 3,
+                    "average_gross_return_bps": 2.0,
+                    "average_cost_bps": 0.0,
+                    "average_required_edge_bps": 0.0,
+                    "blocked_by_confidence": 0,
+                    "blocked_by_cost": 0,
+                    "blocked_by_spread": 0,
+                    "blocked_by_volatility": 0,
+                    "blocked_by_trade_class": 0,
+                    "warnings": [],
+                    "windows": [],
+                }
+            ],
+            data_root=data_root,
+        )
+        md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "filtered_paper_trades (accepted)" in md_text
+        assert "net_return_consistency_check" in md_text
+        assert "cumulative_net_return_bps" in md_text
+        assert "average_net_return_bps" in md_text
+
+    def test_paper_only_and_execution_disabled(self, data_root: Path, reports_dir: Path) -> None:
+        report = build_walk_forward_report(
+            coins=["SOL"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            trade_filter=_permissive_filter(),
+            per_coin_results=[],
+            data_root=data_root,
+        )
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
 
 
 class TestEvaluateCoinWalkForward:
