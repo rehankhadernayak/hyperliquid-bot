@@ -8,6 +8,7 @@ from __future__ import annotations
 import argparse
 import json
 import uuid
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -55,6 +56,10 @@ DEFAULT_SPREAD_BPS = 2.0
 DEFAULT_MIN_CONFIDENCE = 0.4
 DEFAULT_THRESHOLD_BPS = 1.0
 DEFAULT_HORIZON = 5
+DEFAULT_MIN_EDGE_BPS = 0.0
+DEFAULT_COST_MULTIPLIER = 1.0
+DEFAULT_HORIZON_RETURN_SCALE_BPS = 10.0
+DEFAULT_TRADE_CLASSES = frozenset({"UP", "DOWN"})
 
 MIN_ROWS_WARNING = 50
 DEFAULT_MIN_WINDOWS = 5
@@ -107,12 +112,42 @@ def generate_walk_forward_windows(
     return windows
 
 
+@dataclass(frozen=True)
+class TradeFilterConfig:
+    """Cost-aware paper-trade filter settings."""
+
+    min_edge_bps: float = DEFAULT_MIN_EDGE_BPS
+    max_spread_bps: float | None = None
+    min_volatility_bps: float | None = None
+    max_volatility_bps: float | None = None
+    trade_classes: frozenset[str] = DEFAULT_TRADE_CLASSES
+    cost_multiplier: float = DEFAULT_COST_MULTIPLIER
+    horizon_return_scale_bps: float = DEFAULT_HORIZON_RETURN_SCALE_BPS
+    min_absolute_future_label_bps: float | None = None
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE
+    threshold_bps: float = DEFAULT_THRESHOLD_BPS
+
+
+def parse_trade_classes(value: str) -> frozenset[str]:
+    """Parse comma-separated trade classes, e.g. UP,DOWN."""
+    classes = frozenset(part.strip().upper() for part in value.split(",") if part.strip())
+    if not classes:
+        return DEFAULT_TRADE_CLASSES
+    return classes
+
+
 def _spread_cost_bps(row: pd.Series, default_spread_bps: float) -> float:
     if "avg_spread_bps" in row.index and pd.notna(row["avg_spread_bps"]):
         return float(row["avg_spread_bps"])
     if "spread_bps" in row.index and pd.notna(row["spread_bps"]):
         return float(row["spread_bps"])
     return float(default_spread_bps)
+
+
+def _volatility_bps(row: pd.Series) -> float | None:
+    if "rolling_volatility_5" in row.index and pd.notna(row["rolling_volatility_5"]):
+        return float(row["rolling_volatility_5"])
+    return None
 
 
 def _estimate_cost_bps(
@@ -164,58 +199,251 @@ def _prediction_confidence(
     return [1.0] * len(model_predictions)
 
 
+def _confidence_edge_from_proba(proba: np.ndarray) -> float:
+    sorted_probs = np.sort(proba)[::-1]
+    if len(sorted_probs) < 2:
+        return float(sorted_probs[0]) if len(sorted_probs) == 1 else 0.0
+    return float(sorted_probs[0] - sorted_probs[1])
+
+
+def _prediction_confidence_edges(
+    *,
+    sklearn_result: dict[str, Any],
+    model_predictions: list[str],
+    test_df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    model_used: str,
+) -> list[float]:
+    model = sklearn_result.get("model")
+    scaler = sklearn_result.get("scaler")
+    if model is not None and scaler is not None and hasattr(model, "predict_proba"):
+        X_test = _feature_matrix(test_df)
+        if len(X_test) == 0:
+            return []
+        return [
+            _confidence_edge_from_proba(proba)
+            for proba in model.predict_proba(scaler.transform(X_test))
+        ]
+
+    confidences = _prediction_confidence(
+        sklearn_result=sklearn_result,
+        model_predictions=model_predictions,
+        test_df=test_df,
+        train_df=train_df,
+        model_used=model_used,
+    )
+    n_classes = len(LABELS)
+    return [
+        max(0.0, confidence - (1.0 - confidence) / max(1, n_classes - 1))
+        for confidence in confidences
+    ]
+
+
+def _expected_edge_proxy_bps(
+    confidence_edge: float,
+    *,
+    horizon_return_scale_bps: float,
+    threshold_bps: float,
+    min_absolute_future_label_bps: float | None,
+) -> float:
+    proxy = confidence_edge * horizon_return_scale_bps
+    if min_absolute_future_label_bps is not None:
+        return max(proxy, threshold_bps)
+    return proxy
+
+
+def evaluate_trade_filter(
+    *,
+    prediction: str,
+    confidence: float,
+    confidence_edge: float,
+    row: pd.Series,
+    fee_bps: float,
+    slippage_bps: float,
+    default_spread_bps: float,
+    trade_filter: TradeFilterConfig,
+) -> tuple[bool, str, float, float]:
+    """Return (allowed, block_reason, total_cost_bps, required_edge_bps)."""
+    spread_bps = _spread_cost_bps(row, default_spread_bps)
+    total_cost_bps = fee_bps + slippage_bps + spread_bps
+    required_edge_bps = total_cost_bps * trade_filter.cost_multiplier + trade_filter.min_edge_bps
+    expected_edge_proxy_bps = _expected_edge_proxy_bps(
+        confidence_edge,
+        horizon_return_scale_bps=trade_filter.horizon_return_scale_bps,
+        threshold_bps=trade_filter.threshold_bps,
+        min_absolute_future_label_bps=trade_filter.min_absolute_future_label_bps,
+    )
+
+    if prediction == "FLAT":
+        return False, "flat", total_cost_bps, required_edge_bps
+
+    if prediction not in trade_filter.trade_classes:
+        return False, "trade_class", total_cost_bps, required_edge_bps
+
+    if confidence < trade_filter.min_confidence:
+        return False, "confidence", total_cost_bps, required_edge_bps
+
+    if trade_filter.max_spread_bps is not None and spread_bps > trade_filter.max_spread_bps:
+        return False, "spread", total_cost_bps, required_edge_bps
+
+    volatility_bps = _volatility_bps(row)
+    if trade_filter.min_volatility_bps is not None:
+        if volatility_bps is None or volatility_bps < trade_filter.min_volatility_bps:
+            return False, "volatility", total_cost_bps, required_edge_bps
+    if trade_filter.max_volatility_bps is not None:
+        if volatility_bps is None or volatility_bps > trade_filter.max_volatility_bps:
+            return False, "volatility", total_cost_bps, required_edge_bps
+
+    if trade_filter.min_absolute_future_label_bps is not None:
+        label_edge = max(expected_edge_proxy_bps, trade_filter.threshold_bps)
+        if label_edge <= trade_filter.min_absolute_future_label_bps:
+            return False, "cost", total_cost_bps, required_edge_bps
+
+    if expected_edge_proxy_bps <= required_edge_bps:
+        return False, "cost", total_cost_bps, required_edge_bps
+
+    return True, "", total_cost_bps, required_edge_bps
+
+
 def simulate_paper_signal_returns(
     test_df: pd.DataFrame,
     predictions: list[str],
     confidences: list[float],
+    confidence_edges: list[float],
     *,
     fee_bps: float,
     slippage_bps: float,
     default_spread_bps: float,
-    min_confidence: float,
+    trade_filter: TradeFilterConfig,
 ) -> dict[str, Any]:
-    """Simulate paper-only cost-adjusted returns for model signals."""
+    """Simulate paper-only cost-adjusted returns with cost-aware filtering."""
     gross_returns: list[float] = []
     net_returns: list[float] = []
     trade_returns: list[float] = []
-    signal_count = 0
-    trade_count = 0
+    raw_predictions = 0
+    filtered_paper_trades = 0
+    blocked_by_confidence = 0
+    blocked_by_cost = 0
+    blocked_by_spread = 0
+    blocked_by_volatility = 0
+    blocked_by_trade_class = 0
+    cost_samples: list[float] = []
+    required_edge_samples: list[float] = []
 
     for index, (_, row) in enumerate(test_df.iterrows()):
         prediction = predictions[index] if index < len(predictions) else "FLAT"
         confidence = float(confidences[index]) if index < len(confidences) else 0.0
+        confidence_edge = (
+            float(confidence_edges[index]) if index < len(confidence_edges) else 0.0
+        )
         future_return = float(row["future_return_bps"])
-        cost_bps = _estimate_cost_bps(
-            row,
+
+        allowed, block_reason, total_cost_bps, required_edge_bps = evaluate_trade_filter(
+            prediction=prediction,
+            confidence=confidence,
+            confidence_edge=confidence_edge,
+            row=row,
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
             default_spread_bps=default_spread_bps,
+            trade_filter=trade_filter,
         )
 
-        if prediction not in ("UP", "DOWN") or confidence < min_confidence:
+        if prediction in ("UP", "DOWN"):
+            raw_predictions += 1
+            cost_samples.append(total_cost_bps)
+            required_edge_samples.append(required_edge_bps)
+
+        if not allowed:
+            if block_reason == "confidence":
+                blocked_by_confidence += 1
+            elif block_reason == "cost":
+                blocked_by_cost += 1
+            elif block_reason == "spread":
+                blocked_by_spread += 1
+            elif block_reason == "volatility":
+                blocked_by_volatility += 1
+            elif block_reason == "trade_class":
+                blocked_by_trade_class += 1
             gross_returns.append(0.0)
             net_returns.append(0.0)
             continue
 
-        signal_count += 1
         if prediction == "UP":
             gross = future_return
         else:
             gross = -future_return
 
-        net = gross - cost_bps
+        net = gross - total_cost_bps
         gross_returns.append(gross)
         net_returns.append(net)
-        trade_count += 1
+        filtered_paper_trades += 1
         trade_returns.append(net)
+
+    trade_filter_summary = trade_filter_to_summary(trade_filter)
 
     return {
         "gross_returns_bps": gross_returns,
         "net_returns_bps": net_returns,
         "trade_returns_bps": trade_returns,
-        "total_paper_signals": signal_count,
-        "total_paper_trades": trade_count,
+        "raw_predictions": raw_predictions,
+        "filtered_paper_trades": filtered_paper_trades,
+        "blocked_by_confidence": blocked_by_confidence,
+        "blocked_by_cost": blocked_by_cost,
+        "blocked_by_spread": blocked_by_spread,
+        "blocked_by_volatility": blocked_by_volatility,
+        "blocked_by_trade_class": blocked_by_trade_class,
+        "trade_filter_summary": trade_filter_summary,
+        "average_cost_bps": float(np.mean(cost_samples)) if cost_samples else 0.0,
+        "average_required_edge_bps": (
+            float(np.mean(required_edge_samples)) if required_edge_samples else 0.0
+        ),
+        "total_paper_signals": raw_predictions,
+        "total_paper_trades": filtered_paper_trades,
     }
+
+
+def trade_filter_to_summary(trade_filter: TradeFilterConfig) -> dict[str, Any]:
+    """Serialize trade filter settings for reports."""
+    return {
+        "min_edge_bps": trade_filter.min_edge_bps,
+        "max_spread_bps": trade_filter.max_spread_bps,
+        "min_volatility_bps": trade_filter.min_volatility_bps,
+        "max_volatility_bps": trade_filter.max_volatility_bps,
+        "trade_classes": sorted(trade_filter.trade_classes),
+        "cost_multiplier": trade_filter.cost_multiplier,
+        "horizon_return_scale_bps": trade_filter.horizon_return_scale_bps,
+        "min_absolute_future_label_bps": trade_filter.min_absolute_future_label_bps,
+        "min_confidence": trade_filter.min_confidence,
+        "threshold_bps": trade_filter.threshold_bps,
+    }
+
+
+def build_trade_filter(
+    *,
+    min_confidence: float,
+    threshold_bps: float,
+    min_edge_bps: float = DEFAULT_MIN_EDGE_BPS,
+    max_spread_bps: float | None = None,
+    min_volatility_bps: float | None = None,
+    max_volatility_bps: float | None = None,
+    trade_classes: frozenset[str] | None = None,
+    cost_multiplier: float = DEFAULT_COST_MULTIPLIER,
+    horizon_return_scale_bps: float = DEFAULT_HORIZON_RETURN_SCALE_BPS,
+    min_absolute_future_label_bps: float | None = None,
+) -> TradeFilterConfig:
+    return TradeFilterConfig(
+        min_edge_bps=min_edge_bps,
+        max_spread_bps=max_spread_bps,
+        min_volatility_bps=min_volatility_bps,
+        max_volatility_bps=max_volatility_bps,
+        trade_classes=trade_classes or DEFAULT_TRADE_CLASSES,
+        cost_multiplier=cost_multiplier,
+        horizon_return_scale_bps=horizon_return_scale_bps,
+        min_absolute_future_label_bps=min_absolute_future_label_bps,
+        min_confidence=min_confidence,
+        threshold_bps=threshold_bps,
+    )
 
 
 def max_drawdown_bps(net_returns: list[float]) -> float:
@@ -320,7 +548,7 @@ def evaluate_walk_forward_window(
     fee_bps: float,
     slippage_bps: float,
     default_spread_bps: float,
-    min_confidence: float,
+    trade_filter: TradeFilterConfig,
     save_window_models: bool,
     models_dir: Path,
     coin: str,
@@ -370,14 +598,22 @@ def evaluate_walk_forward_window(
         train_df=train_df,
         model_used=model_used,
     )
+    confidence_edges = _prediction_confidence_edges(
+        sklearn_result=sklearn_result,
+        model_predictions=model_predictions,
+        test_df=test_df,
+        train_df=train_df,
+        model_used=model_used,
+    )
     paper_simulation = simulate_paper_signal_returns(
         test_df,
         model_predictions,
         confidences,
+        confidence_edges,
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
         default_spread_bps=default_spread_bps,
-        min_confidence=min_confidence,
+        trade_filter=trade_filter,
     )
     trade_returns = paper_simulation["trade_returns_bps"]
     wins = sum(1 for value in trade_returns if value > 0)
@@ -427,6 +663,16 @@ def evaluate_walk_forward_window(
         },
         "total_paper_signals": paper_simulation["total_paper_signals"],
         "total_paper_trades": paper_simulation["total_paper_trades"],
+        "raw_predictions": paper_simulation["raw_predictions"],
+        "filtered_paper_trades": paper_simulation["filtered_paper_trades"],
+        "blocked_by_confidence": paper_simulation["blocked_by_confidence"],
+        "blocked_by_cost": paper_simulation["blocked_by_cost"],
+        "blocked_by_spread": paper_simulation["blocked_by_spread"],
+        "blocked_by_volatility": paper_simulation["blocked_by_volatility"],
+        "blocked_by_trade_class": paper_simulation["blocked_by_trade_class"],
+        "trade_filter_summary": paper_simulation["trade_filter_summary"],
+        "average_cost_bps": paper_simulation["average_cost_bps"],
+        "average_required_edge_bps": paper_simulation["average_required_edge_bps"],
         "average_gross_return_bps": (
             float(np.mean(paper_simulation["gross_returns_bps"]))
             if paper_simulation["gross_returns_bps"]
@@ -458,7 +704,7 @@ def evaluate_coin_walk_forward(
     fee_bps: float,
     slippage_bps: float,
     default_spread_bps: float,
-    min_confidence: float,
+    trade_filter: TradeFilterConfig,
     data_root: Path,
     save_window_models: bool,
     models_dir: Path,
@@ -525,7 +771,7 @@ def evaluate_coin_walk_forward(
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
             default_spread_bps=default_spread_bps,
-            min_confidence=min_confidence,
+            trade_filter=trade_filter,
             save_window_models=save_window_models,
             models_dir=models_dir,
             coin=coin,
@@ -545,7 +791,27 @@ def evaluate_coin_walk_forward(
     baseline_accuracy_mean = float(np.mean(baseline_accuracies)) if baseline_accuracies else 0.0
 
     total_paper_signals = sum(int(item.get("total_paper_signals", 0)) for item in completed)
-    total_paper_trades = sum(int(item.get("total_paper_trades", 0)) for item in completed)
+    total_paper_trades = sum(int(item.get("filtered_paper_trades", 0)) for item in completed)
+    raw_predictions = sum(int(item.get("raw_predictions", 0)) for item in completed)
+    filtered_paper_trades = total_paper_trades
+    blocked_by_confidence = sum(int(item.get("blocked_by_confidence", 0)) for item in completed)
+    blocked_by_cost = sum(int(item.get("blocked_by_cost", 0)) for item in completed)
+    blocked_by_spread = sum(int(item.get("blocked_by_spread", 0)) for item in completed)
+    blocked_by_volatility = sum(int(item.get("blocked_by_volatility", 0)) for item in completed)
+    blocked_by_trade_class = sum(int(item.get("blocked_by_trade_class", 0)) for item in completed)
+
+    cost_values = [
+        float(item.get("average_cost_bps", 0.0))
+        for item in completed
+        if item.get("raw_predictions", 0) > 0
+    ]
+    required_edge_values = [
+        float(item.get("average_required_edge_bps", 0.0))
+        for item in completed
+        if item.get("raw_predictions", 0) > 0
+    ]
+    average_cost_bps = float(np.mean(cost_values)) if cost_values else 0.0
+    average_required_edge_bps = float(np.mean(required_edge_values)) if required_edge_values else 0.0
 
     per_trade_returns: list[float] = []
     for window in completed:
@@ -584,7 +850,7 @@ def evaluate_coin_walk_forward(
         accuracy_edge_vs_baseline=accuracy_edge_vs_baseline,
         cumulative_net_return_bps=cumulative_net_return_bps,
         completed_windows=len(completed),
-        total_paper_trades=total_paper_trades,
+        total_paper_trades=filtered_paper_trades,
         min_windows=min_windows,
         min_trades=min_trades,
     )
@@ -604,6 +870,16 @@ def evaluate_coin_walk_forward(
         "accuracy_edge_vs_baseline": accuracy_edge_vs_baseline,
         "total_paper_signals": total_paper_signals,
         "total_paper_trades": total_paper_trades,
+        "raw_predictions": raw_predictions,
+        "filtered_paper_trades": filtered_paper_trades,
+        "blocked_by_confidence": blocked_by_confidence,
+        "blocked_by_cost": blocked_by_cost,
+        "blocked_by_spread": blocked_by_spread,
+        "blocked_by_volatility": blocked_by_volatility,
+        "blocked_by_trade_class": blocked_by_trade_class,
+        "trade_filter_summary": trade_filter_to_summary(trade_filter),
+        "average_cost_bps": average_cost_bps,
+        "average_required_edge_bps": average_required_edge_bps,
         "average_gross_return_bps": average_gross_return_bps,
         "average_net_return_bps": average_net_return_bps,
         "cumulative_net_return_bps": cumulative_net_return_bps,
@@ -630,7 +906,7 @@ def build_walk_forward_report(
     fee_bps: float,
     slippage_bps: float,
     default_spread_bps: float,
-    min_confidence: float,
+    trade_filter: TradeFilterConfig,
     per_coin_results: list[dict[str, Any]],
     data_root: Path,
     min_windows: int = DEFAULT_MIN_WINDOWS,
@@ -647,7 +923,27 @@ def build_walk_forward_report(
     completed_windows = sum(int(item.get("completed_windows", 0)) for item in per_coin_results)
     skipped_windows = sum(int(item.get("skipped_windows", 0)) for item in per_coin_results)
     total_paper_signals = sum(int(item.get("total_paper_signals", 0)) for item in per_coin_results)
-    total_paper_trades = sum(int(item.get("total_paper_trades", 0)) for item in per_coin_results)
+    raw_predictions = sum(int(item.get("raw_predictions", 0)) for item in per_coin_results)
+    filtered_paper_trades = sum(int(item.get("filtered_paper_trades", 0)) for item in per_coin_results)
+    total_paper_trades = filtered_paper_trades
+    blocked_by_confidence = sum(int(item.get("blocked_by_confidence", 0)) for item in per_coin_results)
+    blocked_by_cost = sum(int(item.get("blocked_by_cost", 0)) for item in per_coin_results)
+    blocked_by_spread = sum(int(item.get("blocked_by_spread", 0)) for item in per_coin_results)
+    blocked_by_volatility = sum(int(item.get("blocked_by_volatility", 0)) for item in per_coin_results)
+    blocked_by_trade_class = sum(int(item.get("blocked_by_trade_class", 0)) for item in per_coin_results)
+
+    cost_values = [
+        float(item.get("average_cost_bps", 0.0))
+        for item in completed_coins
+        if item.get("raw_predictions", 0) > 0
+    ]
+    required_edge_values = [
+        float(item.get("average_required_edge_bps", 0.0))
+        for item in completed_coins
+        if item.get("raw_predictions", 0) > 0
+    ]
+    average_cost_bps = float(np.mean(cost_values)) if cost_values else 0.0
+    average_required_edge_bps = float(np.mean(required_edge_values)) if required_edge_values else 0.0
 
     model_accuracy_values = [
         float(item["model_accuracy_mean"])
@@ -707,7 +1003,7 @@ def build_walk_forward_report(
         accuracy_edge_vs_baseline=accuracy_edge_vs_baseline,
         cumulative_net_return_bps=cumulative_net_return_bps,
         completed_windows=completed_windows,
-        total_paper_trades=total_paper_trades,
+        total_paper_trades=filtered_paper_trades,
         min_windows=min_windows,
         min_trades=min_trades,
     )
@@ -719,13 +1015,15 @@ def build_walk_forward_report(
             "model_accuracy_mean": item.get("model_accuracy_mean", 0.0),
             "baseline_accuracy_mean": item.get("baseline_accuracy_mean", 0.0),
             "accuracy_edge_vs_baseline": item.get("accuracy_edge_vs_baseline", 0.0),
-            "total_paper_trades": item.get("total_paper_trades", 0),
+            "raw_predictions": item.get("raw_predictions", 0),
+            "filtered_paper_trades": item.get("filtered_paper_trades", 0),
+            "total_paper_trades": item.get("filtered_paper_trades", 0),
             "cumulative_net_return_bps": item.get("cumulative_net_return_bps", 0.0),
             "readiness": item.get("readiness") or compute_readiness_flags(
                 accuracy_edge_vs_baseline=float(item.get("accuracy_edge_vs_baseline", 0.0)),
                 cumulative_net_return_bps=float(item.get("cumulative_net_return_bps", 0.0)),
                 completed_windows=int(item.get("completed_windows", 0)),
-                total_paper_trades=int(item.get("total_paper_trades", 0)),
+                total_paper_trades=int(item.get("filtered_paper_trades", 0)),
                 min_windows=min_windows,
                 min_trades=min_trades,
             ),
@@ -749,7 +1047,16 @@ def build_walk_forward_report(
         "fee_bps": fee_bps,
         "slippage_bps": slippage_bps,
         "default_spread_bps": default_spread_bps,
-        "min_confidence": min_confidence,
+        "min_confidence": trade_filter.min_confidence,
+        "min_edge_bps": trade_filter.min_edge_bps,
+        "max_spread_bps": trade_filter.max_spread_bps,
+        "min_volatility_bps": trade_filter.min_volatility_bps,
+        "max_volatility_bps": trade_filter.max_volatility_bps,
+        "trade_classes": sorted(trade_filter.trade_classes),
+        "cost_multiplier": trade_filter.cost_multiplier,
+        "horizon_return_scale_bps": trade_filter.horizon_return_scale_bps,
+        "min_absolute_future_label_bps": trade_filter.min_absolute_future_label_bps,
+        "trade_filter_summary": trade_filter_to_summary(trade_filter),
         "min_windows": min_windows,
         "min_trades": min_trades,
         "total_windows": total_windows,
@@ -760,6 +1067,15 @@ def build_walk_forward_report(
         "accuracy_edge_vs_baseline": accuracy_edge_vs_baseline,
         "total_paper_signals": total_paper_signals,
         "total_paper_trades": total_paper_trades,
+        "raw_predictions": raw_predictions,
+        "filtered_paper_trades": filtered_paper_trades,
+        "blocked_by_confidence": blocked_by_confidence,
+        "blocked_by_cost": blocked_by_cost,
+        "blocked_by_spread": blocked_by_spread,
+        "blocked_by_volatility": blocked_by_volatility,
+        "blocked_by_trade_class": blocked_by_trade_class,
+        "average_cost_bps": average_cost_bps,
+        "average_required_edge_bps": average_required_edge_bps,
         "average_gross_return_bps": float(np.mean(gross_values)) if gross_values else 0.0,
         "average_net_return_bps": float(np.mean(net_values)) if net_values else 0.0,
         "cumulative_net_return_bps": cumulative_net_return_bps,
@@ -844,6 +1160,15 @@ def write_walk_forward_markdown(
         f"- accuracy_edge_vs_baseline: {report.get('accuracy_edge_vs_baseline', 0.0):.4f}",
         f"- total_paper_signals: {report.get('total_paper_signals', 0)}",
         f"- total_paper_trades: {report.get('total_paper_trades', 0)}",
+        f"- raw_predictions: {report.get('raw_predictions', 0)}",
+        f"- filtered_paper_trades: {report.get('filtered_paper_trades', 0)}",
+        f"- blocked_by_confidence: {report.get('blocked_by_confidence', 0)}",
+        f"- blocked_by_cost: {report.get('blocked_by_cost', 0)}",
+        f"- blocked_by_spread: {report.get('blocked_by_spread', 0)}",
+        f"- blocked_by_volatility: {report.get('blocked_by_volatility', 0)}",
+        f"- blocked_by_trade_class: {report.get('blocked_by_trade_class', 0)}",
+        f"- average_cost_bps: {report.get('average_cost_bps', 0.0):.4f}",
+        f"- average_required_edge_bps: {report.get('average_required_edge_bps', 0.0):.4f}",
         f"- average_gross_return_bps: {report.get('average_gross_return_bps', 0.0):.4f}",
         f"- average_net_return_bps: {report.get('average_net_return_bps', 0.0):.4f}",
         f"- cumulative_net_return_bps: {report.get('cumulative_net_return_bps', 0.0):.4f}",
@@ -895,7 +1220,7 @@ def write_walk_forward_markdown(
             f"{summary.get('model_accuracy_mean', 0.0):.4f} | "
             f"{summary.get('baseline_accuracy_mean', 0.0):.4f} | "
             f"{summary.get('accuracy_edge_vs_baseline', 0.0):.4f} | "
-            f"{summary.get('total_paper_trades', 0)} | "
+            f"{summary.get('filtered_paper_trades', summary.get('total_paper_trades', 0))} | "
             f"{summary.get('cumulative_net_return_bps', 0.0):.4f} |"
         )
 
@@ -937,6 +1262,14 @@ def run_walk_forward_evaluation(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     default_spread_bps: float = DEFAULT_SPREAD_BPS,
     min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    min_edge_bps: float = DEFAULT_MIN_EDGE_BPS,
+    max_spread_bps: float | None = None,
+    min_volatility_bps: float | None = None,
+    max_volatility_bps: float | None = None,
+    trade_classes: frozenset[str] | None = None,
+    cost_multiplier: float = DEFAULT_COST_MULTIPLIER,
+    horizon_return_scale_bps: float = DEFAULT_HORIZON_RETURN_SCALE_BPS,
+    min_absolute_future_label_bps: float | None = None,
     data_root: Path = DEFAULT_DATA_ROOT,
     reports_dir: Path = DEFAULT_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
@@ -947,6 +1280,18 @@ def run_walk_forward_evaluation(
     min_trades: int = DEFAULT_MIN_TRADES,
 ) -> dict[str, Any]:
     """Run walk-forward evaluation for one or more coins and write reports."""
+    trade_filter = build_trade_filter(
+        min_confidence=min_confidence,
+        threshold_bps=threshold_bps,
+        min_edge_bps=min_edge_bps,
+        max_spread_bps=max_spread_bps,
+        min_volatility_bps=min_volatility_bps,
+        max_volatility_bps=max_volatility_bps,
+        trade_classes=trade_classes,
+        cost_multiplier=cost_multiplier,
+        horizon_return_scale_bps=horizon_return_scale_bps,
+        min_absolute_future_label_bps=min_absolute_future_label_bps,
+    )
     per_coin_results = [
         evaluate_coin_walk_forward(
             coin=coin,
@@ -960,7 +1305,7 @@ def run_walk_forward_evaluation(
             fee_bps=fee_bps,
             slippage_bps=slippage_bps,
             default_spread_bps=default_spread_bps,
-            min_confidence=min_confidence,
+            trade_filter=trade_filter,
             data_root=data_root,
             save_window_models=save_window_models,
             models_dir=models_dir,
@@ -983,7 +1328,7 @@ def run_walk_forward_evaluation(
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
         default_spread_bps=default_spread_bps,
-        min_confidence=min_confidence,
+        trade_filter=trade_filter,
         per_coin_results=per_coin_results,
         data_root=data_root,
         min_windows=min_windows,
@@ -1077,6 +1422,56 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=f"Minimum model confidence for paper signals (default: {DEFAULT_MIN_CONFIDENCE})",
     )
     parser.add_argument(
+        "--min-edge-bps",
+        type=float,
+        default=DEFAULT_MIN_EDGE_BPS,
+        help=f"Minimum edge above costs in bps (default: {DEFAULT_MIN_EDGE_BPS})",
+    )
+    parser.add_argument(
+        "--max-spread-bps",
+        type=float,
+        default=None,
+        help="Maximum spread in bps to allow paper trades (default: no limit)",
+    )
+    parser.add_argument(
+        "--min-volatility-bps",
+        type=float,
+        default=None,
+        help="Minimum rolling volatility in bps (default: no limit)",
+    )
+    parser.add_argument(
+        "--max-volatility-bps",
+        type=float,
+        default=None,
+        help="Maximum rolling volatility in bps (default: no limit)",
+    )
+    parser.add_argument(
+        "--trade-classes",
+        default="UP,DOWN",
+        help="Comma-separated classes eligible for paper trades (default: UP,DOWN)",
+    )
+    parser.add_argument(
+        "--cost-multiplier",
+        type=float,
+        default=DEFAULT_COST_MULTIPLIER,
+        help=f"Multiplier on total cost when computing required edge (default: {DEFAULT_COST_MULTIPLIER})",
+    )
+    parser.add_argument(
+        "--horizon-return-scale-bps",
+        type=float,
+        default=DEFAULT_HORIZON_RETURN_SCALE_BPS,
+        help=(
+            "Scale factor for confidence-edge proxy in bps "
+            f"(default: {DEFAULT_HORIZON_RETURN_SCALE_BPS})"
+        ),
+    )
+    parser.add_argument(
+        "--min-absolute-future-label-bps",
+        type=float,
+        default=None,
+        help="Alternative filter: minimum label/proxy edge in bps (default: disabled)",
+    )
+    parser.add_argument(
         "--min-windows",
         type=int,
         default=DEFAULT_MIN_WINDOWS,
@@ -1137,6 +1532,14 @@ def main(argv: list[str] | None = None) -> int:
         slippage_bps=args.slippage_bps,
         default_spread_bps=args.default_spread_bps,
         min_confidence=args.min_confidence,
+        min_edge_bps=args.min_edge_bps,
+        max_spread_bps=args.max_spread_bps,
+        min_volatility_bps=args.min_volatility_bps,
+        max_volatility_bps=args.max_volatility_bps,
+        trade_classes=parse_trade_classes(args.trade_classes),
+        cost_multiplier=args.cost_multiplier,
+        horizon_return_scale_bps=args.horizon_return_scale_bps,
+        min_absolute_future_label_bps=args.min_absolute_future_label_bps,
         data_root=args.data_root,
         reports_dir=args.reports_dir,
         models_dir=args.models_dir,

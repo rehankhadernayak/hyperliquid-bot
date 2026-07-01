@@ -16,14 +16,18 @@ from bid_ask_walk_forward_evaluator import (
     DEFAULT_MIN_WINDOWS,
     DEFAULT_REPORTS_DIR,
     SAFETY_NOTE,
+    TradeFilterConfig,
     _build_arg_parser,
+    build_trade_filter,
     build_walk_forward_report,
     compute_readiness_flags,
     evaluate_coin_walk_forward,
+    evaluate_trade_filter,
     generate_walk_forward_windows,
     longest_losing_streak,
     main,
     max_drawdown_bps,
+    parse_trade_classes,
     resolve_coins,
     run_walk_forward_evaluation,
     simulate_paper_signal_returns,
@@ -98,6 +102,30 @@ READINESS_FIELDS = (
     "ready_for_more_research",
     "real_execution_ready",
 )
+
+FILTER_METRIC_FIELDS = (
+    "raw_predictions",
+    "filtered_paper_trades",
+    "blocked_by_confidence",
+    "blocked_by_cost",
+    "blocked_by_spread",
+    "blocked_by_volatility",
+    "blocked_by_trade_class",
+    "trade_filter_summary",
+    "average_cost_bps",
+    "average_required_edge_bps",
+)
+
+
+def _permissive_filter(**overrides: object) -> TradeFilterConfig:
+    defaults: dict[str, object] = {
+        "min_confidence": 0.0,
+        "threshold_bps": 0.1,
+        "min_edge_bps": 0.0,
+        "horizon_return_scale_bps": 1000.0,
+    }
+    defaults.update(overrides)
+    return build_trade_filter(**defaults)  # type: ignore[arg-type]
 
 
 def _assert_readiness_booleans(report: dict, *, prefix: str = "") -> None:
@@ -193,24 +221,28 @@ class TestCostSimulation:
         row_with_spread = pd.Series({"future_return_bps": 10.0, "avg_spread_bps": 2.0})
         predictions = ["UP"]
         confidences = [1.0]
+        confidence_edges = [1.0]
+        trade_filter = _permissive_filter()
 
         no_cost = simulate_paper_signal_returns(
             pd.DataFrame([row_no_spread]),
             predictions,
             confidences,
+            confidence_edges,
             fee_bps=0.0,
             slippage_bps=0.0,
             default_spread_bps=0.0,
-            min_confidence=0.0,
+            trade_filter=trade_filter,
         )
         with_cost = simulate_paper_signal_returns(
             pd.DataFrame([row_with_spread]),
             predictions,
             confidences,
+            confidence_edges,
             fee_bps=2.0,
             slippage_bps=1.0,
             default_spread_bps=2.0,
-            min_confidence=0.0,
+            trade_filter=trade_filter,
         )
 
         assert no_cost["net_returns_bps"][0] == pytest.approx(10.0)
@@ -223,13 +255,15 @@ class TestCostSimulation:
             test_df,
             ["FLAT"],
             [1.0],
+            [1.0],
             fee_bps=2.0,
             slippage_bps=1.0,
             default_spread_bps=2.0,
-            min_confidence=0.0,
+            trade_filter=_permissive_filter(),
         )
         assert result["net_returns_bps"][0] == 0.0
         assert result["total_paper_trades"] == 0
+        assert result["raw_predictions"] == 0
 
     def test_down_signal_inverse_return(self) -> None:
         row = pd.Series({"future_return_bps": 8.0, "avg_spread_bps": 1.0})
@@ -238,13 +272,172 @@ class TestCostSimulation:
             test_df,
             ["DOWN"],
             [1.0],
+            [1.0],
             fee_bps=1.0,
             slippage_bps=1.0,
             default_spread_bps=1.0,
-            min_confidence=0.0,
+            trade_filter=_permissive_filter(),
         )
         assert result["gross_returns_bps"][0] == pytest.approx(-8.0)
         assert result["net_returns_bps"][0] == pytest.approx(-8.0 - 3.0)
+
+
+class TestCostAwareTradeFiltering:
+    def test_high_min_edge_reduces_trades(self) -> None:
+        rows = [
+            {"future_return_bps": 20.0, "avg_spread_bps": 2.0},
+            {"future_return_bps": 15.0, "avg_spread_bps": 2.0},
+        ]
+        test_df = pd.DataFrame(rows)
+        loose = simulate_paper_signal_returns(
+            test_df,
+            ["UP", "UP"],
+            [0.9, 0.9],
+            [0.8, 0.8],
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=_permissive_filter(min_edge_bps=0.0, horizon_return_scale_bps=50.0),
+        )
+        strict = simulate_paper_signal_returns(
+            test_df,
+            ["UP", "UP"],
+            [0.9, 0.9],
+            [0.8, 0.8],
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=_permissive_filter(min_edge_bps=100.0, horizon_return_scale_bps=50.0),
+        )
+        assert loose["filtered_paper_trades"] >= strict["filtered_paper_trades"]
+        assert strict["blocked_by_cost"] >= 1
+
+    def test_max_spread_blocks_high_spread_rows(self) -> None:
+        rows = [
+            {"future_return_bps": 20.0, "avg_spread_bps": 1.0},
+            {"future_return_bps": 20.0, "avg_spread_bps": 10.0},
+        ]
+        test_df = pd.DataFrame(rows)
+        result = simulate_paper_signal_returns(
+            test_df,
+            ["UP", "UP"],
+            [1.0, 1.0],
+            [1.0, 1.0],
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=2.0,
+            trade_filter=_permissive_filter(max_spread_bps=2.0),
+        )
+        assert result["blocked_by_spread"] == 1
+        assert result["filtered_paper_trades"] == 1
+
+    def test_cost_multiplier_increases_required_edge(self) -> None:
+        row = pd.Series({"future_return_bps": 20.0, "avg_spread_bps": 2.0})
+        test_df = pd.DataFrame([row])
+        base = simulate_paper_signal_returns(
+            test_df,
+            ["UP"],
+            [0.6],
+            [0.5],
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=_permissive_filter(
+                cost_multiplier=1.0,
+                horizon_return_scale_bps=20.0,
+            ),
+        )
+        scaled = simulate_paper_signal_returns(
+            test_df,
+            ["UP"],
+            [0.6],
+            [0.5],
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=_permissive_filter(
+                cost_multiplier=5.0,
+                horizon_return_scale_bps=20.0,
+            ),
+        )
+        assert base["average_required_edge_bps"] < scaled["average_required_edge_bps"]
+        assert scaled["filtered_paper_trades"] <= base["filtered_paper_trades"]
+
+    def test_filtered_paper_trades_lte_raw_predictions(self) -> None:
+        rows = [
+            {"future_return_bps": 10.0, "avg_spread_bps": 2.0},
+            {"future_return_bps": 10.0, "avg_spread_bps": 2.0},
+            {"future_return_bps": 0.0, "avg_spread_bps": 2.0},
+        ]
+        test_df = pd.DataFrame(rows)
+        result = simulate_paper_signal_returns(
+            test_df,
+            ["UP", "DOWN", "FLAT"],
+            [1.0, 0.2, 1.0],
+            [0.9, 0.9, 0.9],
+            fee_bps=1.0,
+            slippage_bps=1.0,
+            default_spread_bps=1.0,
+            trade_filter=build_trade_filter(
+                min_confidence=0.5,
+                threshold_bps=1.0,
+                horizon_return_scale_bps=100.0,
+            ),
+        )
+        assert result["filtered_paper_trades"] <= result["raw_predictions"]
+        assert result["raw_predictions"] == 2
+
+    def test_blocked_counters_add_up_reasonably(self) -> None:
+        rows = [
+            {"future_return_bps": 10.0, "avg_spread_bps": 2.0},
+            {"future_return_bps": 10.0, "avg_spread_bps": 2.0},
+            {"future_return_bps": 10.0, "avg_spread_bps": 8.0},
+        ]
+        test_df = pd.DataFrame(rows)
+        result = simulate_paper_signal_returns(
+            test_df,
+            ["UP", "UP", "UP"],
+            [0.2, 0.9, 0.9],
+            [0.9, 0.1, 0.9],
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=build_trade_filter(
+                min_confidence=0.5,
+                threshold_bps=1.0,
+                max_spread_bps=3.0,
+                min_edge_bps=50.0,
+                horizon_return_scale_bps=10.0,
+            ),
+        )
+        blocked_total = (
+            result["blocked_by_confidence"]
+            + result["blocked_by_cost"]
+            + result["blocked_by_spread"]
+            + result["blocked_by_volatility"]
+            + result["blocked_by_trade_class"]
+        )
+        assert blocked_total == result["raw_predictions"] - result["filtered_paper_trades"]
+
+    def test_evaluate_trade_filter_trade_class(self) -> None:
+        row = pd.Series({"future_return_bps": 10.0, "avg_spread_bps": 1.0})
+        allowed, reason, _, _ = evaluate_trade_filter(
+            prediction="DOWN",
+            confidence=1.0,
+            confidence_edge=1.0,
+            row=row,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=1.0,
+            trade_filter=build_trade_filter(
+                min_confidence=0.0,
+                threshold_bps=0.1,
+                trade_classes=frozenset({"UP"}),
+                horizon_return_scale_bps=100.0,
+            ),
+        )
+        assert allowed is False
+        assert reason == "trade_class"
 
 
 class TestDrawdownAndStreak:
@@ -274,7 +467,7 @@ class TestEvaluateCoinWalkForward:
             fee_bps=2.0,
             slippage_bps=1.0,
             default_spread_bps=2.0,
-            min_confidence=0.0,
+            trade_filter=_permissive_filter(),
             data_root=data_root,
             save_window_models=False,
             models_dir=reports_dir / "models",
@@ -286,6 +479,9 @@ class TestEvaluateCoinWalkForward:
         assert "accuracy_edge_vs_baseline" in result
         assert "total_paper_signals" in result
         assert "cumulative_net_return_bps" in result
+        for field in FILTER_METRIC_FIELDS:
+            assert field in result
+        assert result["filtered_paper_trades"] <= result["raw_predictions"]
         window = result["windows"][0]
         assert window["status"] == "completed"
         assert "model_accuracy" in window
@@ -307,7 +503,7 @@ class TestEvaluateCoinWalkForward:
             fee_bps=2.0,
             slippage_bps=1.0,
             default_spread_bps=2.0,
-            min_confidence=0.0,
+            trade_filter=_permissive_filter(),
             data_root=data_root,
             save_window_models=False,
             models_dir=reports_dir / "models",
@@ -335,7 +531,7 @@ class TestEvaluateCoinWalkForward:
             fee_bps=0.0,
             slippage_bps=0.0,
             default_spread_bps=0.0,
-            min_confidence=0.0,
+            trade_filter=_permissive_filter(),
             data_root=data_root,
             save_window_models=False,
             models_dir=reports_dir / "models",
@@ -365,6 +561,7 @@ class TestRunWalkForwardEvaluation:
             slippage_bps=1.0,
             default_spread_bps=1.0,
             min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
             data_root=data_root,
             reports_dir=reports_dir,
             save_reports=True,
@@ -394,6 +591,7 @@ class TestRunWalkForwardEvaluation:
             slippage_bps=0.0,
             default_spread_bps=0.0,
             min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
             data_root=data_root,
             reports_dir=reports_dir,
             min_windows=2,
@@ -422,6 +620,7 @@ class TestRunWalkForwardEvaluation:
             slippage_bps=10.0,
             default_spread_bps=10.0,
             min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
             data_root=data_root,
             reports_dir=reports_dir,
             min_windows=100,
@@ -457,6 +656,7 @@ class TestRunWalkForwardEvaluation:
             slippage_bps=0.0,
             default_spread_bps=0.0,
             min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
             data_root=data_root,
             reports_dir=reports_dir,
             min_windows=1,
@@ -488,6 +688,109 @@ class TestRunWalkForwardEvaluation:
         _assert_readiness_booleans(loaded)
         assert loaded["paper_only"] is True
         assert loaded["execution_enabled"] is False
+
+    def test_json_report_includes_filter_metrics(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=60))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            horizon_return_scale_bps=1000.0,
+            min_confidence=0.0,
+        )
+        for field in FILTER_METRIC_FIELDS:
+            assert field in report
+        loaded = json.loads(Path(report["json_report_path"]).read_text(encoding="utf-8"))
+        for field in FILTER_METRIC_FIELDS:
+            assert field in loaded
+
+    def test_filtered_returns_use_only_accepted_trades(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=3.0, spread_bps=0.5))
+
+        permissive = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+        strict = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            min_confidence=0.0,
+            min_edge_bps=500.0,
+            horizon_return_scale_bps=10.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+        assert strict["filtered_paper_trades"] <= permissive["filtered_paper_trades"]
+        assert strict["total_paper_trades"] == strict["filtered_paper_trades"]
+
+    def test_enough_trades_uses_filtered_paper_trades(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            min_confidence=0.0,
+            min_edge_bps=500.0,
+            horizon_return_scale_bps=10.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1000,
+        )
+        assert report["filtered_paper_trades"] < 1000
+        assert report["enough_trades"] is False
+        assert report["readiness"]["enough_trades"] is False
 
     def test_paper_only_and_execution_disabled(self, data_root: Path, reports_dir: Path) -> None:
         path = resampled_csv_path("SOL", "15s", data_root, source="combined")
@@ -525,7 +828,7 @@ class TestRunWalkForwardEvaluation:
             fee_bps=1.0,
             slippage_bps=1.0,
             default_spread_bps=1.0,
-            min_confidence=0.0,
+            trade_filter=_permissive_filter(),
             per_coin_results=[],
             data_root=data_root,
         )
@@ -547,6 +850,41 @@ class TestRunWalkForwardEvaluation:
 
 
 class TestCLI:
+    def test_cli_parses_trade_filter_options(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--min-edge-bps",
+                "2.5",
+                "--max-spread-bps",
+                "3.0",
+                "--min-volatility-bps",
+                "0.5",
+                "--max-volatility-bps",
+                "10.0",
+                "--trade-classes",
+                "UP",
+                "--cost-multiplier",
+                "1.5",
+                "--horizon-return-scale-bps",
+                "12.0",
+                "--min-absolute-future-label-bps",
+                "1.5",
+            ]
+        )
+        assert args.min_edge_bps == 2.5
+        assert args.max_spread_bps == 3.0
+        assert args.min_volatility_bps == 0.5
+        assert args.max_volatility_bps == 10.0
+        assert args.trade_classes == "UP"
+        assert args.cost_multiplier == 1.5
+        assert args.horizon_return_scale_bps == 12.0
+        assert args.min_absolute_future_label_bps == 1.5
+
+    def test_parse_trade_classes(self) -> None:
+        assert parse_trade_classes("UP,DOWN") == frozenset({"UP", "DOWN"})
+        assert parse_trade_classes("UP") == frozenset({"UP"})
+
     def test_cli_parses_min_windows_and_min_trades(self) -> None:
         parser = _build_arg_parser()
         args = parser.parse_args(["--min-windows", "3", "--min-trades", "50"])
