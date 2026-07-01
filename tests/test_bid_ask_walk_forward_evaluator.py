@@ -12,10 +12,13 @@ import pytest
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 from bid_ask_walk_forward_evaluator import (
+    DEFAULT_MIN_TRADES,
+    DEFAULT_MIN_WINDOWS,
     DEFAULT_REPORTS_DIR,
     SAFETY_NOTE,
     _build_arg_parser,
     build_walk_forward_report,
+    compute_readiness_flags,
     evaluate_coin_walk_forward,
     generate_walk_forward_windows,
     longest_losing_streak,
@@ -85,6 +88,76 @@ def data_root(tmp_path: Path) -> Path:
 @pytest.fixture
 def reports_dir(tmp_path: Path) -> Path:
     return tmp_path / "walk_forward_reports"
+
+
+READINESS_FIELDS = (
+    "beats_baseline_accuracy",
+    "positive_after_costs",
+    "enough_windows",
+    "enough_trades",
+    "ready_for_more_research",
+    "real_execution_ready",
+)
+
+
+def _assert_readiness_booleans(report: dict, *, prefix: str = "") -> None:
+    for field in READINESS_FIELDS:
+        key = f"{prefix}{field}" if prefix else field
+        value = report[field]
+        assert value is not None, field
+        assert isinstance(value, bool), field
+    nested = report["readiness"]
+    for field in READINESS_FIELDS:
+        assert nested[field] is not None, field
+        assert isinstance(nested[field], bool), field
+        assert nested[field] == report[field], field
+
+
+class TestComputeReadinessFlags:
+    def test_negative_results_all_false_except_real_execution(self) -> None:
+        flags = compute_readiness_flags(
+            accuracy_edge_vs_baseline=-0.01,
+            cumulative_net_return_bps=-5.0,
+            completed_windows=1,
+            total_paper_trades=10,
+            min_windows=5,
+            min_trades=100,
+        )
+        assert flags["beats_baseline_accuracy"] is False
+        assert flags["positive_after_costs"] is False
+        assert flags["enough_windows"] is False
+        assert flags["enough_trades"] is False
+        assert flags["ready_for_more_research"] is False
+        assert flags["real_execution_ready"] is False
+
+    def test_positive_after_costs_when_net_return_positive(self) -> None:
+        flags = compute_readiness_flags(
+            accuracy_edge_vs_baseline=0.05,
+            cumulative_net_return_bps=12.5,
+            completed_windows=5,
+            total_paper_trades=100,
+            min_windows=5,
+            min_trades=100,
+        )
+        assert flags["positive_after_costs"] is True
+        assert flags["beats_baseline_accuracy"] is True
+        assert flags["enough_windows"] is True
+        assert flags["enough_trades"] is True
+        assert flags["ready_for_more_research"] is True
+        assert flags["real_execution_ready"] is False
+
+    def test_ready_for_more_research_requires_windows_and_trades_only(self) -> None:
+        flags = compute_readiness_flags(
+            accuracy_edge_vs_baseline=-0.1,
+            cumulative_net_return_bps=-1.0,
+            completed_windows=10,
+            total_paper_trades=200,
+            min_windows=5,
+            min_trades=100,
+        )
+        assert flags["ready_for_more_research"] is True
+        assert flags["beats_baseline_accuracy"] is False
+        assert flags["positive_after_costs"] is False
 
 
 class TestGenerateWalkForwardWindows:
@@ -323,15 +396,98 @@ class TestRunWalkForwardEvaluation:
             min_confidence=0.0,
             data_root=data_root,
             reports_dir=reports_dir,
+            min_windows=2,
+            min_trades=1,
         )
 
-        readiness = report["readiness"]
-        assert "beats_baseline_accuracy" in readiness
-        assert "positive_after_costs" in readiness
-        assert "enough_windows" in readiness
-        assert "enough_trades" in readiness
-        assert "ready_for_more_research" in readiness
-        assert readiness["real_execution_ready"] is False
+        _assert_readiness_booleans(report)
+        assert report["real_execution_ready"] is False
+
+    def test_negative_results_produce_false_readiness_flags(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=50, mid_step=0.01))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=10.0,
+            slippage_bps=10.0,
+            default_spread_bps=10.0,
+            min_confidence=0.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            min_windows=100,
+            min_trades=10_000,
+        )
+
+        _assert_readiness_booleans(report)
+        assert report["beats_baseline_accuracy"] is False
+        assert report["positive_after_costs"] is False
+        assert report["enough_windows"] is False
+        assert report["enough_trades"] is False
+        assert report["ready_for_more_research"] is False
+
+    def test_positive_synthetic_can_produce_positive_after_costs(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(
+            path,
+            _make_resampled_rows(count=120, mid_step=5.0, spread_bps=0.1),
+        )
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=30,
+            test_bars=15,
+            step_bars=15,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            min_confidence=0.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        _assert_readiness_booleans(report)
+        assert report["positive_after_costs"] is True
+        assert report["cumulative_net_return_bps"] > 0
+
+    def test_json_report_top_level_readiness_not_none(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=60))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            data_root=data_root,
+            reports_dir=reports_dir,
+        )
+        loaded = json.loads(Path(report["json_report_path"]).read_text(encoding="utf-8"))
+        _assert_readiness_booleans(loaded)
+        assert loaded["paper_only"] is True
+        assert loaded["execution_enabled"] is False
 
     def test_paper_only_and_execution_disabled(self, data_root: Path, reports_dir: Path) -> None:
         path = resampled_csv_path("SOL", "15s", data_root, source="combined")
@@ -357,35 +513,23 @@ class TestRunWalkForwardEvaluation:
         path = resampled_csv_path("BTC", "15s", data_root)
         _write_resampled_csv(path, _make_resampled_rows(count=55))
 
-        report = {
-            "generated_at": "2024-06-01T00:00:00+00:00",
-            "coins": ["BTC"],
-            "interval": "15s",
-            "source": "local",
-            "readiness": {"real_execution_ready": False},
-            "warnings": [SAFETY_NOTE],
-            "paper_only": True,
-            "execution_enabled": False,
-            "real_execution_ready": False,
-        }
-        report.update(
-            build_walk_forward_report(
-                coins=["BTC"],
-                interval="15s",
-                source="local",
-                horizon=1,
-                threshold_bps=1.0,
-                train_bars=20,
-                test_bars=10,
-                step_bars=10,
-                fee_bps=1.0,
-                slippage_bps=1.0,
-                default_spread_bps=1.0,
-                min_confidence=0.0,
-                per_coin_results=[],
-                data_root=data_root,
-            )
+        report = build_walk_forward_report(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=1.0,
+            slippage_bps=1.0,
+            default_spread_bps=1.0,
+            min_confidence=0.0,
+            per_coin_results=[],
+            data_root=data_root,
         )
+        _assert_readiness_booleans(report)
 
         json_path = write_walk_forward_json(report, reports_dir=reports_dir)
         md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
@@ -396,9 +540,25 @@ class TestRunWalkForwardEvaluation:
         loaded = json.loads(json_path.read_text(encoding="utf-8"))
         assert loaded["paper_only"] is True
         assert loaded["execution_enabled"] is False
+        _assert_readiness_booleans(loaded)
+        md_text = md_path.read_text(encoding="utf-8")
+        for field in READINESS_FIELDS:
+            assert field in md_text
 
 
 class TestCLI:
+    def test_cli_parses_min_windows_and_min_trades(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--min-windows", "3", "--min-trades", "50"])
+        assert args.min_windows == 3
+        assert args.min_trades == 50
+
+    def test_cli_min_windows_min_trades_defaults(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args([])
+        assert args.min_windows == DEFAULT_MIN_WINDOWS
+        assert args.min_trades == DEFAULT_MIN_TRADES
+
     def test_cli_parses_source_coin_coins_interval_horizon(self) -> None:
         parser = _build_arg_parser()
         args = parser.parse_args(

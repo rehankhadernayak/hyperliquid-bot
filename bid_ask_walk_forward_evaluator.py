@@ -57,8 +57,8 @@ DEFAULT_THRESHOLD_BPS = 1.0
 DEFAULT_HORIZON = 5
 
 MIN_ROWS_WARNING = 50
-MIN_WINDOWS_READY = 2
-MIN_TRADES_READY = 10
+DEFAULT_MIN_WINDOWS = 5
+DEFAULT_MIN_TRADES = 100
 MIN_CLASS_FRACTION = 0.10
 MAX_CLASS_FRACTION = 0.70
 MISSING_DATA_FRACTION_WARNING = 0.05
@@ -252,6 +252,28 @@ def _no_trade_predictions(count: int) -> list[str]:
     return ["FLAT"] * count
 
 
+def compute_readiness_flags(
+    *,
+    accuracy_edge_vs_baseline: float,
+    cumulative_net_return_bps: float,
+    completed_windows: int,
+    total_paper_trades: int,
+    min_windows: int,
+    min_trades: int,
+) -> dict[str, bool]:
+    """Return top-level walk-forward readiness booleans (never None)."""
+    enough_windows = completed_windows >= min_windows
+    enough_trades = total_paper_trades >= min_trades
+    return {
+        "beats_baseline_accuracy": accuracy_edge_vs_baseline > 0,
+        "positive_after_costs": cumulative_net_return_bps > 0,
+        "enough_windows": enough_windows,
+        "enough_trades": enough_trades,
+        "ready_for_more_research": enough_windows and enough_trades,
+        "real_execution_ready": False,
+    }
+
+
 def _label_imbalance_warnings(labels: list[str], split_name: str) -> list[str]:
     warnings: list[str] = []
     total = len(labels)
@@ -441,6 +463,8 @@ def evaluate_coin_walk_forward(
     save_window_models: bool,
     models_dir: Path,
     max_rows: int | None = None,
+    min_windows: int = DEFAULT_MIN_WINDOWS,
+    min_trades: int = DEFAULT_MIN_TRADES,
 ) -> dict[str, Any]:
     """Run walk-forward evaluation for one coin."""
     normalized_source = normalize_source(source)
@@ -449,12 +473,26 @@ def evaluate_coin_walk_forward(
     try:
         raw_df = load_training_data(coin, interval, data_root, source=normalized_source)
     except FileNotFoundError:
+        readiness = compute_readiness_flags(
+            accuracy_edge_vs_baseline=0.0,
+            cumulative_net_return_bps=0.0,
+            completed_windows=0,
+            total_paper_trades=0,
+            min_windows=min_windows,
+            min_trades=min_trades,
+        )
         return {
             "coin": coin,
             "status": "skipped",
             "reason": "csv_not_found",
             "warnings": warnings + [f"too_few_rows: CSV not found for {coin}"],
             "windows": [],
+            "completed_windows": 0,
+            "total_paper_trades": 0,
+            "accuracy_edge_vs_baseline": 0.0,
+            "cumulative_net_return_bps": 0.0,
+            **readiness,
+            "readiness": readiness,
         }
 
     if max_rows is not None and max_rows > 0:
@@ -528,12 +566,13 @@ def evaluate_coin_walk_forward(
         else 0.0
     )
 
-    if len(windows) < MIN_WINDOWS_READY:
+    if len(windows) < min_windows:
         warnings.append(
             f"too_few_windows: only {len(windows)} possible windows "
-            f"(need {MIN_WINDOWS_READY})"
+            f"(need {min_windows})"
         )
-    if model_accuracy_mean <= baseline_accuracy_mean and completed:
+    accuracy_edge_vs_baseline = model_accuracy_mean - baseline_accuracy_mean
+    if accuracy_edge_vs_baseline <= 0 and completed:
         warnings.append("model_not_better_than_baseline")
     if cumulative_net_return_bps <= 0 and total_paper_trades > 0:
         warnings.append("negative_after_costs")
@@ -541,15 +580,13 @@ def evaluate_coin_walk_forward(
     train_labels = model_df["label"].tolist() if not model_df.empty else []
     warnings.extend(_label_imbalance_warnings(train_labels, "all"))
 
-    beats_baseline_accuracy = model_accuracy_mean > baseline_accuracy_mean
-    positive_after_costs = cumulative_net_return_bps > 0
-    enough_windows = len(completed) >= MIN_WINDOWS_READY
-    enough_trades = total_paper_trades >= MIN_TRADES_READY
-    ready_for_more_research = (
-        beats_baseline_accuracy
-        and positive_after_costs
-        and enough_windows
-        and enough_trades
+    readiness = compute_readiness_flags(
+        accuracy_edge_vs_baseline=accuracy_edge_vs_baseline,
+        cumulative_net_return_bps=cumulative_net_return_bps,
+        completed_windows=len(completed),
+        total_paper_trades=total_paper_trades,
+        min_windows=min_windows,
+        min_trades=min_trades,
     )
 
     source_path = str(resampled_csv_path(coin, interval, data_root, source=normalized_source))
@@ -564,7 +601,7 @@ def evaluate_coin_walk_forward(
         "skipped_windows": len(skipped),
         "model_accuracy_mean": model_accuracy_mean,
         "baseline_accuracy_mean": baseline_accuracy_mean,
-        "accuracy_edge_vs_baseline": model_accuracy_mean - baseline_accuracy_mean,
+        "accuracy_edge_vs_baseline": accuracy_edge_vs_baseline,
         "total_paper_signals": total_paper_signals,
         "total_paper_trades": total_paper_trades,
         "average_gross_return_bps": average_gross_return_bps,
@@ -573,14 +610,8 @@ def evaluate_coin_walk_forward(
         "max_drawdown_bps": max_drawdown_bps(per_trade_returns),
         "win_rate_after_costs": win_rate_after_costs,
         "longest_losing_streak": longest_losing_streak(per_trade_returns),
-        "readiness": {
-            "beats_baseline_accuracy": beats_baseline_accuracy,
-            "positive_after_costs": positive_after_costs,
-            "enough_windows": enough_windows,
-            "enough_trades": enough_trades,
-            "ready_for_more_research": ready_for_more_research,
-            "real_execution_ready": False,
-        },
+        **readiness,
+        "readiness": readiness,
         "windows": window_results,
         "warnings": warnings,
     }
@@ -602,6 +633,8 @@ def build_walk_forward_report(
     min_confidence: float,
     per_coin_results: list[dict[str, Any]],
     data_root: Path,
+    min_windows: int = DEFAULT_MIN_WINDOWS,
+    min_trades: int = DEFAULT_MIN_TRADES,
 ) -> dict[str, Any]:
     """Aggregate per-coin walk-forward results into one combined report."""
     normalized_source = normalize_source(source)
@@ -659,25 +692,24 @@ def build_walk_forward_report(
     for item in per_coin_results:
         warnings.extend(item.get("warnings", []))
 
-    if total_windows < MIN_WINDOWS_READY:
+    if total_windows < min_windows:
         warnings.append(
             f"too_few_windows: aggregate total_windows={total_windows} "
-            f"(need {MIN_WINDOWS_READY})"
+            f"(need {min_windows})"
         )
-    if model_accuracy_mean <= baseline_accuracy_mean and completed_coins:
+    accuracy_edge_vs_baseline = model_accuracy_mean - baseline_accuracy_mean
+    if accuracy_edge_vs_baseline <= 0 and completed_coins:
         warnings.append("model_not_better_than_baseline")
     if cumulative_net_return_bps <= 0 and total_paper_trades > 0:
         warnings.append("negative_after_costs")
 
-    beats_baseline_accuracy = model_accuracy_mean > baseline_accuracy_mean
-    positive_after_costs = cumulative_net_return_bps > 0
-    enough_windows = completed_windows >= MIN_WINDOWS_READY
-    enough_trades = total_paper_trades >= MIN_TRADES_READY
-    ready_for_more_research = (
-        beats_baseline_accuracy
-        and positive_after_costs
-        and enough_windows
-        and enough_trades
+    readiness = compute_readiness_flags(
+        accuracy_edge_vs_baseline=accuracy_edge_vs_baseline,
+        cumulative_net_return_bps=cumulative_net_return_bps,
+        completed_windows=completed_windows,
+        total_paper_trades=total_paper_trades,
+        min_windows=min_windows,
+        min_trades=min_trades,
     )
 
     per_coin_summary = {
@@ -689,7 +721,14 @@ def build_walk_forward_report(
             "accuracy_edge_vs_baseline": item.get("accuracy_edge_vs_baseline", 0.0),
             "total_paper_trades": item.get("total_paper_trades", 0),
             "cumulative_net_return_bps": item.get("cumulative_net_return_bps", 0.0),
-            "readiness": item.get("readiness", {}),
+            "readiness": item.get("readiness") or compute_readiness_flags(
+                accuracy_edge_vs_baseline=float(item.get("accuracy_edge_vs_baseline", 0.0)),
+                cumulative_net_return_bps=float(item.get("cumulative_net_return_bps", 0.0)),
+                completed_windows=int(item.get("completed_windows", 0)),
+                total_paper_trades=int(item.get("total_paper_trades", 0)),
+                min_windows=min_windows,
+                min_trades=min_trades,
+            ),
         }
         for item in per_coin_results
     }
@@ -711,12 +750,14 @@ def build_walk_forward_report(
         "slippage_bps": slippage_bps,
         "default_spread_bps": default_spread_bps,
         "min_confidence": min_confidence,
+        "min_windows": min_windows,
+        "min_trades": min_trades,
         "total_windows": total_windows,
         "completed_windows": completed_windows,
         "skipped_windows": skipped_windows,
         "model_accuracy_mean": model_accuracy_mean,
         "baseline_accuracy_mean": baseline_accuracy_mean,
-        "accuracy_edge_vs_baseline": model_accuracy_mean - baseline_accuracy_mean,
+        "accuracy_edge_vs_baseline": accuracy_edge_vs_baseline,
         "total_paper_signals": total_paper_signals,
         "total_paper_trades": total_paper_trades,
         "average_gross_return_bps": float(np.mean(gross_values)) if gross_values else 0.0,
@@ -727,18 +768,11 @@ def build_walk_forward_report(
         "longest_losing_streak": max(losing_streaks) if losing_streaks else 0,
         "per_coin": per_coin_summary,
         "per_coin_details": per_coin_results,
-        "readiness": {
-            "beats_baseline_accuracy": beats_baseline_accuracy,
-            "positive_after_costs": positive_after_costs,
-            "enough_windows": enough_windows,
-            "enough_trades": enough_trades,
-            "ready_for_more_research": ready_for_more_research,
-            "real_execution_ready": False,
-        },
+        **readiness,
+        "readiness": readiness,
         "warnings": list(dict.fromkeys(warnings)),
         "paper_only": PAPER_ONLY,
         "execution_enabled": EXECUTION_ENABLED,
-        "real_execution_ready": False,
         "safety_statement": SAFETY_STATEMENT,
         "safety_note": SAFETY_NOTE,
     }
@@ -776,7 +810,16 @@ def write_walk_forward_markdown(
     coins_label = "_".join(report.get("coins", ["UNKNOWN"]))
     output_path = reports_dir / f"walk_forward_{coins_label}_{stamp}.md"
 
-    readiness = report.get("readiness", {})
+    readiness = report.get("readiness") or {}
+    beats_baseline = report.get("beats_baseline_accuracy", readiness.get("beats_baseline_accuracy", False))
+    positive_after_costs = report.get("positive_after_costs", readiness.get("positive_after_costs", False))
+    enough_windows = report.get("enough_windows", readiness.get("enough_windows", False))
+    enough_trades = report.get("enough_trades", readiness.get("enough_trades", False))
+    ready_for_more_research = report.get(
+        "ready_for_more_research", readiness.get("ready_for_more_research", False)
+    )
+    real_execution_ready = report.get("real_execution_ready", readiness.get("real_execution_ready", False))
+
     lines = [
         "# Walk-Forward Paper Evaluation",
         "",
@@ -789,7 +832,7 @@ def write_walk_forward_markdown(
         "",
         f"- paper_only: {str(report.get('paper_only', True)).lower()}",
         f"- execution_enabled: {str(report.get('execution_enabled', False)).lower()}",
-        f"- real_execution_ready: {str(report.get('real_execution_ready', False)).lower()}",
+        f"- real_execution_ready: {str(real_execution_ready).lower()}",
         "",
         "## Aggregate metrics",
         "",
@@ -810,23 +853,23 @@ def write_walk_forward_markdown(
         "",
         "## Readiness",
         "",
-        f"- beats_baseline_accuracy: {readiness.get('beats_baseline_accuracy', False)}",
-        f"- positive_after_costs: {readiness.get('positive_after_costs', False)}",
-        f"- enough_windows: {readiness.get('enough_windows', False)}",
-        f"- enough_trades: {readiness.get('enough_trades', False)}",
-        f"- ready_for_more_research: {readiness.get('ready_for_more_research', False)}",
-        f"- real_execution_ready: {readiness.get('real_execution_ready', False)}",
+        f"- beats_baseline_accuracy: {beats_baseline}",
+        f"- positive_after_costs: {positive_after_costs}",
+        f"- enough_windows: {enough_windows}",
+        f"- enough_trades: {enough_trades}",
+        f"- ready_for_more_research: {ready_for_more_research}",
+        f"- real_execution_ready: {real_execution_ready}",
         "",
         "## Model vs baseline after costs",
         "",
     ]
 
-    if readiness.get("beats_baseline_accuracy") and readiness.get("positive_after_costs"):
+    if beats_baseline and positive_after_costs:
         lines.append(
             "Model accuracy beats baseline and cumulative net returns are positive "
             "after simulated costs (paper-only)."
         )
-    elif readiness.get("beats_baseline_accuracy"):
+    elif beats_baseline:
         lines.append(
             "Model accuracy beats baseline, but cumulative net returns are not "
             "positive after simulated costs."
@@ -900,6 +943,8 @@ def run_walk_forward_evaluation(
     save_window_models: bool = False,
     max_rows: int | None = None,
     save_reports: bool = True,
+    min_windows: int = DEFAULT_MIN_WINDOWS,
+    min_trades: int = DEFAULT_MIN_TRADES,
 ) -> dict[str, Any]:
     """Run walk-forward evaluation for one or more coins and write reports."""
     per_coin_results = [
@@ -920,6 +965,8 @@ def run_walk_forward_evaluation(
             save_window_models=save_window_models,
             models_dir=models_dir,
             max_rows=max_rows,
+            min_windows=min_windows,
+            min_trades=min_trades,
         )
         for coin in coins
     ]
@@ -939,6 +986,8 @@ def run_walk_forward_evaluation(
         min_confidence=min_confidence,
         per_coin_results=per_coin_results,
         data_root=data_root,
+        min_windows=min_windows,
+        min_trades=min_trades,
     )
 
     if save_reports:
@@ -1028,6 +1077,18 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help=f"Minimum model confidence for paper signals (default: {DEFAULT_MIN_CONFIDENCE})",
     )
     parser.add_argument(
+        "--min-windows",
+        type=int,
+        default=DEFAULT_MIN_WINDOWS,
+        help=f"Minimum completed windows for readiness (default: {DEFAULT_MIN_WINDOWS})",
+    )
+    parser.add_argument(
+        "--min-trades",
+        type=int,
+        default=DEFAULT_MIN_TRADES,
+        help=f"Minimum paper trades for readiness (default: {DEFAULT_MIN_TRADES})",
+    )
+    parser.add_argument(
         "--data-root",
         type=Path,
         default=DEFAULT_DATA_ROOT,
@@ -1081,8 +1142,11 @@ def main(argv: list[str] | None = None) -> int:
         models_dir=args.models_dir,
         save_window_models=args.save_window_models,
         max_rows=args.max_rows,
+        min_windows=args.min_windows,
+        min_trades=args.min_trades,
     )
 
+    readiness = report["readiness"]
     print(
         f"coins={','.join(coins)} interval={args.interval} source={report['source']} "
         f"horizon={args.horizon}"
@@ -1094,8 +1158,8 @@ def main(argv: list[str] | None = None) -> int:
     )
     print(
         f"cumulative_net_return_bps={report['cumulative_net_return_bps']:.4f} "
-        f"beats_baseline={report['readiness']['beats_baseline_accuracy']} "
-        f"positive_after_costs={report['readiness']['positive_after_costs']}"
+        f"beats_baseline={readiness['beats_baseline_accuracy']} "
+        f"positive_after_costs={readiness['positive_after_costs']}"
     )
     if report.get("json_report_path"):
         print(f"json_report_path={report['json_report_path']}")
