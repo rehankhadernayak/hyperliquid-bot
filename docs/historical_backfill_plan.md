@@ -614,6 +614,41 @@ Behavior:
 
 **AWS cost control:** Set up [AWS Budget alerts](https://docs.aws.amazon.com/cost-management/latest/userguide/budgets-managing-costs.html) before enabling scheduled requester-pays downloads. Autopilot does not bypass cost controls.
 
+## Walk-Forward Paper Evaluation
+
+After historical resampled CSVs exist, use `bid_ask_walk_forward_evaluator.py` to test
+whether models beat baseline on unseen chronological windows with simulated costs.
+Research-only and paper-only — no orders, wallets, or network calls.
+
+```bash
+python3 bid_ask_walk_forward_evaluator.py \
+  --source historical \
+  --coin BTC \
+  --interval 15s \
+  --horizon 5 \
+  --train-bars 500 \
+  --test-bars 100 \
+  --step-bars 100 \
+  --fee-bps 2 \
+  --slippage-bps 1 \
+  --min-confidence 0.4
+```
+
+Multi-coin combined report:
+
+```bash
+python3 bid_ask_walk_forward_evaluator.py \
+  --source historical \
+  --coins BTC ETH SOL \
+  --interval 15s \
+  --horizon 5
+```
+
+Data sources: `local`, `historical`, or `combined` (see resampler folder layout).
+Reports go to `reports/bid_ask_walk_forward/` as timestamped JSON and Markdown.
+All reports include `paper_only=true`, `execution_enabled=false`, and
+`real_execution_ready=false`.
+
 ## Future Work (Not in This Phase)
 
 - Larger batch Python downloader beyond hard-capped sample limits
