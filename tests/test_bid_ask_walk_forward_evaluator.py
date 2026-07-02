@@ -11,17 +11,19 @@ import pytest
 
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
-from bid_ask_train import create_features, create_labels
+from bid_ask_train import FEATURE_COLUMNS, create_features, create_labels
 from bid_ask_walk_forward_evaluator import (
     ACCEPTED_TRADES_CSV_COLUMNS,
     DEFAULT_ACCEPTED_TRADES_LIMIT,
     DEFAULT_DIAGNOSTICS_DETAIL,
+    DEFAULT_FEATURE_SET,
     DEFAULT_LABEL_COST_MULTIPLIER,
     DEFAULT_LABEL_MIN_EDGE_BPS,
     DEFAULT_LABEL_MODE,
     DEFAULT_MIN_TRADES,
     DEFAULT_MIN_WINDOWS,
     DEFAULT_REPORTS_DIR,
+    MICROSTRUCTURE_EXTRA_COLUMNS,
     SAFETY_NOTE,
     TradeFilterConfig,
     _build_arg_parser,
@@ -29,25 +31,30 @@ from bid_ask_walk_forward_evaluator import (
     aggregate_class_trade_diagnostics,
     aggregate_coin_class_trade_diagnostics,
     apply_diagnostics_detail,
+    build_feature_metadata,
     build_trade_filter,
     build_walk_forward_report,
     compute_label_distribution,
     compute_readiness_flags,
     cost_aware_label_warnings,
     create_cost_aware_labels,
+    create_walk_forward_features,
     create_walk_forward_labels,
     evaluate_coin_walk_forward,
     evaluate_trade_filter,
     generate_walk_forward_windows,
+    get_walk_forward_feature_columns,
     longest_losing_streak,
     main,
     max_drawdown_bps,
+    parse_feature_set,
     parse_label_mode,
     parse_trade_classes,
     resolve_coins,
     run_walk_forward_evaluation,
     simulate_paper_signal_returns,
     summarize_label_required_edge_bps,
+    walk_forward_feature_matrix,
     write_walk_forward_json,
     write_walk_forward_markdown,
 )
@@ -186,6 +193,170 @@ def _make_labeled_feature_rows(
             len(featured) - len(future_returns_bps)
         )
     return featured
+
+
+class TestFeatureSets:
+    def test_basic_feature_set_matches_existing_columns(self) -> None:
+        rows = _make_resampled_rows(count=40)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, meta = create_walk_forward_features(raw_df, feature_set="basic")
+        expected = create_features(raw_df)
+
+        assert meta["feature_set"] == "basic"
+        assert meta["feature_columns"] == list(FEATURE_COLUMNS)
+        assert meta["feature_count"] == len(FEATURE_COLUMNS)
+        assert meta["skipped_microstructure_features"] == []
+        assert meta["feature_warning"] is None
+        for column in FEATURE_COLUMNS:
+            assert featured[column].equals(expected[column])
+
+    def test_microstructure_adds_more_features_than_basic(self) -> None:
+        rows = _make_resampled_rows(count=80)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        basic_meta = create_walk_forward_features(raw_df, feature_set="basic")[1]
+        micro_df, micro_meta = create_walk_forward_features(raw_df, feature_set="microstructure")
+
+        assert micro_meta["feature_set"] == "microstructure"
+        assert micro_meta["feature_count"] > basic_meta["feature_count"]
+        assert set(FEATURE_COLUMNS).issubset(micro_meta["feature_columns"])
+        assert any(
+            column in micro_meta["feature_columns"]
+            for column in MICROSTRUCTURE_EXTRA_COLUMNS
+        )
+        for column in micro_meta["feature_columns"]:
+            assert column in micro_df.columns
+
+    def test_no_future_leakage_from_negative_shifts(self) -> None:
+        rows = _make_resampled_rows(count=60, mid_start=100.0, mid_step=1.0)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, _ = create_walk_forward_features(raw_df, feature_set="microstructure")
+
+        # Perturbing only the final row should not change earlier feature values.
+        altered = raw_df.copy()
+        altered.loc[altered.index[-1], "close_mid"] = altered.loc[altered.index[-1], "close_mid"] * 2
+        altered_featured, _ = create_walk_forward_features(altered, feature_set="microstructure")
+
+        compare_columns = [
+            column
+            for column in featured.columns
+            if column in MICROSTRUCTURE_EXTRA_COLUMNS or column in FEATURE_COLUMNS
+        ]
+        for column in compare_columns:
+            pd.testing.assert_series_equal(
+                featured[column].iloc[:-1],
+                altered_featured[column].iloc[:-1],
+                check_names=False,
+            )
+
+    def test_missing_spread_and_imbalance_columns_are_skipped_safely(self) -> None:
+        rows = _make_resampled_rows(count=30)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS)).drop(
+            columns=["avg_spread_bps", "avg_bbo_imbalance"]
+        )
+        featured, meta = create_walk_forward_features(raw_df, feature_set="microstructure")
+
+        assert meta["feature_set"] == "microstructure"
+        assert meta["skipped_microstructure_features"]
+        assert "spread_bps" in meta["skipped_microstructure_features"]
+        assert "bbo_imbalance" in meta["skipped_microstructure_features"]
+        assert "return_1" in meta["feature_columns"]
+        assert "return_5" in featured.columns
+
+    def test_report_includes_feature_metadata(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=1.5))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            feature_set="microstructure",
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["feature_set"] == "microstructure"
+        assert report["feature_columns"]
+        assert report["feature_count"] == len(report["feature_columns"])
+        assert isinstance(report["skipped_microstructure_features"], list)
+
+    def test_skipped_feature_list_populated_when_columns_missing(self) -> None:
+        rows = _make_resampled_rows(count=20)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS)).drop(columns=["avg_spread_bps"])
+        _, meta = create_walk_forward_features(raw_df, feature_set="microstructure")
+
+        assert "spread_bps" in meta["skipped_microstructure_features"]
+        assert "rolling_spread_mean_5" in meta["skipped_microstructure_features"]
+
+    def test_feature_warning_when_too_few_features(self) -> None:
+        metadata = build_feature_metadata(
+            feature_set="microstructure",
+            feature_columns=FEATURE_COLUMNS,
+            skipped_microstructure_features=list(MICROSTRUCTURE_EXTRA_COLUMNS),
+        )
+        assert metadata["feature_warning"] is not None
+        assert "too_few_features" in metadata["feature_warning"]
+
+    def test_microstructure_walk_forward_safety_flags(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=70, mid_step=1.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            feature_set="microstructure",
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+
+    def test_cli_parses_feature_set(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--feature-set", "microstructure"])
+        assert args.feature_set == "microstructure"
+
+    def test_cli_feature_set_default(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args([])
+        assert args.feature_set == DEFAULT_FEATURE_SET
+
+    def test_parse_feature_set(self) -> None:
+        assert parse_feature_set("basic") == "basic"
+        assert parse_feature_set("microstructure") == "microstructure"
+        with pytest.raises(ValueError):
+            parse_feature_set("invalid")
+
+    def test_get_walk_forward_feature_columns(self) -> None:
+        assert get_walk_forward_feature_columns("basic") == FEATURE_COLUMNS
+        micro_columns = get_walk_forward_feature_columns("microstructure")
+        assert micro_columns[: len(FEATURE_COLUMNS)] == FEATURE_COLUMNS
+        assert len(micro_columns) == len(FEATURE_COLUMNS) + len(MICROSTRUCTURE_EXTRA_COLUMNS)
+
+    def test_walk_forward_feature_matrix_uses_selected_columns(self) -> None:
+        rows = _make_resampled_rows(count=10)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, meta = create_walk_forward_features(raw_df, feature_set="microstructure")
+        matrix = walk_forward_feature_matrix(featured, tuple(meta["feature_columns"]))
+        assert list(matrix.columns) == meta["feature_columns"]
 
 
 class TestCostAwareLabels:

@@ -22,17 +22,15 @@ from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT
 from bid_ask_train import (
     FEATURE_COLUMNS,
     LABELS,
+    MID_PRICE_COLUMN,
     MajorityClassBaseline,
     RuleBaseline,
+    _SKLEARN_AVAILABLE,
     _accuracy,
-    _feature_matrix,
-    _predict_sklearn,
-    _rows_ready_for_model,
     create_features,
     create_labels,
     load_training_data,
     train_baseline_model,
-    train_optional_sklearn_model,
 )
 
 SAFETY_NOTE = (
@@ -67,6 +65,49 @@ DEFAULT_DIAGNOSTICS_DETAIL = "basic"
 DEFAULT_ACCEPTED_TRADES_LIMIT = 1000
 
 SUPPORTED_LABEL_MODES = frozenset({"direction", "cost_aware"})
+SUPPORTED_FEATURE_SETS = frozenset({"basic", "microstructure"})
+DEFAULT_FEATURE_SET = "basic"
+
+MICROSTRUCTURE_EXTRA_COLUMNS = (
+    "return_1",
+    "return_3",
+    "return_5",
+    "return_10",
+    "return_20",
+    "rolling_return_mean_5",
+    "rolling_return_mean_10",
+    "rolling_return_std_5",
+    "rolling_return_std_10",
+    "rolling_return_zscore_10",
+    "momentum_ratio_5_20",
+    "spread_bps",
+    "rolling_spread_mean_5",
+    "rolling_spread_mean_20",
+    "rolling_spread_std_20",
+    "spread_zscore_20",
+    "spread_percentile_50",
+    "is_tight_spread_regime",
+    "is_wide_spread_regime",
+    "bbo_imbalance",
+    "imbalance_change_1",
+    "imbalance_mean_5",
+    "imbalance_mean_20",
+    "imbalance_std_20",
+    "imbalance_zscore_20",
+    "imbalance_persistence_5",
+    "imbalance_persistence_10",
+    "volatility_5",
+    "volatility_20",
+    "volatility_ratio_5_20",
+    "is_low_volatility_regime",
+    "is_high_volatility_regime",
+    "imbalance_x_return_5",
+    "spread_x_volatility_20",
+    "tight_spread_x_imbalance",
+    "wide_spread_x_volatility",
+)
+
+MIN_MICROSTRUCTURE_FEATURE_COUNT = len(FEATURE_COLUMNS) + 1
 
 ACCEPTED_TRADES_CSV_COLUMNS = (
     "coin",
@@ -166,6 +207,445 @@ def parse_label_mode(value: str) -> str:
         raise ValueError(f"Unsupported label_mode {value!r}; use one of: {supported}")
     return mode
 
+
+def parse_feature_set(value: str) -> str:
+    """Parse feature set: basic (default) or microstructure."""
+    feature_set = str(value).strip().lower()
+    if feature_set not in SUPPORTED_FEATURE_SETS:
+        supported = ", ".join(sorted(SUPPORTED_FEATURE_SETS))
+        raise ValueError(f"Unsupported feature_set {value!r}; use one of: {supported}")
+    return feature_set
+
+
+def resolve_mid_price_column(df: pd.DataFrame) -> str | None:
+    """Return the best available mid-price column name."""
+    for column in ("close_mid", "avg_mid_price", "avg_mid"):
+        if column in df.columns:
+            return column
+    return None
+
+
+def resolve_spread_column(df: pd.DataFrame) -> str | None:
+    """Return the best available spread column name."""
+    for column in ("avg_spread_bps", "spread_bps"):
+        if column in df.columns:
+            return column
+    return None
+
+
+def resolve_imbalance_column(df: pd.DataFrame) -> str | None:
+    """Return the best available BBO imbalance column name."""
+    for column in ("avg_bbo_imbalance", "bbo_imbalance"):
+        if column in df.columns:
+            return column
+    return None
+
+
+def get_walk_forward_feature_columns(feature_set: str) -> tuple[str, ...]:
+    """Return ordered feature columns for the requested feature set."""
+    mode = parse_feature_set(feature_set)
+    if mode == "basic":
+        return FEATURE_COLUMNS
+    return FEATURE_COLUMNS + MICROSTRUCTURE_EXTRA_COLUMNS
+
+
+def _safe_fill_series(series: pd.Series) -> pd.Series:
+    """Fill NaNs from rolling calculations without using future rows."""
+    return series.ffill().bfill().fillna(0.0)
+
+
+def _return_bps(mid: pd.Series, lag: int) -> pd.Series:
+    prior = mid.shift(lag).replace(0, np.nan)
+    return (mid - mid.shift(lag)) / prior * 10_000.0
+
+
+def _rolling_zscore(series: pd.Series, window: int) -> pd.Series:
+    rolling_mean = series.rolling(window=window, min_periods=window).mean()
+    rolling_std = series.rolling(window=window, min_periods=window).std()
+    return (series - rolling_mean) / rolling_std.replace(0, np.nan)
+
+
+def _imbalance_persistence(imbalance: pd.Series, window: int) -> pd.Series:
+    sign = np.sign(imbalance.fillna(0.0))
+    same_as_prior = (sign == sign.shift(1)).astype(float)
+    return same_as_prior.rolling(window=window, min_periods=1).sum()
+
+
+def _add_microstructure_features(
+    df: pd.DataFrame,
+    *,
+    missing_sources: set[str] | None = None,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Add microstructure features beyond the basic set."""
+    out = df.copy()
+    skipped: list[str] = []
+    missing = missing_sources or set()
+    mid_column = resolve_mid_price_column(out)
+    spread_column = None if "avg_spread_bps" in missing else resolve_spread_column(out)
+    imbalance_column = None if "avg_bbo_imbalance" in missing else resolve_imbalance_column(out)
+
+    if mid_column is None:
+        skipped.extend(
+            [
+                "return_1",
+                "return_3",
+                "return_5",
+                "return_10",
+                "return_20",
+                "rolling_return_mean_5",
+                "rolling_return_mean_10",
+                "rolling_return_std_5",
+                "rolling_return_std_10",
+                "rolling_return_zscore_10",
+                "momentum_ratio_5_20",
+                "volatility_5",
+                "volatility_20",
+                "volatility_ratio_5_20",
+                "is_low_volatility_regime",
+                "is_high_volatility_regime",
+                "imbalance_x_return_5",
+            ]
+        )
+    else:
+        mid = out[mid_column].astype(float)
+        out["return_1"] = _return_bps(mid, 1)
+        out["return_3"] = _return_bps(mid, 3)
+        out["return_5"] = _return_bps(mid, 5)
+        out["return_10"] = _return_bps(mid, 10)
+        out["return_20"] = _return_bps(mid, 20)
+
+        return_1 = out["return_1"]
+        out["rolling_return_mean_5"] = return_1.rolling(window=5, min_periods=5).mean()
+        out["rolling_return_mean_10"] = return_1.rolling(window=10, min_periods=10).mean()
+        out["rolling_return_std_5"] = return_1.rolling(window=5, min_periods=5).std()
+        out["rolling_return_std_10"] = return_1.rolling(window=10, min_periods=10).std()
+        out["rolling_return_zscore_10"] = _rolling_zscore(return_1, 10)
+        out["momentum_ratio_5_20"] = out["rolling_return_mean_5"] / out[
+            "rolling_return_mean_10"
+        ].replace(0, np.nan)
+
+        out["volatility_5"] = return_1.rolling(window=5, min_periods=5).std()
+        out["volatility_20"] = return_1.rolling(window=20, min_periods=20).std()
+        out["volatility_ratio_5_20"] = out["volatility_5"] / out["volatility_20"].replace(
+            0, np.nan
+        )
+        vol_median = out["volatility_20"].rolling(window=50, min_periods=20).median()
+        out["is_low_volatility_regime"] = (out["volatility_20"] < vol_median).astype(float)
+        out["is_high_volatility_regime"] = (out["volatility_20"] > vol_median).astype(float)
+
+        for column in (
+            "return_1",
+            "return_3",
+            "return_5",
+            "return_10",
+            "return_20",
+            "rolling_return_mean_5",
+            "rolling_return_mean_10",
+            "rolling_return_std_5",
+            "rolling_return_std_10",
+            "rolling_return_zscore_10",
+            "momentum_ratio_5_20",
+            "volatility_5",
+            "volatility_20",
+            "volatility_ratio_5_20",
+            "is_low_volatility_regime",
+            "is_high_volatility_regime",
+        ):
+            out[column] = _safe_fill_series(out[column])
+
+    if spread_column is None:
+        skipped.extend(
+            [
+                "spread_bps",
+                "rolling_spread_mean_5",
+                "rolling_spread_mean_20",
+                "rolling_spread_std_20",
+                "spread_zscore_20",
+                "spread_percentile_50",
+                "is_tight_spread_regime",
+                "is_wide_spread_regime",
+                "spread_x_volatility_20",
+                "wide_spread_x_volatility",
+            ]
+        )
+    else:
+        spread = out[spread_column].astype(float)
+        out["spread_bps"] = spread
+        out["rolling_spread_mean_5"] = spread.rolling(window=5, min_periods=5).mean()
+        out["rolling_spread_mean_20"] = spread.rolling(window=20, min_periods=20).mean()
+        out["rolling_spread_std_20"] = spread.rolling(window=20, min_periods=20).std()
+        out["spread_zscore_20"] = _rolling_zscore(spread, 20)
+        out["spread_percentile_50"] = spread.rolling(window=50, min_periods=50).apply(
+            lambda values: float(pd.Series(values).rank(pct=True).iloc[-1]),
+            raw=False,
+        )
+        spread_mean_20 = out["rolling_spread_mean_20"]
+        spread_std_20 = out["rolling_spread_std_20"]
+        out["is_tight_spread_regime"] = (
+            spread < (spread_mean_20 - spread_std_20)
+        ).astype(float)
+        out["is_wide_spread_regime"] = (
+            spread > (spread_mean_20 + spread_std_20)
+        ).astype(float)
+
+        for column in (
+            "spread_bps",
+            "rolling_spread_mean_5",
+            "rolling_spread_mean_20",
+            "rolling_spread_std_20",
+            "spread_zscore_20",
+            "spread_percentile_50",
+            "is_tight_spread_regime",
+            "is_wide_spread_regime",
+        ):
+            out[column] = _safe_fill_series(out[column])
+
+    if imbalance_column is None:
+        skipped.extend(
+            [
+                "bbo_imbalance",
+                "imbalance_change_1",
+                "imbalance_mean_5",
+                "imbalance_mean_20",
+                "imbalance_std_20",
+                "imbalance_zscore_20",
+                "imbalance_persistence_5",
+                "imbalance_persistence_10",
+                "imbalance_x_return_5",
+                "tight_spread_x_imbalance",
+            ]
+        )
+    else:
+        imbalance = out[imbalance_column].astype(float)
+        out["bbo_imbalance"] = imbalance
+        out["imbalance_change_1"] = imbalance.diff(1)
+        out["imbalance_mean_5"] = imbalance.rolling(window=5, min_periods=5).mean()
+        out["imbalance_mean_20"] = imbalance.rolling(window=20, min_periods=20).mean()
+        out["imbalance_std_20"] = imbalance.rolling(window=20, min_periods=20).std()
+        out["imbalance_zscore_20"] = _rolling_zscore(imbalance, 20)
+        out["imbalance_persistence_5"] = _imbalance_persistence(imbalance, 5)
+        out["imbalance_persistence_10"] = _imbalance_persistence(imbalance, 10)
+
+        for column in (
+            "bbo_imbalance",
+            "imbalance_change_1",
+            "imbalance_mean_5",
+            "imbalance_mean_20",
+            "imbalance_std_20",
+            "imbalance_zscore_20",
+            "imbalance_persistence_5",
+            "imbalance_persistence_10",
+        ):
+            out[column] = _safe_fill_series(out[column])
+
+    if "return_5" in out.columns and "bbo_imbalance" in out.columns:
+        out["imbalance_x_return_5"] = _safe_fill_series(
+            out["bbo_imbalance"] * out["return_5"]
+        )
+    elif "imbalance_x_return_5" not in skipped:
+        skipped.append("imbalance_x_return_5")
+
+    if "spread_bps" in out.columns and "volatility_20" in out.columns:
+        out["spread_x_volatility_20"] = _safe_fill_series(
+            out["spread_bps"] * out["volatility_20"]
+        )
+    elif "spread_x_volatility_20" not in skipped:
+        skipped.append("spread_x_volatility_20")
+
+    if "is_tight_spread_regime" in out.columns and "bbo_imbalance" in out.columns:
+        out["tight_spread_x_imbalance"] = _safe_fill_series(
+            out["is_tight_spread_regime"] * out["bbo_imbalance"]
+        )
+    elif "tight_spread_x_imbalance" not in skipped:
+        skipped.append("tight_spread_x_imbalance")
+
+    if "is_wide_spread_regime" in out.columns and "volatility_20" in out.columns:
+        out["wide_spread_x_volatility"] = _safe_fill_series(
+            out["is_wide_spread_regime"] * out["volatility_20"]
+        )
+    elif "wide_spread_x_volatility" not in skipped:
+        skipped.append("wide_spread_x_volatility")
+
+    return out, sorted(set(skipped))
+
+
+def build_feature_metadata(
+    *,
+    feature_set: str,
+    feature_columns: tuple[str, ...],
+    skipped_microstructure_features: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build report metadata for the active feature set."""
+    mode = parse_feature_set(feature_set)
+    columns = list(feature_columns)
+    skipped = list(skipped_microstructure_features or [])
+    metadata: dict[str, Any] = {
+        "feature_set": mode,
+        "feature_columns": columns,
+        "feature_count": len(columns),
+        "skipped_microstructure_features": skipped,
+        "feature_warning": None,
+    }
+    if mode == "microstructure" and len(columns) < MIN_MICROSTRUCTURE_FEATURE_COUNT:
+        metadata["feature_warning"] = (
+            f"too_few_features: only {len(columns)} columns available "
+            f"(expected at least {MIN_MICROSTRUCTURE_FEATURE_COUNT})"
+        )
+    return metadata
+
+
+def _prepare_source_columns_for_basic_features(
+    df: pd.DataFrame,
+) -> tuple[pd.DataFrame, set[str]]:
+    """Ensure create_features inputs exist; return df and missing source column names."""
+    out = df.copy()
+    missing_sources: set[str] = set()
+
+    spread_column = resolve_spread_column(out)
+    if spread_column is None:
+        out["avg_spread_bps"] = 0.0
+        missing_sources.add("avg_spread_bps")
+    elif spread_column != "avg_spread_bps":
+        out["avg_spread_bps"] = out[spread_column].astype(float)
+
+    imbalance_column = resolve_imbalance_column(out)
+    if imbalance_column is None:
+        out["avg_bbo_imbalance"] = 0.0
+        missing_sources.add("avg_bbo_imbalance")
+    elif imbalance_column != "avg_bbo_imbalance":
+        out["avg_bbo_imbalance"] = out[imbalance_column].astype(float)
+
+    return out, missing_sources
+
+
+def _basic_features_blocked_by_missing_sources(missing_sources: set[str]) -> set[str]:
+    blocked = set(missing_sources)
+    if "avg_spread_bps" in missing_sources:
+        blocked.add("spread_change_1")
+    if "avg_bbo_imbalance" in missing_sources:
+        blocked.add("bbo_imbalance_change_1")
+    return blocked
+
+
+def create_walk_forward_features(
+    df: pd.DataFrame,
+    *,
+    feature_set: str = DEFAULT_FEATURE_SET,
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Create model features for walk-forward evaluation."""
+    mode = parse_feature_set(feature_set)
+    prepared_df, missing_sources = _prepare_source_columns_for_basic_features(df)
+    featured_df = create_features(prepared_df)
+    skipped: list[str] = sorted(_basic_features_blocked_by_missing_sources(missing_sources))
+
+    if mode == "microstructure":
+        featured_df, micro_skipped = _add_microstructure_features(
+            featured_df,
+            missing_sources=missing_sources,
+        )
+        skipped = sorted(set(skipped) | set(micro_skipped))
+
+    blocked_basic = _basic_features_blocked_by_missing_sources(missing_sources)
+    requested_columns = get_walk_forward_feature_columns(mode)
+    feature_columns = tuple(
+        column
+        for column in requested_columns
+        if column in featured_df.columns and column not in blocked_basic
+    )
+    metadata = build_feature_metadata(
+        feature_set=mode,
+        feature_columns=feature_columns,
+        skipped_microstructure_features=skipped if mode == "microstructure" else [],
+    )
+    return featured_df, metadata
+
+
+def walk_forward_feature_matrix(
+    df: pd.DataFrame,
+    feature_columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Extract the active feature matrix, filling safe defaults for sparse columns."""
+    available = [column for column in feature_columns if column in df.columns]
+    matrix = df[available].copy()
+    for column in ("avg_bbo_imbalance", "bbo_imbalance", "bbo_imbalance_change_1", "imbalance_change_1"):
+        if column in matrix.columns:
+            matrix[column] = matrix[column].fillna(0.0)
+    return matrix.astype(float)
+
+
+def walk_forward_rows_ready_for_model(
+    df: pd.DataFrame,
+    feature_columns: tuple[str, ...],
+) -> pd.DataFrame:
+    """Drop rows that are missing required labels, returns, or active features."""
+    mid_column = resolve_mid_price_column(df) or MID_PRICE_COLUMN
+    required = list(feature_columns) + ["label", "future_return_bps", mid_column]
+    required = [column for column in required if column in df.columns]
+    return df.dropna(subset=required).reset_index(drop=True)
+
+
+def train_walk_forward_sklearn_model(
+    train_df: pd.DataFrame,
+    feature_columns: tuple[str, ...],
+) -> dict[str, Any]:
+    """Train sklearn classifier on the active walk-forward feature set."""
+    if not _SKLEARN_AVAILABLE:
+        return {
+            "available": False,
+            "model": None,
+            "message": "sklearn not installed; using baseline models only",
+        }
+
+    X_train = walk_forward_feature_matrix(train_df, feature_columns)
+    y_train = train_df["label"].tolist()
+    if len(X_train) == 0:
+        return {
+            "available": True,
+            "model": None,
+            "message": "no training rows available for sklearn model",
+        }
+
+    from sklearn.ensemble import RandomForestClassifier
+    from sklearn.linear_model import LogisticRegression
+    from sklearn.preprocessing import StandardScaler
+
+    scaler = StandardScaler()
+    X_scaled = scaler.fit_transform(X_train)
+
+    if len(set(y_train)) < 2:
+        model: Any = LogisticRegression(max_iter=1000)
+    else:
+        model = RandomForestClassifier(
+            n_estimators=50,
+            random_state=42,
+            class_weight="balanced_subsample",
+        )
+
+    model.fit(X_scaled, y_train)
+    return {
+        "available": True,
+        "model": model,
+        "scaler": scaler,
+        "model_type": type(model).__name__,
+        "message": None,
+    }
+
+
+def predict_walk_forward_sklearn(
+    sklearn_result: dict[str, Any],
+    test_df: pd.DataFrame,
+    feature_columns: tuple[str, ...],
+) -> list[str] | None:
+    """Predict labels with the active walk-forward feature set."""
+    model = sklearn_result.get("model")
+    scaler = sklearn_result.get("scaler")
+    if model is None or scaler is None:
+        return None
+    X_test = walk_forward_feature_matrix(test_df, feature_columns)
+    if len(X_test) == 0:
+        return []
+    predictions = model.predict(scaler.transform(X_test))
+    return [str(label) for label in predictions]
 
 def compute_label_distribution(labels: list[str]) -> dict[str, dict[str, float | int]]:
     """Return UP/DOWN/FLAT counts and fractions for report payloads."""
@@ -340,11 +820,12 @@ def _prediction_confidence(
     test_df: pd.DataFrame,
     train_df: pd.DataFrame,
     model_used: str,
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
 ) -> list[float]:
     model = sklearn_result.get("model")
     scaler = sklearn_result.get("scaler")
     if model is not None and scaler is not None and hasattr(model, "predict_proba"):
-        X_test = _feature_matrix(test_df)
+        X_test = walk_forward_feature_matrix(test_df, feature_columns)
         if len(X_test) == 0:
             return []
         confidences: list[float] = []
@@ -385,11 +866,12 @@ def _prediction_confidence_edges(
     test_df: pd.DataFrame,
     train_df: pd.DataFrame,
     model_used: str,
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
 ) -> list[float]:
     model = sklearn_result.get("model")
     scaler = sklearn_result.get("scaler")
     if model is not None and scaler is not None and hasattr(model, "predict_proba"):
-        X_test = _feature_matrix(test_df)
+        X_test = walk_forward_feature_matrix(test_df, feature_columns)
         if len(X_test) == 0:
             return []
         return [
@@ -403,6 +885,7 @@ def _prediction_confidence_edges(
         test_df=test_df,
         train_df=train_df,
         model_used=model_used,
+        feature_columns=feature_columns,
     )
     n_classes = len(LABELS)
     return [
@@ -958,6 +1441,7 @@ def evaluate_walk_forward_window(
     horizon: int,
     threshold_bps: float,
     source: str,
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
 ) -> dict[str, Any]:
     """Train on one chronological window and evaluate on the following test slice."""
     train_start, train_end, test_start, test_end = window
@@ -976,14 +1460,18 @@ def evaluate_walk_forward_window(
         }
 
     baseline = train_baseline_model(train_df)
-    sklearn_result = train_optional_sklearn_model(train_df)
+    sklearn_result = train_walk_forward_sklearn_model(train_df, feature_columns)
 
     majority_model: MajorityClassBaseline = baseline["majority_model"]
     rule_model: RuleBaseline = baseline["rule_model"]
     baseline_predictions = majority_model.predict(test_df)
     no_trade_predictions = _no_trade_predictions(len(test_df))
-    momentum_predictions = rule_model.predict(_feature_matrix(test_df))
-    sklearn_predictions = _predict_sklearn(sklearn_result, test_df)
+    momentum_predictions = rule_model.predict(walk_forward_feature_matrix(test_df, feature_columns))
+    sklearn_predictions = predict_walk_forward_sklearn(
+        sklearn_result,
+        test_df,
+        feature_columns,
+    )
 
     if sklearn_predictions is not None:
         model_predictions = sklearn_predictions
@@ -999,6 +1487,7 @@ def evaluate_walk_forward_window(
         test_df=test_df,
         train_df=train_df,
         model_used=model_used,
+        feature_columns=feature_columns,
     )
     confidence_edges = _prediction_confidence_edges(
         sklearn_result=sklearn_result,
@@ -1006,6 +1495,7 @@ def evaluate_walk_forward_window(
         test_df=test_df,
         train_df=train_df,
         model_used=model_used,
+        feature_columns=feature_columns,
     )
     paper_simulation = simulate_paper_signal_returns(
         test_df,
@@ -1030,7 +1520,7 @@ def evaluate_walk_forward_window(
         payload = build_artifact_payload(
             model=sklearn_result["model"],
             scaler=sklearn_result.get("scaler"),
-            feature_names=FEATURE_COLUMNS,
+            feature_names=list(feature_columns),
             coin=coin,
             interval=interval,
             horizon=horizon,
@@ -1126,6 +1616,7 @@ def evaluate_coin_walk_forward(
     label_mode: str = DEFAULT_LABEL_MODE,
     label_cost_multiplier: float = DEFAULT_LABEL_COST_MULTIPLIER,
     label_min_edge_bps: float = DEFAULT_LABEL_MIN_EDGE_BPS,
+    feature_set: str = DEFAULT_FEATURE_SET,
 ) -> dict[str, Any]:
     """Run walk-forward evaluation for one coin."""
     normalized_source = normalize_source(source)
@@ -1154,6 +1645,10 @@ def evaluate_coin_walk_forward(
             "cumulative_net_return_bps": 0.0,
             **readiness,
             "readiness": readiness,
+            **build_feature_metadata(
+                feature_set=feature_set,
+                feature_columns=get_walk_forward_feature_columns(feature_set),
+            ),
         }
 
     if max_rows is not None and max_rows > 0:
@@ -1163,7 +1658,11 @@ def evaluate_coin_walk_forward(
     if missing_warning:
         warnings.append(missing_warning)
 
-    featured_df = create_features(raw_df)
+    featured_df, feature_meta = create_walk_forward_features(
+        raw_df,
+        feature_set=feature_set,
+    )
+    feature_columns = tuple(feature_meta["feature_columns"])
     labeled_df, label_meta = create_walk_forward_labels(
         featured_df,
         label_mode=label_mode,
@@ -1175,7 +1674,7 @@ def evaluate_coin_walk_forward(
         label_cost_multiplier=label_cost_multiplier,
         label_min_edge_bps=label_min_edge_bps,
     )
-    model_df = _rows_ready_for_model(labeled_df)
+    model_df = walk_forward_rows_ready_for_model(labeled_df, feature_columns)
 
     if len(model_df) < MIN_ROWS_WARNING:
         warnings.append(f"too_few_rows: only {len(model_df)} model-ready rows for {coin}")
@@ -1204,6 +1703,7 @@ def evaluate_coin_walk_forward(
             horizon=horizon,
             threshold_bps=threshold_bps,
             source=normalized_source,
+            feature_columns=feature_columns,
         )
         window_results.append(result)
 
@@ -1289,6 +1789,8 @@ def evaluate_coin_walk_forward(
     train_labels = model_df["label"].tolist() if not model_df.empty else []
     warnings.extend(_label_imbalance_warnings(train_labels, "all"))
     warnings.extend(cost_aware_label_warnings(train_labels, label_mode=label_mode))
+    if feature_meta.get("feature_warning"):
+        warnings.append(str(feature_meta["feature_warning"]))
 
     readiness = compute_readiness_flags(
         accuracy_edge_vs_baseline=accuracy_edge_vs_baseline,
@@ -1344,6 +1846,7 @@ def evaluate_coin_walk_forward(
         "windows": window_results,
         "warnings": warnings,
         **label_meta,
+        **feature_meta,
     }
 
 
@@ -1419,6 +1922,10 @@ def build_walk_forward_report(
     label_mode: str = DEFAULT_LABEL_MODE,
     label_cost_multiplier: float = DEFAULT_LABEL_COST_MULTIPLIER,
     label_min_edge_bps: float = DEFAULT_LABEL_MIN_EDGE_BPS,
+    feature_set: str = DEFAULT_FEATURE_SET,
+    feature_columns: tuple[str, ...] | None = None,
+    skipped_microstructure_features: list[str] | None = None,
+    feature_warning: str | None = None,
 ) -> dict[str, Any]:
     """Aggregate per-coin walk-forward results into one combined report."""
     normalized_source = normalize_source(source)
@@ -1558,6 +2065,24 @@ def build_walk_forward_report(
         threshold_bps=threshold_bps,
     )
 
+    resolved_feature_columns = tuple(
+        feature_columns
+        or per_coin_results[0].get("feature_columns", get_walk_forward_feature_columns(feature_set))
+        if per_coin_results
+        else get_walk_forward_feature_columns(feature_set)
+    )
+    resolved_skipped = list(
+        skipped_microstructure_features
+        or (per_coin_results[0].get("skipped_microstructure_features", []) if per_coin_results else [])
+    )
+    feature_metadata = build_feature_metadata(
+        feature_set=feature_set,
+        feature_columns=resolved_feature_columns,
+        skipped_microstructure_features=resolved_skipped,
+    )
+    if feature_warning:
+        feature_metadata["feature_warning"] = feature_warning
+
     return {
         "report_id": uuid.uuid4().hex,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1632,6 +2157,7 @@ def build_walk_forward_report(
         "execution_enabled": EXECUTION_ENABLED,
         "safety_statement": SAFETY_STATEMENT,
         "safety_note": SAFETY_NOTE,
+        **feature_metadata,
     }
 
 
@@ -1906,6 +2432,7 @@ def run_walk_forward_evaluation(
     label_mode: str = DEFAULT_LABEL_MODE,
     label_cost_multiplier: float = DEFAULT_LABEL_COST_MULTIPLIER,
     label_min_edge_bps: float = DEFAULT_LABEL_MIN_EDGE_BPS,
+    feature_set: str = DEFAULT_FEATURE_SET,
     data_root: Path = DEFAULT_DATA_ROOT,
     reports_dir: Path = DEFAULT_REPORTS_DIR,
     models_dir: Path = DEFAULT_MODELS_DIR,
@@ -1954,9 +2481,31 @@ def run_walk_forward_evaluation(
             label_mode=label_mode,
             label_cost_multiplier=label_cost_multiplier,
             label_min_edge_bps=label_min_edge_bps,
+            feature_set=feature_set,
         )
         for coin in coins
     ]
+
+    aggregate_feature_columns = tuple(
+        per_coin_results[0]["feature_columns"]
+        if per_coin_results and per_coin_results[0].get("feature_columns")
+        else get_walk_forward_feature_columns(feature_set)
+    )
+    aggregate_skipped = sorted(
+        {
+            feature_name
+            for item in per_coin_results
+            for feature_name in item.get("skipped_microstructure_features", [])
+        }
+    )
+    aggregate_feature_warning = next(
+        (
+            str(item["feature_warning"])
+            for item in per_coin_results
+            if item.get("feature_warning")
+        ),
+        None,
+    )
 
     report = build_walk_forward_report(
         coins=coins,
@@ -1978,6 +2527,10 @@ def run_walk_forward_evaluation(
         label_mode=label_mode,
         label_cost_multiplier=label_cost_multiplier,
         label_min_edge_bps=label_min_edge_bps,
+        feature_set=feature_set,
+        feature_columns=aggregate_feature_columns,
+        skipped_microstructure_features=aggregate_skipped,
+        feature_warning=aggregate_feature_warning,
     )
 
     all_accepted_trade_records = list(report.get("accepted_trade_records", []))
@@ -2062,6 +2615,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             "Minimum edge above estimated row cost for cost_aware labels "
             f"(default: {DEFAULT_LABEL_MIN_EDGE_BPS})"
         ),
+    )
+    parser.add_argument(
+        "--feature-set",
+        default=DEFAULT_FEATURE_SET,
+        choices=sorted(SUPPORTED_FEATURE_SETS),
+        help="Feature set: basic (default) or microstructure",
     )
     parser.add_argument(
         "--train-bars",
@@ -2229,6 +2788,7 @@ def main(argv: list[str] | None = None) -> int:
         label_mode=args.label_mode,
         label_cost_multiplier=args.label_cost_multiplier,
         label_min_edge_bps=args.label_min_edge_bps,
+        feature_set=args.feature_set,
         train_bars=args.train_bars,
         test_bars=args.test_bars,
         step_bars=args.step_bars,
