@@ -1573,6 +1573,123 @@ class TestLaunchdAutopilot:
         assert "<integer>21600</integer>" in plist_text
 
 
+class TestLaunchdHourlyAutopilot:
+    def test_writes_hourly_plist_and_setup(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, setup_path = scheduler.cmd_write_hourly_launchd_template(
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        assert plist_path.name == scheduler.LAUNCHD_PLIST_NAME_AUTOPILOT_HOURLY
+        assert setup_path.name == scheduler.LAUNCHD_SETUP_MD_HOURLY
+        assert plist_path.is_file()
+        assert setup_path.is_file()
+
+    def test_start_interval_default_3600(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, _ = scheduler.cmd_write_hourly_launchd_template(
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<key>StartInterval</key>" in plist_text
+        assert "<integer>3600</integer>" in plist_text
+
+    def test_custom_interval_seconds(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, _ = scheduler.cmd_write_hourly_launchd_template(
+            interval_seconds=7200,
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<integer>7200</integer>" in plist_text
+
+    def test_run_at_load_true_by_default(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, _ = scheduler.cmd_write_hourly_launchd_template(
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<key>RunAtLoad</key>" in plist_text
+        assert "<true/>" in plist_text
+
+    def test_run_at_load_false(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, _ = scheduler.cmd_write_hourly_launchd_template(
+            run_at_load=False,
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<key>RunAtLoad</key>" not in plist_text
+
+    def test_program_arguments_autopilot_tick(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, _ = scheduler.cmd_write_hourly_launchd_template(
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "bid_ask_research_scheduler.py" in plist_text
+        assert "<string>autopilot-tick</string>" in plist_text
+        assert "auto-backfill-next" not in plist_text
+
+    def test_stdout_stderr_log_paths(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        stdout_log = state_dir / "custom.out.log"
+        stderr_log = state_dir / "custom.err.log"
+        plist_path, _ = scheduler.cmd_write_hourly_launchd_template(
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert str(stdout_log) in plist_text
+        assert str(stderr_log) in plist_text
+
+    def test_setup_includes_daily_cap_warning(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        _, setup_path = scheduler.cmd_write_hourly_launchd_template(
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        setup_text = setup_path.read_text(encoding="utf-8")
+        assert "Daily caps protect the hourly schedule" in setup_text
+        assert "daily-chunk-limit 8" in setup_text
+        assert "daily-file-limit 24" in setup_text
+        assert "max_daily_chunk_limit" in setup_text
+        assert "max_daily_file_limit" in setup_text
+
+    def test_setup_includes_unload_old_daily_plist(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        _, setup_path = scheduler.cmd_write_hourly_launchd_template(
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        setup_text = setup_path.read_text(encoding="utf-8")
+        assert (
+            f"launchctl unload ~/Library/LaunchAgents/{scheduler.LAUNCHD_PLIST_NAME_AUTOPILOT}"
+            in setup_text
+        )
+        assert "autopilot-status" in setup_text
+        assert "tail -50" in setup_text
+        assert "research-only" in setup_text.lower()
+        assert "paper-only" in setup_text.lower()
+
+    def test_custom_label(self, tmp_path: Path) -> None:
+        state_dir = tmp_path / "scheduler"
+        plist_path, _ = scheduler.cmd_write_hourly_launchd_template(
+            label="com.example.hourly",
+            state_dir=state_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<string>com.example.hourly</string>" in plist_text
+
+
 class TestAutoBackfillNext:
     def test_selects_first_incomplete_chunk(
         self,

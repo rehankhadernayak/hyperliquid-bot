@@ -53,6 +53,14 @@ AUTOPILOT_FAILURE_PAUSE_THRESHOLD = 3
 AUTOPILOT_DISABLED_MESSAGE = "Autopilot is disabled; no work performed."
 AUTOPILOT_PAUSED_MESSAGE = "Autopilot is paused; no work performed."
 LAUNCHD_PLIST_NAME_AUTOPILOT = "com.hyperliquid.research.autopilot.plist"
+LAUNCHD_PLIST_NAME_AUTOPILOT_HOURLY = "com.hyperliquid.research.autopilot.hourly.plist"
+LAUNCHD_SETUP_MD_HOURLY = "launchd_hourly_autopilot_setup.md"
+DEFAULT_HOURLY_INTERVAL_SECONDS = 3600
+DEFAULT_HOURLY_LABEL = "com.hyperliquid.research.autopilot.hourly"
+DEFAULT_HOURLY_STDOUT_LOG = DEFAULT_STATE_DIR / "hourly_launchd.out.log"
+DEFAULT_HOURLY_STDERR_LOG = DEFAULT_STATE_DIR / "hourly_launchd.err.log"
+HOURLY_AUTOPILOT_RECOMMENDED_DAILY_CHUNK_LIMIT = 8
+HOURLY_AUTOPILOT_RECOMMENDED_DAILY_FILE_LIMIT = 24
 
 
 @dataclass
@@ -2141,6 +2149,22 @@ def cmd_autopilot_tick(
     return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
 
+def _resolve_project_root(project_root: Path | None = None) -> Path:
+    """Resolve repository root from explicit path or this module's location."""
+    if project_root is not None:
+        return project_root.resolve()
+    return Path(__file__).resolve().parent
+
+
+def _parse_bool_arg(value: str) -> bool:
+    lowered = value.strip().lower()
+    if lowered in {"true", "1", "yes", "on"}:
+        return True
+    if lowered in {"false", "0", "no", "off"}:
+        return False
+    raise argparse.ArgumentTypeError(f"expected true/false, got {value!r}")
+
+
 def cmd_write_launchd_template(
     *,
     run_time: str = "02:00",
@@ -2157,7 +2181,7 @@ def cmd_write_launchd_template(
 ) -> tuple[Path, Path]:
     """Write macOS launchd plist template and setup instructions (does not install)."""
     normalized_coins = orchestrator._normalize_coins(coins)
-    root = project_root or Path.cwd()
+    root = _resolve_project_root(project_root)
     python_path = sys.executable
     scheduler_script = root / "bid_ask_research_scheduler.py"
 
@@ -2313,6 +2337,148 @@ def cmd_write_launchd_template(
             f"Chunk size: **{chunk_size_hours}** hours; train interval: **{train_interval}**; horizon: **{horizon}**.",
         ]
     )
+    setup_md.write_text("\n".join(setup_lines) + "\n", encoding="utf-8")
+    return plist_path, setup_md
+
+
+def cmd_write_hourly_launchd_template(
+    *,
+    interval_seconds: int = DEFAULT_HOURLY_INTERVAL_SECONDS,
+    label: str = DEFAULT_HOURLY_LABEL,
+    run_at_load: bool = True,
+    stdout_log: Path = DEFAULT_HOURLY_STDOUT_LOG,
+    stderr_log: Path = DEFAULT_HOURLY_STDERR_LOG,
+    state_dir: Path = DEFAULT_STATE_DIR,
+    project_root: Path | None = None,
+) -> tuple[Path, Path]:
+    """Write hourly macOS launchd plist for autopilot-tick (does not install)."""
+    if interval_seconds < 60:
+        raise ValueError("interval-seconds must be at least 60")
+    root = _resolve_project_root(project_root)
+    python_path = sys.executable
+    scheduler_script = root / "bid_ask_research_scheduler.py"
+    cmd_parts = [python_path, str(scheduler_script), "autopilot-tick"]
+
+    plist_name = LAUNCHD_PLIST_NAME_AUTOPILOT_HOURLY
+    plist_path = state_dir / plist_name
+    state_dir.mkdir(parents=True, exist_ok=True)
+
+    run_at_load_block = ""
+    if run_at_load:
+        run_at_load_block = """    <key>RunAtLoad</key>
+    <true/>
+"""
+
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+{''.join(f'        <string>{part}</string>\n' for part in cmd_parts)}    </array>
+    <key>WorkingDirectory</key>
+    <string>{root}</string>
+    <key>StartInterval</key>
+    <integer>{interval_seconds}</integer>
+{run_at_load_block}    <key>StandardOutPath</key>
+    <string>{stdout_log}</string>
+    <key>StandardErrorPath</key>
+    <string>{stderr_log}</string>
+</dict>
+</plist>
+"""
+    plist_path.write_text(plist_content, encoding="utf-8")
+
+    setup_md = state_dir / LAUNCHD_SETUP_MD_HOURLY
+    setup_lines = [
+        "# macOS launchd Setup for Hourly Autopilot Extractor",
+        "",
+        "This template runs `autopilot-tick` on a fixed interval (default: every hour). "
+        "Each invocation processes **at most one bounded chunk** and exits. "
+        "It is **not installed automatically**.",
+        "",
+        "Research-only, paper-only; no orders, wallets, or execution endpoints.",
+        "",
+        "## 1. Configure safe daily caps",
+        "",
+        "Daily caps protect the hourly schedule from runaway downloads. "
+        "Without them, hourly ticks could accumulate excessive AWS requester-pays charges.",
+        "",
+        "Recommended safe caps for hourly extraction:",
+        "",
+        f"- `daily_chunk_limit`: **{HOURLY_AUTOPILOT_RECOMMENDED_DAILY_CHUNK_LIMIT}**",
+        f"- `daily_file_limit`: **{HOURLY_AUTOPILOT_RECOMMENDED_DAILY_FILE_LIMIT}**",
+        "- Keep `max_daily_chunk_limit` and `max_daily_file_limit` capped (defaults are safe).",
+        "",
+        "```bash",
+        "python3 bid_ask_research_scheduler.py configure-autopilot \\",
+        "  --enable \\",
+        f"  --daily-chunk-limit {HOURLY_AUTOPILOT_RECOMMENDED_DAILY_CHUNK_LIMIT} \\",
+        f"  --daily-file-limit {HOURLY_AUTOPILOT_RECOMMENDED_DAILY_FILE_LIMIT}",
+        "```",
+        "",
+        "Set up **AWS Budget alerts** before enabling scheduled downloads.",
+        "",
+        "## 2. Copy plist to LaunchAgents",
+        "",
+        "```bash",
+        f"cp {plist_path} ~/Library/LaunchAgents/",
+        "```",
+        "",
+        "## 3. Unload old daily plist (if present)",
+        "",
+        "```bash",
+        f"launchctl unload ~/Library/LaunchAgents/{LAUNCHD_PLIST_NAME_AUTOPILOT} 2>/dev/null || true",
+        f"launchctl unload ~/Library/LaunchAgents/{plist_name} 2>/dev/null || true",
+        "```",
+        "",
+        "## 4. Load hourly plist",
+        "",
+        "```bash",
+        f"launchctl load ~/Library/LaunchAgents/{plist_name}",
+        "```",
+        "",
+        "## 5. Check launchctl status",
+        "",
+        "```bash",
+        "launchctl list | grep hyperliquid",
+        "```",
+        "",
+        "## 6. Check autopilot status",
+        "",
+        "```bash",
+        "python3 bid_ask_research_scheduler.py autopilot-status",
+        "```",
+        "",
+        "## 7. Inspect stdout/stderr logs",
+        "",
+        "```bash",
+        f"tail -50 {stdout_log}",
+        f"tail -50 {stderr_log}",
+        "```",
+        "",
+        "## Uninstall",
+        "",
+        "```bash",
+        f"launchctl unload ~/Library/LaunchAgents/{plist_name}",
+        f"rm ~/Library/LaunchAgents/{plist_name}",
+        "```",
+        "",
+        "## Safety",
+        "",
+        "- Research-only, paper-only; no orders or execution endpoints.",
+        "- Each hourly tick runs `autopilot-tick`, which enforces daily chunk/file limits.",
+        "- When daily caps are reached, ticks exit cleanly with a limit-skipped report.",
+        "- **Daily caps protect the hourly schedule** — do not disable or raise them without review.",
+        "- Archive availability is not guaranteed.",
+        "- Use AWS Budget alerts; requester-pays downloads incur charges.",
+        "",
+        f"Schedule: every **{interval_seconds}** seconds (`StartInterval`).",
+        f"RunAtLoad: **{run_at_load}**.",
+        f"Label: `{label}`.",
+    ]
     setup_md.write_text("\n".join(setup_lines) + "\n", encoding="utf-8")
     return plist_path, setup_md
 
@@ -2500,6 +2666,42 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help="Run every N hours (StartInterval) instead of daily calendar time",
     )
+
+    hourly_launchd = subparsers.add_parser(
+        "write-hourly-launchd-template",
+        help="Write hourly launchd plist for autopilot-tick (does not install)",
+    )
+    hourly_launchd.add_argument(
+        "--interval-seconds",
+        type=int,
+        default=DEFAULT_HOURLY_INTERVAL_SECONDS,
+        help="StartInterval in seconds (default 3600)",
+    )
+    hourly_launchd.add_argument(
+        "--label",
+        default=DEFAULT_HOURLY_LABEL,
+        help="launchd Label key",
+    )
+    hourly_launchd.add_argument(
+        "--run-at-load",
+        type=_parse_bool_arg,
+        default=True,
+        help="Set RunAtLoad true/false (default true)",
+    )
+    hourly_launchd.add_argument(
+        "--stdout-log",
+        type=Path,
+        default=DEFAULT_HOURLY_STDOUT_LOG,
+        help="StandardOutPath for launchd",
+    )
+    hourly_launchd.add_argument(
+        "--stderr-log",
+        type=Path,
+        default=DEFAULT_HOURLY_STDERR_LOG,
+        help="StandardErrorPath for launchd",
+    )
+    hourly_launchd.add_argument("--state-dir", type=Path, default=DEFAULT_STATE_DIR)
+    hourly_launchd.add_argument("--project-root", type=Path, default=None)
 
     configure_autopilot = subparsers.add_parser(
         "configure-autopilot",
@@ -2762,6 +2964,19 @@ def main(argv: list[str] | None = None) -> int:
                 interval_hours=args.interval_hours,
             )
             print(f"Wrote launchd template: {plist_path}")
+            print(f"Wrote setup instructions: {setup_path}")
+            print("Not installed automatically.")
+        elif args.command == "write-hourly-launchd-template":
+            plist_path, setup_path = cmd_write_hourly_launchd_template(
+                interval_seconds=args.interval_seconds,
+                label=args.label,
+                run_at_load=args.run_at_load,
+                stdout_log=args.stdout_log,
+                stderr_log=args.stderr_log,
+                state_dir=args.state_dir,
+                project_root=args.project_root,
+            )
+            print(f"Wrote hourly launchd template: {plist_path}")
             print(f"Wrote setup instructions: {setup_path}")
             print("Not installed automatically.")
         elif args.command == "configure-autopilot":
