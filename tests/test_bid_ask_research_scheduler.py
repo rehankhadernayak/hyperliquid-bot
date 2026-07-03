@@ -1863,6 +1863,197 @@ class TestAutoBackfillNext:
         assert saved["execution_enabled"] is False
 
 
+class TestPhaseBackfillEstimate:
+    def test_btc_eth_14_days_at_144_files_per_day(self) -> None:
+        estimate = scheduler.compute_phase_backfill_estimate(
+            target_days=14,
+            coins=["BTC", "ETH"],
+            daily_file_limit=144,
+        )
+        assert estimate["files_required"] == 672
+        assert estimate["archive_days_per_real_day"] == pytest.approx(3.0)
+        assert estimate["estimated_real_days_to_complete"] == pytest.approx(4.6666666667)
+
+    def test_dry_run_command_does_not_change_state(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        before = json.loads(state_path.read_text(encoding="utf-8"))
+        estimate = scheduler.cmd_phase_backfill_estimate(
+            coins=["BTC", "ETH"],
+            target_days=14,
+            daily_file_limit=144,
+        )
+        after = json.loads(state_path.read_text(encoding="utf-8"))
+        assert before == after
+        assert estimate["files_required"] == 672
+
+
+class TestConfigurePhaseBackfill:
+    CONFIRMATION = scheduler.PHASE_BACKFILL_CONFIRMATION_TEXT
+
+    def test_enable_requires_exact_confirmation_text(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        with pytest.raises(ValueError, match="require-confirmation-text"):
+            scheduler.cmd_configure_phase_backfill(
+                enable=True,
+                state_path=state_path,
+            )
+        with pytest.raises(ValueError, match="require-confirmation-text"):
+            scheduler.cmd_configure_phase_backfill(
+                enable=True,
+                require_confirmation_text="wrong text",
+                state_path=state_path,
+            )
+
+    def test_enable_stores_phase_config_and_focused_coins(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        result = scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            phase_name="phase3_btc_eth_recent",
+            coins=["BTC", "ETH"],
+            target_days=14,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.enabled is True
+        assert state.autopilot.phase_backfill_enabled is True
+        assert state.autopilot.phase_backfill_name == "phase3_btc_eth_recent"
+        assert state.autopilot.focused_coins == ["BTC", "ETH"]
+        assert state.autopilot.target_days == 14
+        assert result["phase_backfill_enabled"] is True
+        assert result["focused_coins"] == ["BTC", "ETH"]
+
+    def test_limits_bounded_by_hard_caps(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            daily_file_limit=999,
+            daily_chunk_limit=99,
+            max_daily_file_limit=999,
+            max_daily_chunk_limit=99,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.daily_file_limit == scheduler.PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_FILE_LIMIT
+        assert state.autopilot.max_daily_file_limit == scheduler.PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_FILE_LIMIT
+        assert state.autopilot.daily_chunk_limit == scheduler.PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_CHUNK_LIMIT
+        assert state.autopilot.max_daily_chunk_limit == scheduler.PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_CHUNK_LIMIT
+
+    def test_disable_restores_conservative_limits(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        scheduler.cmd_configure_phase_backfill(
+            disable=True,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.phase_backfill_enabled is False
+        assert state.autopilot.daily_chunk_limit == scheduler.CONSERVATIVE_DAILY_CHUNK_LIMIT
+        assert state.autopilot.daily_file_limit == scheduler.CONSERVATIVE_DAILY_FILE_LIMIT
+        assert state.autopilot.max_daily_chunk_limit == scheduler.CONSERVATIVE_MAX_DAILY_CHUNK_LIMIT
+        assert state.autopilot.max_daily_file_limit == scheduler.CONSERVATIVE_MAX_DAILY_FILE_LIMIT
+
+    def test_status_includes_phase_fields_and_eta(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            coins=["BTC", "ETH"],
+            target_days=14,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        status = scheduler.cmd_autopilot_status(state_path=state_path)
+        assert status["phase_backfill_enabled"] is True
+        assert status["phase_backfill_name"] == "phase3_btc_eth_recent"
+        assert status["focused_coins"] == ["BTC", "ETH"]
+        assert status["target_days"] == 14
+        assert status["estimated_files_required"] == 672
+        assert status["estimated_real_days_to_complete"] == pytest.approx(4.6666666667)
+        assert status["daily_chunk_limit"] == 12
+        assert status["daily_file_limit"] == 144
+        assert status["requester_pays_warning"] == scheduler.PHASE_REQUESTER_PAYS_WARNING
+
+    def test_reset_usage_clears_counters(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        state = scheduler.load_state(state_path)
+        state.autopilot.runs_today = 3
+        state.autopilot.chunks_completed_today = 2
+        state.autopilot.files_downloaded_today = 12
+        scheduler.save_state(state, state_path)
+
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            reset_usage=True,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.runs_today == 0
+        assert state.autopilot.chunks_completed_today == 0
+        assert state.autopilot.files_downloaded_today == 0
+
+    def test_autopilot_tick_uses_focused_coins_when_phase_enabled(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            coins=["BTC", "ETH"],
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        captured: list[list[str]] = []
+
+        def fake_auto_backfill(**kwargs: object) -> scheduler.SchedulerReport:
+            coins_arg = kwargs.get("coins")
+            if coins_arg:
+                captured.append(list(coins_arg))
+            return scheduler.SchedulerReport(
+                workflows_run=["auto-backfill-next"],
+                historical_date="20230916",
+                historical_hours=["9", "10", "11"],
+                details={
+                    "historical_backfill": {
+                        "details": {
+                            "orchestrator_batch": {
+                                "download": {"file_results": [{"status": "downloaded"}]},
+                            }
+                        }
+                    }
+                },
+            )
+
+        monkeypatch.setattr(scheduler, "cmd_auto_backfill_next", fake_auto_backfill)
+
+        scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        assert captured == [["BTC", "ETH"]]
+
+    def test_safety_flags_remain_paper_only(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        report = scheduler.SchedulerReport(workflows_run=["configure-phase-backfill"])
+        payload = report.to_dict()
+        assert payload["paper_only"] is True
+        assert payload["execution_enabled"] is False
+
+
 class TestRepairStateFromExistingData:
     def _write_mock_historical_csv(
         self,

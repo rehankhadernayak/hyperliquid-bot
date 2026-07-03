@@ -62,6 +62,22 @@ DEFAULT_HOURLY_STDERR_LOG = DEFAULT_STATE_DIR / "hourly_launchd.err.log"
 HOURLY_AUTOPILOT_RECOMMENDED_DAILY_CHUNK_LIMIT = 8
 HOURLY_AUTOPILOT_RECOMMENDED_DAILY_FILE_LIMIT = 24
 
+PHASE_BACKFILL_DEFAULT_NAME = "phase3_btc_eth_recent"
+PHASE_BACKFILL_DEFAULT_COINS = ["BTC", "ETH"]
+PHASE_BACKFILL_DEFAULT_TARGET_DAYS = 14
+PHASE_BACKFILL_DEFAULT_DAILY_FILE_LIMIT = 144
+PHASE_BACKFILL_DEFAULT_DAILY_CHUNK_LIMIT = 12
+PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_FILE_LIMIT = 144
+PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_CHUNK_LIMIT = 12
+PHASE_BACKFILL_CONFIRMATION_TEXT = "I understand this may increase AWS Requester Pays costs"
+PHASE_REQUESTER_PAYS_WARNING = (
+    "Phase backfill enabled: downloads may incur AWS Requester Pays costs."
+)
+CONSERVATIVE_DAILY_CHUNK_LIMIT = 4
+CONSERVATIVE_DAILY_FILE_LIMIT = 24
+CONSERVATIVE_MAX_DAILY_CHUNK_LIMIT = 4
+CONSERVATIVE_MAX_DAILY_FILE_LIMIT = 36
+
 
 @dataclass
 class AutopilotState:
@@ -84,6 +100,10 @@ class AutopilotState:
     paused: bool = False
     pause_reason: str | None = None
     last_autopilot_report_path: str | None = None
+    phase_backfill_enabled: bool = False
+    phase_backfill_name: str | None = None
+    focused_coins: list[str] = field(default_factory=list)
+    target_days: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -106,6 +126,10 @@ class AutopilotState:
             "paused": self.paused,
             "pause_reason": self.pause_reason,
             "last_autopilot_report_path": self.last_autopilot_report_path,
+            "phase_backfill_enabled": self.phase_backfill_enabled,
+            "phase_backfill_name": self.phase_backfill_name,
+            "focused_coins": self.focused_coins,
+            "target_days": self.target_days,
         }
 
     @classmethod
@@ -132,6 +156,10 @@ class AutopilotState:
             paused=bool(payload.get("paused", False)),
             pause_reason=payload.get("pause_reason"),
             last_autopilot_report_path=payload.get("last_autopilot_report_path"),
+            phase_backfill_enabled=bool(payload.get("phase_backfill_enabled", False)),
+            phase_backfill_name=payload.get("phase_backfill_name"),
+            focused_coins=list(payload.get("focused_coins") or []),
+            target_days=int(payload.get("target_days") or 0),
         )
 
 
@@ -563,6 +591,213 @@ def _autopilot_next_recommended_action(state: SchedulerState, autopilot: Autopil
     if state.next_historical_date is None:
         return "python3 bid_ask_research_scheduler.py status"
     return "python3 bid_ask_research_scheduler.py autopilot-tick"
+
+
+def _effective_scheduler_coins(
+    state: SchedulerState,
+    coins: list[str] | None = None,
+) -> list[str]:
+    """Resolve coins for backfill; phase mode prefers focused_coins when set."""
+    if coins:
+        return orchestrator._normalize_coins(coins)
+    autopilot = state.autopilot
+    if autopilot.phase_backfill_enabled and autopilot.focused_coins:
+        return orchestrator._normalize_coins(autopilot.focused_coins)
+    return orchestrator._normalize_coins(state.coins)
+
+
+def compute_phase_backfill_estimate(
+    *,
+    target_days: int,
+    coins: list[str],
+    daily_file_limit: int,
+) -> dict[str, Any]:
+    """Compute phase backfill file counts and ETA without changing state."""
+    normalized_coins = orchestrator._normalize_coins(coins)
+    num_coins = len(normalized_coins)
+    if num_coins < 1:
+        raise ValueError("coins must contain at least one coin")
+    if target_days < 1:
+        raise ValueError("target-days must be at least 1")
+    if daily_file_limit < 1:
+        raise ValueError("daily-file-limit must be at least 1")
+
+    files_per_archive_day = 24 * num_coins
+    files_required = target_days * files_per_archive_day
+    archive_days_per_real_day = daily_file_limit / files_per_archive_day
+    estimated_real_days_to_complete = files_required / daily_file_limit
+
+    return {
+        "target_days": target_days,
+        "coins": normalized_coins,
+        "num_coins": num_coins,
+        "daily_file_limit": daily_file_limit,
+        "files_required": files_required,
+        "archive_days_per_real_day": archive_days_per_real_day,
+        "estimated_real_days_to_complete": estimated_real_days_to_complete,
+    }
+
+
+def _bound_phase_backfill_limits(
+    *,
+    daily_chunk_limit: int,
+    daily_file_limit: int,
+    max_daily_chunk_limit: int,
+    max_daily_file_limit: int,
+) -> tuple[int, int, int, int]:
+    """Clamp phase limits to absolute hard caps."""
+    bounded_daily_chunk = min(daily_chunk_limit, PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_CHUNK_LIMIT)
+    bounded_max_chunk = min(max_daily_chunk_limit, PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_CHUNK_LIMIT)
+    bounded_daily_file = min(daily_file_limit, PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_FILE_LIMIT)
+    bounded_max_file = min(max_daily_file_limit, PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_FILE_LIMIT)
+
+    if bounded_daily_chunk < 1:
+        raise ValueError("daily-chunk-limit must be at least 1")
+    if bounded_daily_file < 1:
+        raise ValueError("daily-file-limit must be at least 1")
+    if bounded_max_chunk < 1:
+        raise ValueError("max-daily-chunk-limit must be at least 1")
+    if bounded_max_file < 1:
+        raise ValueError("max-daily-file-limit must be at least 1")
+    if bounded_daily_chunk > bounded_max_chunk:
+        raise ValueError(
+            f"daily_chunk_limit {bounded_daily_chunk} exceeds "
+            f"max_daily_chunk_limit {bounded_max_chunk}"
+        )
+    if bounded_daily_file > bounded_max_file:
+        raise ValueError(
+            f"daily_file_limit {bounded_daily_file} exceeds "
+            f"max_daily_file_limit {bounded_max_file}"
+        )
+    return bounded_daily_chunk, bounded_daily_file, bounded_max_chunk, bounded_max_file
+
+
+def _phase_backfill_status_fields(autopilot: AutopilotState) -> dict[str, Any]:
+    """Return phase backfill fields for status output."""
+    fields: dict[str, Any] = {
+        "phase_backfill_enabled": autopilot.phase_backfill_enabled,
+        "phase_backfill_name": autopilot.phase_backfill_name,
+        "focused_coins": list(autopilot.focused_coins),
+        "target_days": autopilot.target_days,
+        "estimated_files_required": None,
+        "estimated_real_days_to_complete": None,
+        "archive_days_per_real_day": None,
+        "requester_pays_warning": None,
+    }
+    if autopilot.phase_backfill_enabled and autopilot.target_days > 0 and autopilot.focused_coins:
+        estimate = compute_phase_backfill_estimate(
+            target_days=autopilot.target_days,
+            coins=autopilot.focused_coins,
+            daily_file_limit=autopilot.daily_file_limit,
+        )
+        fields["estimated_files_required"] = estimate["files_required"]
+        fields["estimated_real_days_to_complete"] = estimate["estimated_real_days_to_complete"]
+        fields["archive_days_per_real_day"] = estimate["archive_days_per_real_day"]
+        fields["requester_pays_warning"] = PHASE_REQUESTER_PAYS_WARNING
+    return fields
+
+
+def cmd_phase_backfill_estimate(
+    *,
+    coins: list[str] | None = None,
+    target_days: int = PHASE_BACKFILL_DEFAULT_TARGET_DAYS,
+    daily_file_limit: int = PHASE_BACKFILL_DEFAULT_DAILY_FILE_LIMIT,
+) -> dict[str, Any]:
+    """Dry-run phase backfill ETA without changing state."""
+    normalized_coins = orchestrator._normalize_coins(
+        coins or PHASE_BACKFILL_DEFAULT_COINS
+    )
+    return compute_phase_backfill_estimate(
+        target_days=target_days,
+        coins=normalized_coins,
+        daily_file_limit=daily_file_limit,
+    )
+
+
+def cmd_configure_phase_backfill(
+    *,
+    enable: bool = False,
+    disable: bool = False,
+    phase_name: str = PHASE_BACKFILL_DEFAULT_NAME,
+    coins: list[str] | None = None,
+    target_days: int = PHASE_BACKFILL_DEFAULT_TARGET_DAYS,
+    daily_file_limit: int = PHASE_BACKFILL_DEFAULT_DAILY_FILE_LIMIT,
+    daily_chunk_limit: int = PHASE_BACKFILL_DEFAULT_DAILY_CHUNK_LIMIT,
+    max_daily_file_limit: int = PHASE_BACKFILL_DEFAULT_DAILY_FILE_LIMIT,
+    max_daily_chunk_limit: int = PHASE_BACKFILL_DEFAULT_DAILY_CHUNK_LIMIT,
+    reset_usage: bool = False,
+    require_confirmation_text: str | None = None,
+    state_path: Path = DEFAULT_STATE_PATH,
+) -> dict[str, Any]:
+    """Enable or disable targeted phase backfill mode with bounded daily caps."""
+    if enable and disable:
+        raise ValueError("pass --enable or --disable, not both")
+    if not enable and not disable:
+        raise ValueError("pass --enable or --disable")
+
+    state = load_state(state_path)
+    autopilot = state.autopilot
+
+    if reset_usage:
+        _reset_autopilot_daily_counters(autopilot, _utc_today_yyyymmdd())
+
+    if enable:
+        if require_confirmation_text != PHASE_BACKFILL_CONFIRMATION_TEXT:
+            raise ValueError(
+                f"pass --require-confirmation-text with exact text: "
+                f"{PHASE_BACKFILL_CONFIRMATION_TEXT!r}"
+            )
+        normalized_coins = orchestrator._normalize_coins(
+            coins or PHASE_BACKFILL_DEFAULT_COINS
+        )
+        (
+            bounded_daily_chunk,
+            bounded_daily_file,
+            bounded_max_chunk,
+            bounded_max_file,
+        ) = _bound_phase_backfill_limits(
+            daily_chunk_limit=daily_chunk_limit,
+            daily_file_limit=daily_file_limit,
+            max_daily_chunk_limit=max_daily_chunk_limit,
+            max_daily_file_limit=max_daily_file_limit,
+        )
+
+        autopilot.enabled = True
+        autopilot.paused = False
+        autopilot.pause_reason = None
+        if autopilot.started_at is None:
+            autopilot.started_at = _utc_now_iso()
+        autopilot.phase_backfill_enabled = True
+        autopilot.phase_backfill_name = phase_name.strip() or PHASE_BACKFILL_DEFAULT_NAME
+        autopilot.focused_coins = normalized_coins
+        autopilot.target_days = target_days
+        autopilot.daily_chunk_limit = bounded_daily_chunk
+        autopilot.daily_file_limit = bounded_daily_file
+        autopilot.max_daily_chunk_limit = bounded_max_chunk
+        autopilot.max_daily_file_limit = bounded_max_file
+    else:
+        autopilot.phase_backfill_enabled = False
+        autopilot.daily_chunk_limit = CONSERVATIVE_DAILY_CHUNK_LIMIT
+        autopilot.daily_file_limit = CONSERVATIVE_DAILY_FILE_LIMIT
+        autopilot.max_daily_chunk_limit = CONSERVATIVE_MAX_DAILY_CHUNK_LIMIT
+        autopilot.max_daily_file_limit = CONSERVATIVE_MAX_DAILY_FILE_LIMIT
+
+    state.autopilot = autopilot
+    save_state(state, state_path)
+
+    result: dict[str, Any] = {
+        "phase_backfill_enabled": autopilot.phase_backfill_enabled,
+        "phase_backfill_name": autopilot.phase_backfill_name,
+        "focused_coins": list(autopilot.focused_coins),
+        "target_days": autopilot.target_days,
+        "daily_chunk_limit": autopilot.daily_chunk_limit,
+        "daily_file_limit": autopilot.daily_file_limit,
+        "max_daily_chunk_limit": autopilot.max_daily_chunk_limit,
+        "max_daily_file_limit": autopilot.max_daily_file_limit,
+        "autopilot_enabled": autopilot.enabled,
+    }
+    result.update(_phase_backfill_status_fields(autopilot))
+    return result
 
 
 def write_autopilot_report(
@@ -1629,7 +1864,7 @@ def cmd_auto_backfill_next(
         _advance_date_if_complete(state)
         save_state(state, state_path)
         state = load_state(state_path)
-    normalized_coins = orchestrator._normalize_coins(coins or state.coins)
+    normalized_coins = _effective_scheduler_coins(state, coins)
 
     report = SchedulerReport(
         workflows_run=["auto-backfill-next"],
@@ -1974,6 +2209,7 @@ def cmd_autopilot_status(
         "failed_runs_in_row": autopilot.failed_runs_in_row,
         "next_recommended_action": _autopilot_next_recommended_action(state, autopilot),
         "latest_report": autopilot.last_autopilot_report_path,
+        **_phase_backfill_status_fields(autopilot),
     }
 
 
@@ -2016,7 +2252,7 @@ def cmd_autopilot_tick(
     orchestrator.reject_all_time(all_time=False)
     state = load_state(state_path)
     autopilot = state.autopilot
-    normalized_coins = orchestrator._normalize_coins(coins or state.coins)
+    normalized_coins = _effective_scheduler_coins(state, coins)
     today = today_override or _utc_today_yyyymmdd()
     requested_files = _estimate_chunk_files(len(normalized_coins), chunk_size_hours)
 
@@ -2726,6 +2962,82 @@ def build_parser() -> argparse.ArgumentParser:
     configure_autopilot.add_argument("--max-daily-file-limit", type=int, default=None)
     configure_autopilot.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
 
+    configure_phase_backfill = subparsers.add_parser(
+        "configure-phase-backfill",
+        help="Enable/disable targeted phase backfill sprint (BTC+ETH, bounded caps)",
+    )
+    configure_phase_backfill.add_argument(
+        "--phase-name",
+        default=PHASE_BACKFILL_DEFAULT_NAME,
+        help="Label for this phase backfill sprint",
+    )
+    configure_phase_backfill.add_argument(
+        "--coins",
+        nargs="+",
+        default=None,
+        help="Focused coins (default BTC ETH)",
+    )
+    configure_phase_backfill.add_argument(
+        "--target-days",
+        type=int,
+        default=PHASE_BACKFILL_DEFAULT_TARGET_DAYS,
+        help="Archive days to backfill in this phase",
+    )
+    configure_phase_backfill.add_argument(
+        "--daily-file-limit",
+        type=int,
+        default=PHASE_BACKFILL_DEFAULT_DAILY_FILE_LIMIT,
+    )
+    configure_phase_backfill.add_argument(
+        "--daily-chunk-limit",
+        type=int,
+        default=PHASE_BACKFILL_DEFAULT_DAILY_CHUNK_LIMIT,
+    )
+    configure_phase_backfill.add_argument(
+        "--max-daily-file-limit",
+        type=int,
+        default=PHASE_BACKFILL_DEFAULT_DAILY_FILE_LIMIT,
+    )
+    configure_phase_backfill.add_argument(
+        "--max-daily-chunk-limit",
+        type=int,
+        default=PHASE_BACKFILL_DEFAULT_DAILY_CHUNK_LIMIT,
+    )
+    configure_phase_backfill.add_argument("--enable", action="store_true")
+    configure_phase_backfill.add_argument("--disable", action="store_true")
+    configure_phase_backfill.add_argument(
+        "--reset-usage",
+        action="store_true",
+        help="Reset daily usage counters (default preserves them)",
+    )
+    configure_phase_backfill.add_argument(
+        "--require-confirmation-text",
+        default=None,
+        help=f"Required exact text when using --enable: {PHASE_BACKFILL_CONFIRMATION_TEXT!r}",
+    )
+    configure_phase_backfill.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+
+    phase_backfill_estimate = subparsers.add_parser(
+        "phase-backfill-estimate",
+        help="Print phase backfill ETA without changing state",
+    )
+    phase_backfill_estimate.add_argument(
+        "--coins",
+        nargs="+",
+        default=None,
+        help="Coins to estimate (default BTC ETH)",
+    )
+    phase_backfill_estimate.add_argument(
+        "--target-days",
+        type=int,
+        default=PHASE_BACKFILL_DEFAULT_TARGET_DAYS,
+    )
+    phase_backfill_estimate.add_argument(
+        "--daily-file-limit",
+        type=int,
+        default=PHASE_BACKFILL_DEFAULT_DAILY_FILE_LIMIT,
+    )
+
     autopilot_status = subparsers.add_parser(
         "autopilot-status",
         help="Print autopilot settings and usage",
@@ -2784,6 +3096,39 @@ def _print_autopilot_status(status: dict[str, Any]) -> None:
     print(f"  failed_runs_in_row: {status['failed_runs_in_row']}")
     print(f"  next_recommended_action: {status['next_recommended_action']}")
     print(f"  latest_report: {status['latest_report']}")
+    print(f"  phase_backfill_enabled: {status.get('phase_backfill_enabled', False)}")
+    if status.get("phase_backfill_name"):
+        print(f"  phase_backfill_name: {status['phase_backfill_name']}")
+    if status.get("focused_coins"):
+        print(f"  focused_coins: {', '.join(status['focused_coins'])}")
+    if status.get("target_days"):
+        print(f"  target_days: {status['target_days']}")
+    if status.get("estimated_files_required") is not None:
+        print(f"  estimated_files_required: {status['estimated_files_required']}")
+    if status.get("estimated_real_days_to_complete") is not None:
+        print(
+            f"  estimated_real_days_to_complete: "
+            f"{status['estimated_real_days_to_complete']:.2f}"
+        )
+    if status.get("archive_days_per_real_day") is not None:
+        print(
+            f"  archive_days_per_real_day: {status['archive_days_per_real_day']:.2f}"
+        )
+    if status.get("requester_pays_warning"):
+        print(f"  requester_pays_warning: {status['requester_pays_warning']}")
+
+
+def _print_phase_backfill_estimate(estimate: dict[str, Any]) -> None:
+    print("Phase Backfill Estimate (dry run, no state change)")
+    print(f"  coins: {', '.join(estimate['coins'])}")
+    print(f"  target_days: {estimate['target_days']}")
+    print(f"  daily_file_limit: {estimate['daily_file_limit']}")
+    print(f"  files_required: {estimate['files_required']}")
+    print(f"  archive_days_per_real_day: {estimate['archive_days_per_real_day']:.2f}")
+    print(
+        f"  estimated_real_days_to_complete: "
+        f"{estimate['estimated_real_days_to_complete']:.2f}"
+    )
 
 
 def _print_status(status: dict[str, Any]) -> None:
@@ -2997,6 +3342,34 @@ def main(argv: list[str] | None = None) -> int:
             )
             _print_autopilot_status(cmd_autopilot_status(state_path=args.state_path))
             print(f"Autopilot configured: enabled={autopilot.enabled} paused={autopilot.paused}")
+        elif args.command == "configure-phase-backfill":
+            result = cmd_configure_phase_backfill(
+                enable=args.enable,
+                disable=args.disable,
+                phase_name=args.phase_name,
+                coins=args.coins,
+                target_days=args.target_days,
+                daily_file_limit=args.daily_file_limit,
+                daily_chunk_limit=args.daily_chunk_limit,
+                max_daily_file_limit=args.max_daily_file_limit,
+                max_daily_chunk_limit=args.max_daily_chunk_limit,
+                reset_usage=args.reset_usage,
+                require_confirmation_text=args.require_confirmation_text,
+                state_path=args.state_path,
+            )
+            _print_autopilot_status(cmd_autopilot_status(state_path=args.state_path))
+            print(
+                "Phase backfill configured: "
+                f"enabled={result['phase_backfill_enabled']} "
+                f"name={result.get('phase_backfill_name')}"
+            )
+        elif args.command == "phase-backfill-estimate":
+            estimate = cmd_phase_backfill_estimate(
+                coins=args.coins,
+                target_days=args.target_days,
+                daily_file_limit=args.daily_file_limit,
+            )
+            _print_phase_backfill_estimate(estimate)
         elif args.command == "autopilot-status":
             status = cmd_autopilot_status(state_path=args.state_path)
             _print_autopilot_status(status)
