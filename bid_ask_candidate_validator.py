@@ -13,12 +13,14 @@ from pathlib import Path
 from typing import Any
 
 from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT
+from bid_ask_train import load_training_data
 from bid_ask_walk_forward_evaluator import (
     DEFAULT_DATA_ROOT,
     DEFAULT_REPORTS_DIR,
     parse_trade_classes,
     run_walk_forward_evaluation,
 )
+import bid_ask_walk_forward_evaluator as walk_forward_module
 
 SAFETY_NOTE = (
     "Candidate validation is research-only and paper-only. "
@@ -46,6 +48,9 @@ SOURCE_CHOICES = ("historical", "combined", "local")
 DEFAULT_MIN_TRADES_REQUIRED = 20
 DEFAULT_REQUIRE_POSITIVE = True
 TREND_RUN_LIMIT = 10
+DEFAULT_SLICE_MODES = "recent_halves,recent_thirds,expanding"
+SLICE_MODE_CHOICES = ("recent_halves", "recent_thirds", "expanding")
+ROBUSTNESS_REPORT_PREFIX = "robustness_"
 
 VALIDATION_REPORT_GLOB = "candidate_validation_*.json"
 
@@ -394,6 +399,509 @@ def run_candidate_validation(
     return report
 
 
+def parse_slice_modes(slices: str) -> list[str]:
+    """Parse comma-separated rolling slice mode names."""
+    modes = [item.strip() for item in str(slices).split(",") if item.strip()]
+    if not modes:
+        raise ValueError("At least one slice mode is required")
+    invalid = [mode for mode in modes if mode not in SLICE_MODE_CHOICES]
+    if invalid:
+        supported = ", ".join(SLICE_MODE_CHOICES)
+        raise ValueError(f"Unsupported slice mode(s) {invalid}; use one of: {supported}")
+    return modes
+
+
+def build_row_slices(total_rows: int, modes: list[str]) -> list[dict[str, Any]]:
+    """Build chronological row-range slices for rolling robustness checks."""
+    if total_rows <= 0:
+        return []
+
+    slices: list[dict[str, Any]] = []
+    seen: set[tuple[int, int]] = set()
+
+    def add_slice(slice_name: str, row_start: int, row_end: int) -> None:
+        if row_end <= row_start:
+            return
+        key = (row_start, row_end)
+        if key in seen:
+            return
+        seen.add(key)
+        slices.append(
+            {
+                "slice_name": slice_name,
+                "row_start": row_start,
+                "row_end": row_end,
+                "row_count": row_end - row_start,
+            }
+        )
+
+    if "recent_halves" in modes:
+        midpoint = total_rows // 2
+        add_slice("half_first", 0, midpoint)
+        add_slice("half_second", midpoint, total_rows)
+
+    if "recent_thirds" in modes:
+        third = total_rows // 3
+        two_thirds = (total_rows * 2) // 3
+        add_slice("third_first", 0, third)
+        add_slice("third_middle", third, two_thirds)
+        add_slice("third_last", two_thirds, total_rows)
+
+    if "expanding" in modes:
+        third = max(total_rows // 3, 1)
+        two_thirds = max((total_rows * 2) // 3, third)
+        add_slice("expand_33", 0, third)
+        add_slice("expand_66", 0, two_thirds)
+        add_slice("expand_100", 0, total_rows)
+
+    return slices
+
+
+def make_sliced_walk_forward_runner(
+    *,
+    row_start: int,
+    row_end: int,
+    base_runner=run_walk_forward_evaluation,
+):
+    """Return a walk-forward runner that evaluates only a row slice of the CSV."""
+
+    def runner(**kwargs: Any) -> dict[str, Any]:
+        coin = kwargs["coins"][0]
+        interval = kwargs["interval"]
+        source = kwargs["source"]
+        data_root = kwargs["data_root"]
+        original_loader = walk_forward_module.load_training_data
+
+        def patched_loader(
+            load_coin: str,
+            load_interval: str,
+            load_data_root: Path,
+            *,
+            source: str,
+        ):
+            frame = original_loader(
+                load_coin,
+                load_interval,
+                load_data_root,
+                source=source,
+            )
+            return frame.iloc[row_start:row_end].reset_index(drop=True)
+
+        walk_forward_module.load_training_data = patched_loader
+        try:
+            return base_runner(**kwargs)
+        finally:
+            walk_forward_module.load_training_data = original_loader
+
+    return runner
+
+
+def build_slice_validation_result(
+    walk_forward_report: dict[str, Any],
+    *,
+    config: dict[str, Any],
+    slice_name: str,
+    slice_meta: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one rolling-slice validation result from walk-forward metrics."""
+    stability_summary = walk_forward_report.get("stability_summary") or {}
+    filtered_paper_trades = int(walk_forward_report.get("filtered_paper_trades", 0))
+    beats_baseline_accuracy = bool(
+        walk_forward_report.get(
+            "beats_baseline_accuracy",
+            (walk_forward_report.get("readiness") or {}).get("beats_baseline_accuracy", False),
+        )
+    )
+    positive_after_costs = bool(
+        walk_forward_report.get(
+            "positive_after_costs",
+            (walk_forward_report.get("readiness") or {}).get("positive_after_costs", False),
+        )
+    )
+    validation_status = compute_validation_status(
+        beats_baseline_accuracy=beats_baseline_accuracy,
+        positive_after_costs=positive_after_costs,
+        filtered_paper_trades=filtered_paper_trades,
+        stability_summary=stability_summary,
+        min_trades_required=int(config.get("min_trades_required", DEFAULT_MIN_TRADES_REQUIRED)),
+        require_positive=bool(config.get("require_positive", DEFAULT_REQUIRE_POSITIVE)),
+    )
+    result = {
+        "slice_name": slice_name,
+        "config": config,
+        "beats_baseline_accuracy": beats_baseline_accuracy,
+        "accuracy_edge_vs_baseline": float(
+            walk_forward_report.get("accuracy_edge_vs_baseline", 0.0)
+        ),
+        "filtered_paper_trades": filtered_paper_trades,
+        "cumulative_net_return_bps": float(
+            walk_forward_report.get("cumulative_net_return_bps", 0.0)
+        ),
+        "average_net_return_bps": float(walk_forward_report.get("average_net_return_bps", 0.0)),
+        "win_rate_after_costs": float(walk_forward_report.get("win_rate_after_costs", 0.0)),
+        "positive_after_costs": positive_after_costs,
+        "stability_summary": stability_summary,
+        "stability_warnings": list(walk_forward_report.get("stability_warnings") or []),
+        "validation_status": validation_status,
+    }
+    if slice_meta:
+        result["slice_meta"] = slice_meta
+    return result
+
+
+def build_slice_result_from_validation_report(
+    report: dict[str, Any],
+    *,
+    slice_name: str,
+) -> dict[str, Any]:
+    """Map a saved candidate validation report into a rolling slice result."""
+    config = dict(report.get("config") or {})
+    stability_summary = report.get("stability_summary") or {}
+    filtered_paper_trades = int(report.get("filtered_paper_trades", 0))
+    beats_baseline_accuracy = bool(report.get("beats_baseline_accuracy", False))
+    positive_after_costs = bool(report.get("positive_after_costs", False))
+    validation_status = compute_validation_status(
+        beats_baseline_accuracy=beats_baseline_accuracy,
+        positive_after_costs=positive_after_costs,
+        filtered_paper_trades=filtered_paper_trades,
+        stability_summary=stability_summary,
+        min_trades_required=int(config.get("min_trades_required", DEFAULT_MIN_TRADES_REQUIRED)),
+        require_positive=bool(config.get("require_positive", DEFAULT_REQUIRE_POSITIVE)),
+    )
+    return {
+        "slice_name": slice_name,
+        "config": config,
+        "beats_baseline_accuracy": beats_baseline_accuracy,
+        "accuracy_edge_vs_baseline": float(report.get("accuracy_edge_vs_baseline", 0.0)),
+        "filtered_paper_trades": filtered_paper_trades,
+        "cumulative_net_return_bps": float(report.get("cumulative_net_return_bps", 0.0)),
+        "average_net_return_bps": float(report.get("average_net_return_bps", 0.0)),
+        "win_rate_after_costs": float(report.get("win_rate_after_costs", 0.0)),
+        "positive_after_costs": positive_after_costs,
+        "stability_summary": stability_summary,
+        "stability_warnings": list(report.get("stability_warnings") or []),
+        "validation_status": validation_status,
+        "source_report_path": report.get("json_report_path"),
+        "source_run_timestamp": report.get("run_timestamp"),
+    }
+
+
+def compute_robustness_summary(slice_results: list[dict[str, Any]]) -> dict[str, Any]:
+    """Aggregate rolling slice outcomes into top-level robustness flags."""
+    slices_tested = len(slice_results)
+    slices_positive_after_costs = sum(
+        1 for item in slice_results if item.get("positive_after_costs")
+    )
+    slices_beating_baseline = sum(
+        1 for item in slice_results if item.get("beats_baseline_accuracy")
+    )
+    slices_with_enough_trades = sum(
+        1
+        for item in slice_results
+        if not (item.get("validation_status") or {}).get("insufficient_trades")
+    )
+    slices_without_stability_warnings = sum(
+        1
+        for item in slice_results
+        if not (item.get("validation_status") or {}).get("unstable_concentrated")
+        and not (item.get("validation_status") or {}).get("unstable_sparse")
+    )
+    robustness_pass = (
+        slices_tested > 0
+        and slices_positive_after_costs == slices_tested
+        and slices_beating_baseline == slices_tested
+        and slices_with_enough_trades == slices_tested
+        and slices_without_stability_warnings == slices_tested
+    )
+    return {
+        "slices_tested": slices_tested,
+        "slices_positive_after_costs": slices_positive_after_costs,
+        "slices_beating_baseline": slices_beating_baseline,
+        "slices_with_enough_trades": slices_with_enough_trades,
+        "slices_without_stability_warnings": slices_without_stability_warnings,
+        "robustness_pass": robustness_pass,
+        "not_market_ready": not robustness_pass,
+        "real_execution_ready": False,
+        "paper_only": PAPER_ONLY,
+        "execution_enabled": EXECUTION_ENABLED,
+    }
+
+
+def build_robustness_report(
+    *,
+    candidate_name: str,
+    run_timestamp: str,
+    config: dict[str, Any],
+    slice_results: list[dict[str, Any]],
+    slice_modes: list[str],
+    evaluation_mode: str,
+) -> dict[str, Any]:
+    """Build the top-level rolling robustness validation report."""
+    summary = compute_robustness_summary(slice_results)
+    return {
+        "candidate_name": candidate_name,
+        "run_timestamp": run_timestamp,
+        "evaluation_mode": evaluation_mode,
+        "slice_modes": slice_modes,
+        "config": config,
+        "slices": slice_results,
+        "robustness_summary": summary,
+        "robustness_pass": summary["robustness_pass"],
+        "not_market_ready": summary["not_market_ready"],
+        "real_execution_ready": False,
+        "paper_only": PAPER_ONLY,
+        "execution_enabled": EXECUTION_ENABLED,
+        "safety_note": SAFETY_NOTE,
+        "safety_statement": SAFETY_STATEMENT,
+    }
+
+
+def write_robustness_json(
+    report: dict[str, Any],
+    reports_dir: Path = DEFAULT_VALIDATION_REPORTS_DIR,
+) -> Path:
+    """Write timestamped JSON rolling robustness report."""
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    candidate_name = str(report.get("candidate_name", DEFAULT_CANDIDATE_NAME))
+    stamp = _report_stamp(str(report.get("run_timestamp", "")))
+    output_path = reports_dir / f"{ROBUSTNESS_REPORT_PREFIX}{candidate_name}_{stamp}.json"
+    with output_path.open("w", encoding="utf-8") as handle:
+        json.dump(report, handle, indent=2, sort_keys=True)
+    report["json_report_path"] = str(output_path)
+    return output_path
+
+
+def write_robustness_markdown(
+    report: dict[str, Any],
+    reports_dir: Path = DEFAULT_VALIDATION_REPORTS_DIR,
+) -> Path:
+    """Write timestamped Markdown rolling robustness report."""
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    candidate_name = str(report.get("candidate_name", DEFAULT_CANDIDATE_NAME))
+    stamp = _report_stamp(str(report.get("run_timestamp", "")))
+    output_path = reports_dir / f"{ROBUSTNESS_REPORT_PREFIX}{candidate_name}_{stamp}.md"
+
+    config = report.get("config") or {}
+    summary = report.get("robustness_summary") or {}
+    lines = [
+        "# Rolling Robustness Validation Report",
+        "",
+        f"Candidate: {candidate_name}",
+        f"Run timestamp: {report.get('run_timestamp', 'n/a')}",
+        f"Evaluation mode: {report.get('evaluation_mode', 'n/a')}",
+        f"Slice modes: {', '.join(report.get('slice_modes') or [])}",
+        "",
+        "## Safety",
+        "",
+        f"- paper_only: {str(report.get('paper_only', True)).lower()}",
+        f"- execution_enabled: {str(report.get('execution_enabled', False)).lower()}",
+        f"- real_execution_ready: {str(report.get('real_execution_ready', False)).lower()}",
+        "",
+        report.get("safety_note", SAFETY_NOTE),
+        "",
+        "## Configuration",
+        "",
+        f"- coin: {config.get('coin')}",
+        f"- interval: {config.get('interval')}",
+        f"- horizon: {config.get('horizon')}",
+        f"- source: {config.get('source')}",
+        f"- min_trades_required: {config.get('min_trades_required')}",
+        f"- require_positive: {str(config.get('require_positive', True)).lower()}",
+        "",
+        "## Robustness Summary",
+        "",
+        f"- slices_tested: {summary.get('slices_tested', 0)}",
+        f"- slices_positive_after_costs: {summary.get('slices_positive_after_costs', 0)}",
+        f"- slices_beating_baseline: {summary.get('slices_beating_baseline', 0)}",
+        f"- slices_with_enough_trades: {summary.get('slices_with_enough_trades', 0)}",
+        f"- slices_without_stability_warnings: {summary.get('slices_without_stability_warnings', 0)}",
+        f"- robustness_pass: {str(summary.get('robustness_pass', False)).lower()}",
+        f"- not_market_ready: {str(summary.get('not_market_ready', True)).lower()}",
+        "",
+        "## Slice Results",
+        "",
+    ]
+
+    for item in report.get("slices") or []:
+        status = item.get("validation_status") or {}
+        stability = item.get("stability_summary") or {}
+        lines.extend(
+            [
+                f"### {item.get('slice_name', 'unknown')}",
+                "",
+                f"- beats_baseline_accuracy: {str(item.get('beats_baseline_accuracy', False)).lower()}",
+                f"- accuracy_edge_vs_baseline: {float(item.get('accuracy_edge_vs_baseline', 0.0)):.4f}",
+                f"- filtered_paper_trades: {item.get('filtered_paper_trades', 0)}",
+                f"- cumulative_net_return_bps: {float(item.get('cumulative_net_return_bps', 0.0)):.4f}",
+                f"- average_net_return_bps: {float(item.get('average_net_return_bps', 0.0)):.4f}",
+                f"- win_rate_after_costs: {float(item.get('win_rate_after_costs', 0.0)):.4f}",
+                f"- positive_after_costs: {str(item.get('positive_after_costs', False)).lower()}",
+                f"- concentration_warning: {str(stability.get('concentration_warning', False)).lower()}",
+                f"- sparse_stability_warning: {str(stability.get('sparse_stability_warning', False)).lower()}",
+                f"- paper_candidate_pass: {str(status.get('paper_candidate_pass', False)).lower()}",
+                "",
+            ]
+        )
+        warnings = item.get("stability_warnings") or []
+        if warnings:
+            lines.append("Stability warnings:")
+            for warning in warnings:
+                lines.append(f"- {warning}")
+            lines.append("")
+
+    output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    report["markdown_report_path"] = str(output_path)
+    return output_path
+
+
+def build_robustness_from_prior_reports(
+    *,
+    candidate_name: str,
+    reports_dir: Path,
+    config: dict[str, Any],
+) -> list[dict[str, Any]]:
+    """Fallback: treat prior candidate validation reports as rolling trend slices."""
+    reports = load_candidate_validation_reports(reports_dir=reports_dir)
+    matching = [item for item in reports if item.get("candidate_name") == candidate_name]
+    slice_results: list[dict[str, Any]] = []
+    for report in matching[-TREND_RUN_LIMIT:]:
+        stamp = str(report.get("run_timestamp") or "unknown")
+        slice_results.append(
+            build_slice_result_from_validation_report(
+                report,
+                slice_name=f"trend_{stamp}",
+            )
+        )
+    return slice_results
+
+
+def _resolve_total_rows(
+    *,
+    coin: str,
+    interval: str,
+    source: str,
+    data_root: Path,
+    total_rows: int | None,
+    data_loader=load_training_data,
+) -> int | None:
+    """Return available CSV row count, or None when data cannot be loaded."""
+    if total_rows is not None:
+        return total_rows
+    try:
+        frame = data_loader(coin, interval, data_root, source=source)
+    except (FileNotFoundError, ValueError, OSError):
+        return None
+    return len(frame)
+
+
+def run_robustness_validation(
+    *,
+    coin: str = DEFAULT_COIN,
+    interval: str = DEFAULT_INTERVAL,
+    horizon: int = DEFAULT_HORIZON,
+    min_confidence: float = DEFAULT_MIN_CONFIDENCE,
+    min_edge_bps: float = DEFAULT_MIN_EDGE_BPS,
+    cost_multiplier: float = DEFAULT_COST_MULTIPLIER,
+    max_spread_bps: float = DEFAULT_MAX_SPREAD_BPS,
+    min_trades_required: int = DEFAULT_MIN_TRADES_REQUIRED,
+    require_positive: bool = DEFAULT_REQUIRE_POSITIVE,
+    candidate_name: str = DEFAULT_CANDIDATE_NAME,
+    source: str = DEFAULT_SOURCE,
+    slice_modes: str = DEFAULT_SLICE_MODES,
+    data_root: Path = DEFAULT_DATA_ROOT,
+    walk_forward_reports_dir: Path = DEFAULT_WALK_FORWARD_REPORTS_DIR,
+    validation_reports_dir: Path = DEFAULT_VALIDATION_REPORTS_DIR,
+    run_timestamp: str | None = None,
+    total_rows: int | None = None,
+    walk_forward_runner=run_walk_forward_evaluation,
+    data_loader=load_training_data,
+) -> dict[str, Any]:
+    """Run rolling robustness validation across chronological data slices."""
+    timestamp = run_timestamp or _utc_now_iso()
+    modes = parse_slice_modes(slice_modes)
+    config = build_candidate_config(
+        coin=coin,
+        interval=interval,
+        horizon=horizon,
+        min_confidence=min_confidence,
+        min_edge_bps=min_edge_bps,
+        cost_multiplier=cost_multiplier,
+        max_spread_bps=max_spread_bps,
+        min_trades_required=min_trades_required,
+        require_positive=require_positive,
+        candidate_name=candidate_name,
+        source=source,
+    )
+
+    resolved_rows = _resolve_total_rows(
+        coin=config["coin"],
+        interval=config["interval"],
+        source=config["source"],
+        data_root=data_root,
+        total_rows=total_rows,
+        data_loader=data_loader,
+    )
+
+    slice_results: list[dict[str, Any]] = []
+    evaluation_mode = "data_slicing"
+
+    if resolved_rows is not None and resolved_rows > 0:
+        row_slices = build_row_slices(resolved_rows, modes)
+        for row_slice in row_slices:
+            sliced_runner = make_sliced_walk_forward_runner(
+                row_start=int(row_slice["row_start"]),
+                row_end=int(row_slice["row_end"]),
+                base_runner=walk_forward_runner,
+            )
+            walk_forward_report = sliced_runner(
+                coins=[config["coin"]],
+                interval=config["interval"],
+                source=config["source"],
+                horizon=config["horizon"],
+                feature_set=config["feature_set"],
+                label_mode=config["label_mode"],
+                trade_classes=frozenset(config["trade_classes"]),
+                min_confidence=config["min_confidence"],
+                min_edge_bps=config["min_edge_bps"],
+                cost_multiplier=config["cost_multiplier"],
+                max_spread_bps=config["max_spread_bps"],
+                fee_bps=config["fee_bps"],
+                slippage_bps=config["slippage_bps"],
+                data_root=data_root,
+                reports_dir=walk_forward_reports_dir,
+                save_reports=False,
+                save_accepted_trades=False,
+                stability_report_enabled=config["stability_report"],
+            )
+            slice_results.append(
+                build_slice_validation_result(
+                    walk_forward_report,
+                    config=config,
+                    slice_name=str(row_slice["slice_name"]),
+                    slice_meta=row_slice,
+                )
+            )
+    else:
+        evaluation_mode = "trend_fallback"
+        slice_results = build_robustness_from_prior_reports(
+            candidate_name=candidate_name,
+            reports_dir=validation_reports_dir,
+            config=config,
+        )
+
+    report = build_robustness_report(
+        candidate_name=candidate_name,
+        run_timestamp=timestamp,
+        config=config,
+        slice_results=slice_results,
+        slice_modes=modes,
+        evaluation_mode=evaluation_mode,
+    )
+    write_robustness_json(report, reports_dir=validation_reports_dir)
+    write_robustness_markdown(report, reports_dir=validation_reports_dir)
+    return report
+
+
 def _validation_report_sort_key(report: dict[str, Any]) -> str:
     return str(report.get("run_timestamp") or report.get("json_report_path") or "")
 
@@ -721,6 +1229,21 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Directory containing candidate validation JSON reports",
     )
 
+    robustness_parser = subparsers.add_parser(
+        "robustness",
+        help="Run rolling robustness validation across chronological data slices",
+    )
+    _add_run_arguments(robustness_parser)
+    robustness_parser.add_argument(
+        "--slices",
+        default=DEFAULT_SLICE_MODES,
+        help=(
+            "Comma-separated slice modes "
+            f"(default: {DEFAULT_SLICE_MODES}; choices: {', '.join(SLICE_MODE_CHOICES)})"
+        ),
+    )
+    robustness_parser.set_defaults(walk_forward_reports_dir=DEFAULT_WALK_FORWARD_REPORTS_DIR)
+
     launchd_parser = subparsers.add_parser(
         "write-launchd-template",
         help="Write daily launchd plist template for candidate validation (does not install)",
@@ -821,6 +1344,37 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "summarize":
         print(summarize_candidate_validation_reports(reports_dir=args.reports_dir))
+        return 0
+
+    if args.command == "robustness":
+        report = run_robustness_validation(
+            coin=args.coin,
+            interval=args.interval,
+            horizon=args.horizon,
+            min_confidence=args.min_confidence,
+            min_edge_bps=args.min_edge_bps,
+            cost_multiplier=args.cost_multiplier,
+            max_spread_bps=args.max_spread_bps,
+            min_trades_required=args.min_trades_required,
+            require_positive=args.require_positive,
+            candidate_name=args.candidate_name,
+            source=args.source,
+            slice_modes=args.slices,
+            data_root=args.data_root,
+            walk_forward_reports_dir=args.walk_forward_reports_dir,
+            validation_reports_dir=args.reports_dir,
+        )
+        summary = report.get("robustness_summary") or {}
+        print(
+            f"candidate={report.get('candidate_name')} "
+            f"slices_tested={summary.get('slices_tested', 0)} "
+            f"robustness_pass={summary.get('robustness_pass')} "
+            f"evaluation_mode={report.get('evaluation_mode')}"
+        )
+        if report.get("json_report_path"):
+            print(f"json_report_path={report['json_report_path']}")
+        if report.get("markdown_report_path"):
+            print(f"markdown_report_path={report['markdown_report_path']}")
         return 0
 
     if args.command == "write-launchd-template":

@@ -13,20 +13,29 @@ from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_
 from bid_ask_candidate_validator import (
     DEFAULT_CANDIDATE_NAME,
     DEFAULT_LAUNCHD_LABEL,
+    DEFAULT_SLICE_MODES,
     DEFAULT_SOURCE,
     DEFAULT_VALIDATION_REPORTS_DIR,
     LAUNCHD_SETUP_MD,
+    ROBUSTNESS_REPORT_PREFIX,
     _build_arg_parser,
     build_candidate_config,
     build_candidate_validation_report,
+    build_robustness_from_prior_reports,
+    build_row_slices,
     cmd_write_launchd_template,
+    compute_robustness_summary,
     compute_validation_status,
     load_candidate_validation_reports,
     main,
+    parse_slice_modes,
     run_candidate_validation,
+    run_robustness_validation,
     summarize_candidate_validation_reports,
     write_candidate_validation_json,
     write_candidate_validation_markdown,
+    write_robustness_json,
+    write_robustness_markdown,
 )
 
 VALIDATOR_FILE = Path(__file__).resolve().parent.parent / "bid_ask_candidate_validator.py"
@@ -381,6 +390,240 @@ class TestSafety:
         assert PAPER_ONLY is True
         assert EXECUTION_ENABLED is False
         assert DEFAULT_VALIDATION_REPORTS_DIR == Path("reports/bid_ask_candidate_validation")
+
+
+class TestRobustnessValidation:
+    def _run_with_mock_slices(
+        self,
+        tmp_path: Path,
+        mock_runner,
+        *,
+        slice_modes: str = "recent_halves",
+        total_rows: int = 1000,
+    ) -> dict[str, Any]:
+        return run_robustness_validation(
+            validation_reports_dir=tmp_path / "validation",
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            run_timestamp="2026-07-03T09:00:00Z",
+            slice_modes=slice_modes,
+            total_rows=total_rows,
+            walk_forward_runner=mock_runner,
+        )
+
+    def test_robustness_writes_json_and_markdown(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        report = self._run_with_mock_slices(tmp_path, mock_runner, slice_modes="recent_halves")
+
+        mock_runner.assert_called()
+        assert report["json_report_path"]
+        assert report["markdown_report_path"]
+        assert Path(report["json_report_path"]).is_file()
+        assert Path(report["markdown_report_path"]).is_file()
+        assert ROBUSTNESS_REPORT_PREFIX in Path(report["json_report_path"]).name
+        assert DEFAULT_CANDIDATE_NAME in Path(report["json_report_path"]).name
+
+        payload = json.loads(Path(report["json_report_path"]).read_text(encoding="utf-8"))
+        assert payload["evaluation_mode"] == "data_slicing"
+        assert len(payload["slices"]) == 2
+        assert payload["paper_only"] is True
+        assert payload["execution_enabled"] is False
+        assert payload["real_execution_ready"] is False
+
+    def test_robustness_pass_false_when_any_slice_negative(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(
+            side_effect=[
+                _mock_walk_forward_report(positive_after_costs=True),
+                _mock_walk_forward_report(positive_after_costs=False, cumulative_net_return_bps=-1.0),
+            ]
+        )
+        report = self._run_with_mock_slices(tmp_path, mock_runner, slice_modes="recent_halves")
+        assert report["robustness_pass"] is False
+        assert report["not_market_ready"] is True
+
+    def test_robustness_pass_false_when_insufficient_trades(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(
+            side_effect=[
+                _mock_walk_forward_report(filtered_paper_trades=25),
+                _mock_walk_forward_report(filtered_paper_trades=5),
+            ]
+        )
+        report = self._run_with_mock_slices(tmp_path, mock_runner, slice_modes="recent_halves")
+        assert report["robustness_pass"] is False
+        summary = report["robustness_summary"]
+        assert summary["slices_with_enough_trades"] == 1
+
+    def test_robustness_pass_false_when_stability_warnings(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(
+            side_effect=[
+                _mock_walk_forward_report(),
+                _mock_walk_forward_report(
+                    stability_summary={
+                        "concentration_warning": True,
+                        "sparse_stability_warning": False,
+                    },
+                    stability_warnings=["concentrated returns"],
+                ),
+            ]
+        )
+        report = self._run_with_mock_slices(tmp_path, mock_runner, slice_modes="recent_halves")
+        assert report["robustness_pass"] is False
+        summary = report["robustness_summary"]
+        assert summary["slices_without_stability_warnings"] == 1
+
+    def test_robustness_pass_true_when_all_slices_pass(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        report = self._run_with_mock_slices(
+            tmp_path,
+            mock_runner,
+            slice_modes="recent_halves,recent_thirds",
+            total_rows=900,
+        )
+        assert report["robustness_pass"] is True
+        assert report["not_market_ready"] is False
+        summary = report["robustness_summary"]
+        assert summary["slices_tested"] == 5
+        assert summary["slices_positive_after_costs"] == 5
+        assert summary["slices_beating_baseline"] == 5
+        assert summary["slices_with_enough_trades"] == 5
+        assert summary["slices_without_stability_warnings"] == 5
+
+    def test_robustness_handles_no_prior_reports_fallback(self, tmp_path: Path) -> None:
+        def missing_data_loader(*_args, **_kwargs):
+            raise FileNotFoundError("missing csv")
+
+        report = run_robustness_validation(
+            validation_reports_dir=tmp_path / "validation",
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            run_timestamp="2026-07-03T09:00:00Z",
+            slice_modes="recent_halves",
+            data_loader=missing_data_loader,
+        )
+        assert report["evaluation_mode"] == "trend_fallback"
+        assert report["slices"] == []
+        assert report["robustness_pass"] is False
+        assert report["robustness_summary"]["slices_tested"] == 0
+
+    def test_trend_fallback_uses_prior_reports(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        reports_dir.mkdir(parents=True)
+        for stamp in ("2026-07-01T08:00:00Z", "2026-07-02T08:00:00Z"):
+            prior = build_candidate_validation_report(
+                _mock_walk_forward_report(),
+                config=_passing_config(),
+                run_timestamp=stamp,
+            )
+            write_candidate_validation_json(prior, reports_dir=reports_dir)
+
+        def missing_data_loader(*_args, **_kwargs):
+            raise FileNotFoundError("missing csv")
+
+        report = run_robustness_validation(
+            validation_reports_dir=reports_dir,
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            run_timestamp="2026-07-03T09:00:00Z",
+            slice_modes="recent_halves",
+            data_loader=missing_data_loader,
+        )
+        assert report["evaluation_mode"] == "trend_fallback"
+        assert len(report["slices"]) == 2
+        assert report["robustness_pass"] is True
+
+    def test_slice_modes_and_row_slices(self) -> None:
+        modes = parse_slice_modes(DEFAULT_SLICE_MODES)
+        assert modes == ["recent_halves", "recent_thirds", "expanding"]
+        slices = build_row_slices(900, modes)
+        assert len(slices) == 7
+        names = {item["slice_name"] for item in slices}
+        assert "half_first" in names
+        assert "third_last" in names
+        assert "expand_100" in names
+        row_ranges = {(item["row_start"], item["row_end"]) for item in slices}
+        assert len(row_ranges) == len(slices)
+
+    def test_compute_robustness_summary_requires_all_slices(self) -> None:
+        passing = {
+            "positive_after_costs": True,
+            "beats_baseline_accuracy": True,
+            "validation_status": {
+                "insufficient_trades": False,
+                "unstable_concentrated": False,
+                "unstable_sparse": False,
+            },
+        }
+        assert compute_robustness_summary([passing, passing])["robustness_pass"] is True
+        failing = dict(passing)
+        failing["beats_baseline_accuracy"] = False
+        assert compute_robustness_summary([passing, failing])["robustness_pass"] is False
+
+    def test_cli_robustness_defaults(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["robustness"])
+        assert args.source == "historical"
+        assert args.slices == DEFAULT_SLICE_MODES
+
+    def test_main_robustness_command(self, tmp_path: Path, monkeypatch) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_run_robustness_validation(**kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            report = {
+                "candidate_name": DEFAULT_CANDIDATE_NAME,
+                "evaluation_mode": "data_slicing",
+                "robustness_summary": {"slices_tested": 2, "robustness_pass": True},
+            }
+            write_robustness_json(
+                {
+                    **report,
+                    "run_timestamp": "2026-07-03T09:00:00Z",
+                    "config": build_candidate_config(),
+                    "slice_modes": ["recent_halves"],
+                    "slices": [],
+                    "robustness_pass": True,
+                    "not_market_ready": False,
+                    "paper_only": True,
+                    "execution_enabled": False,
+                    "real_execution_ready": False,
+                },
+                reports_dir=kwargs["validation_reports_dir"],
+            )
+            return report
+
+        monkeypatch.setattr(
+            "bid_ask_candidate_validator.run_robustness_validation",
+            fake_run_robustness_validation,
+        )
+        exit_code = main(
+            [
+                "robustness",
+                "--source",
+                "historical",
+                "--slices",
+                "recent_halves",
+                "--reports-dir",
+                str(tmp_path / "validation"),
+                "--data-root",
+                str(tmp_path / "data"),
+            ]
+        )
+        assert exit_code == 0
+        assert captured["source"] == "historical"
+        assert captured["slice_modes"] == "recent_halves"
+
+    def test_build_robustness_from_prior_reports_filters_candidate(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        reports_dir.mkdir(parents=True)
+        other = build_candidate_validation_report(
+            _mock_walk_forward_report(),
+            config=_passing_config(candidate_name="OTHER"),
+            run_timestamp="2026-07-01T08:00:00Z",
+        )
+        write_candidate_validation_json(other, reports_dir=reports_dir)
+        slices = build_robustness_from_prior_reports(
+            candidate_name=DEFAULT_CANDIDATE_NAME,
+            reports_dir=reports_dir,
+            config=_passing_config(),
+        )
+        assert slices == []
 
 
 class TestReportWriters:
