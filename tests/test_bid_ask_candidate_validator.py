@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import pytest
 from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
@@ -11,11 +12,14 @@ from unittest.mock import MagicMock
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 from bid_ask_candidate_validator import (
     DEFAULT_CANDIDATE_NAME,
+    DEFAULT_SOURCE,
     DEFAULT_VALIDATION_REPORTS_DIR,
+    _build_arg_parser,
     build_candidate_config,
     build_candidate_validation_report,
     compute_validation_status,
     load_candidate_validation_reports,
+    main,
     run_candidate_validation,
     summarize_candidate_validation_reports,
     write_candidate_validation_json,
@@ -93,6 +97,121 @@ class TestRunWritesReports:
         assert payload["paper_only"] is True
         assert payload["execution_enabled"] is False
         assert payload["real_execution_ready"] is False
+
+
+class TestSource:
+    def test_build_candidate_config_defaults_to_historical(self) -> None:
+        config = build_candidate_config()
+        assert config["source"] == "historical"
+        assert DEFAULT_SOURCE == "historical"
+
+    def test_default_run_passes_historical_to_evaluator(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        run_candidate_validation(
+            validation_reports_dir=tmp_path / "validation",
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            walk_forward_runner=mock_runner,
+        )
+        mock_runner.assert_called_once()
+        assert mock_runner.call_args.kwargs["source"] == "historical"
+
+    def test_run_passes_combined_source_to_evaluator(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        run_candidate_validation(
+            source="combined",
+            validation_reports_dir=tmp_path / "validation",
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            walk_forward_runner=mock_runner,
+        )
+        assert mock_runner.call_args.kwargs["source"] == "combined"
+
+    def test_run_passes_local_source_to_evaluator(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        run_candidate_validation(
+            source="local",
+            validation_reports_dir=tmp_path / "validation",
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            walk_forward_runner=mock_runner,
+        )
+        assert mock_runner.call_args.kwargs["source"] == "local"
+
+    def test_cli_default_source_is_historical(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["run"])
+        assert args.source == "historical"
+
+    def test_cli_accepts_combined_source(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["run", "--source", "combined"])
+        assert args.source == "combined"
+
+    def test_cli_accepts_local_source(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["run", "--source", "local"])
+        assert args.source == "local"
+
+    def test_cli_rejects_invalid_source(self) -> None:
+        parser = _build_arg_parser()
+        with pytest.raises(SystemExit):
+            parser.parse_args(["run", "--source", "invalid"])
+
+    def test_json_report_config_includes_source(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        report = run_candidate_validation(
+            source="historical",
+            validation_reports_dir=tmp_path / "validation",
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            run_timestamp="2026-07-03T08:00:00Z",
+            walk_forward_runner=mock_runner,
+        )
+        payload = json.loads(Path(report["json_report_path"]).read_text(encoding="utf-8"))
+        assert payload["config"]["source"] == "historical"
+
+    def test_main_run_passes_source_to_evaluator(self, tmp_path: Path, monkeypatch) -> None:
+        captured: dict[str, Any] = {}
+
+        def fake_run_candidate_validation(**kwargs: Any) -> dict[str, Any]:
+            captured.update(kwargs)
+            report = build_candidate_validation_report(
+                _mock_walk_forward_report(),
+                config=build_candidate_config(source=kwargs["source"]),
+                run_timestamp="2026-07-03T08:00:00Z",
+            )
+            write_candidate_validation_json(report, reports_dir=kwargs["validation_reports_dir"])
+            write_candidate_validation_markdown(report, reports_dir=kwargs["validation_reports_dir"])
+            return report
+
+        monkeypatch.setattr(
+            "bid_ask_candidate_validator.run_candidate_validation",
+            fake_run_candidate_validation,
+        )
+        exit_code = main(
+            [
+                "run",
+                "--source",
+                "historical",
+                "--data-root",
+                str(tmp_path / "data"),
+                "--reports-dir",
+                str(tmp_path / "validation"),
+                "--walk-forward-reports-dir",
+                str(tmp_path / "walk_forward"),
+            ]
+        )
+        assert exit_code == 0
+        assert captured["source"] == "historical"
+
+    def test_safety_flags_remain_paper_only_with_source(self, tmp_path: Path) -> None:
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        report = run_candidate_validation(
+            source="historical",
+            validation_reports_dir=tmp_path / "validation",
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            walk_forward_runner=mock_runner,
+        )
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
 
 
 class TestValidationStatusLogic:
@@ -201,10 +320,12 @@ class TestSummarize:
         summary = summarize_candidate_validation_reports(reports_dir=reports_dir)
         assert "Latest report:" in summary
         assert "2026-07-03T08:00:00Z" in summary
+        assert "- source: historical" in summary
         assert "Best cumulative_net_return_bps:" in summary
         assert "3.0000" in summary
         assert "Passes:" in summary
         assert "Trend (last 3 runs):" in summary
+        assert "timestamp | source | trades" in summary
         assert "paper_candidate_pass" in summary
         assert "not_market_ready" in summary
 
@@ -270,6 +391,7 @@ class TestReportWriters:
         text = path.read_text(encoding="utf-8")
         assert "Validation Status" in text
         assert "paper_candidate_pass" in text
+        assert "- source: historical" in text
 
     def test_load_reports_sorted_by_timestamp(self, tmp_path: Path) -> None:
         reports_dir = tmp_path / "validation"

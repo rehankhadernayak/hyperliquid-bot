@@ -40,7 +40,8 @@ DEFAULT_COST_MULTIPLIER = 1.25
 DEFAULT_MAX_SPREAD_BPS = 8.0
 DEFAULT_FEE_BPS_CANDIDATE = 2.0
 DEFAULT_SLIPPAGE_BPS_CANDIDATE = 1.0
-DEFAULT_SOURCE = "combined"
+DEFAULT_SOURCE = "historical"
+SOURCE_CHOICES = ("historical", "combined", "local")
 DEFAULT_MIN_TRADES_REQUIRED = 20
 DEFAULT_REQUIRE_POSITIVE = True
 TREND_RUN_LIMIT = 10
@@ -80,6 +81,7 @@ def build_candidate_config(
     min_trades_required: int = DEFAULT_MIN_TRADES_REQUIRED,
     require_positive: bool = DEFAULT_REQUIRE_POSITIVE,
     candidate_name: str = DEFAULT_CANDIDATE_NAME,
+    source: str = DEFAULT_SOURCE,
 ) -> dict[str, Any]:
     """Return the fixed candidate configuration used for validation runs."""
     return {
@@ -97,7 +99,7 @@ def build_candidate_config(
         "fee_bps": DEFAULT_FEE_BPS_CANDIDATE,
         "slippage_bps": DEFAULT_SLIPPAGE_BPS_CANDIDATE,
         "stability_report": True,
-        "source": DEFAULT_SOURCE,
+        "source": source,
         "min_trades_required": min_trades_required,
         "require_positive": require_positive,
     }
@@ -330,6 +332,7 @@ def run_candidate_validation(
     min_trades_required: int = DEFAULT_MIN_TRADES_REQUIRED,
     require_positive: bool = DEFAULT_REQUIRE_POSITIVE,
     candidate_name: str = DEFAULT_CANDIDATE_NAME,
+    source: str = DEFAULT_SOURCE,
     data_root: Path = DEFAULT_DATA_ROOT,
     walk_forward_reports_dir: Path = DEFAULT_WALK_FORWARD_REPORTS_DIR,
     validation_reports_dir: Path = DEFAULT_VALIDATION_REPORTS_DIR,
@@ -349,6 +352,7 @@ def run_candidate_validation(
         min_trades_required=min_trades_required,
         require_positive=require_positive,
         candidate_name=candidate_name,
+        source=source,
     )
 
     walk_forward_report = walk_forward_runner(
@@ -435,6 +439,7 @@ def summarize_candidate_validation_reports(
         "Latest report:",
         f"- candidate_name: {latest.get('candidate_name')}",
         f"- run_timestamp: {latest.get('run_timestamp')}",
+        f"- source: {(latest.get('config') or {}).get('source', 'n/a')}",
         f"- filtered_paper_trades: {latest.get('filtered_paper_trades')}",
         f"- cumulative_net_return_bps: {latest.get('cumulative_net_return_bps', 0.0):.4f}",
         f"- average_net_return_bps: {latest.get('average_net_return_bps', 0.0):.4f}",
@@ -449,12 +454,14 @@ def summarize_candidate_validation_reports(
         f"Passes: {passes} | Fails: {fails}",
         "",
         f"Trend (last {len(trend_reports)} runs):",
-        "timestamp | trades | cumulative_net | avg_net | win_rate | accuracy_edge | status",
+        "timestamp | source | trades | cumulative_net | avg_net | win_rate | accuracy_edge | status",
     ]
 
     for item in trend_reports:
+        item_source = (item.get("config") or {}).get("source", "n/a")
         lines.append(
             f"{item.get('run_timestamp')} | "
+            f"{item_source} | "
             f"{item.get('filtered_paper_trades', 0)} | "
             f"{float(item.get('cumulative_net_return_bps', 0.0)):.4f} | "
             f"{float(item.get('average_net_return_bps', 0.0)):.4f} | "
@@ -521,6 +528,12 @@ def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
         help=f"Candidate label (default: {DEFAULT_CANDIDATE_NAME})",
     )
     parser.add_argument(
+        "--source",
+        choices=SOURCE_CHOICES,
+        default=DEFAULT_SOURCE,
+        help=f"Bid/ask CSV source (default: {DEFAULT_SOURCE})",
+    )
+    parser.add_argument(
         "--data-root",
         type=Path,
         default=DEFAULT_DATA_ROOT,
@@ -584,6 +597,7 @@ def main(argv: list[str] | None = None) -> int:
             min_trades_required=args.min_trades_required,
             require_positive=args.require_positive,
             candidate_name=args.candidate_name,
+            source=args.source,
             data_root=args.data_root,
             walk_forward_reports_dir=args.walk_forward_reports_dir,
             validation_reports_dir=args.reports_dir,
