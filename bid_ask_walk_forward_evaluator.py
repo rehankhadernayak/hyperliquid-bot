@@ -63,6 +63,8 @@ DEFAULT_LABEL_MIN_EDGE_BPS = 0.0
 DEFAULT_TRADE_CLASSES = frozenset({"UP", "DOWN"})
 DEFAULT_DIAGNOSTICS_DETAIL = "basic"
 DEFAULT_ACCEPTED_TRADES_LIMIT = 1000
+DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET = 3
+STABILITY_CONCENTRATION_FRACTION = 0.70
 
 SUPPORTED_LABEL_MODES = frozenset({"direction", "cost_aware"})
 SUPPORTED_FEATURE_SETS = frozenset({"basic", "microstructure"})
@@ -1044,6 +1046,289 @@ def aggregate_coin_class_trade_diagnostics(
     }
 
 
+def empty_stability_bucket_metrics() -> dict[str, Any]:
+    """Return zeroed stability metrics for one diagnostic bucket."""
+    return {
+        "trades": 0,
+        "cumulative_net_return_bps": 0.0,
+        "average_net_return_bps": 0.0,
+        "win_rate_after_costs": 0.0,
+        "average_cost_bps": 0.0,
+        "average_confidence": 0.0,
+        "positive_after_costs": False,
+    }
+
+
+def aggregate_stability_bucket_metrics(
+    records: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """Compute stability metrics for one bucket of accepted paper trades."""
+    if not records:
+        return empty_stability_bucket_metrics()
+
+    net_returns = [float(record["net_return_bps"]) for record in records]
+    costs = [float(record["cost_bps"]) for record in records]
+    confidences = [float(record["confidence"]) for record in records]
+    trades = len(records)
+    cumulative_net_return_bps = float(sum(net_returns))
+    wins = sum(1 for value in net_returns if value > 0)
+    return {
+        "trades": trades,
+        "cumulative_net_return_bps": cumulative_net_return_bps,
+        "average_net_return_bps": cumulative_net_return_bps / trades,
+        "win_rate_after_costs": wins / trades,
+        "average_cost_bps": float(np.mean(costs)),
+        "average_confidence": float(np.mean(confidences)),
+        "positive_after_costs": cumulative_net_return_bps > 0,
+    }
+
+
+def _parse_timestamp_iso(value: object) -> datetime | None:
+    """Parse timestamp_iso safely without external dependencies."""
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    try:
+        if text.endswith("Z"):
+            text = text[:-1] + "+00:00"
+        return datetime.fromisoformat(text)
+    except ValueError:
+        return None
+
+
+def _stability_group_records(
+    accepted_trade_records: list[dict[str, Any]],
+    *,
+    key_fn: Any,
+) -> dict[str, list[dict[str, Any]]]:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in accepted_trade_records:
+        key = key_fn(record)
+        if key is None:
+            continue
+        grouped.setdefault(str(key), []).append(record)
+    return grouped
+
+
+def compute_stability_diagnostics(
+    accepted_trade_records: list[dict[str, Any]],
+    *,
+    coins: list[str] | None = None,
+) -> dict[str, dict[str, dict[str, Any]]]:
+    """Compute stability diagnostics grouped by coin, class, time, and window."""
+    by_coin = _stability_group_records(
+        accepted_trade_records,
+        key_fn=lambda record: str(record.get("coin", "UNKNOWN")).upper(),
+    )
+    if coins:
+        for coin in sorted({value.upper() for value in coins}):
+            by_coin.setdefault(coin, [])
+
+    by_predicted_class = _stability_group_records(
+        accepted_trade_records,
+        key_fn=lambda record: _normalize_predicted_class(record.get("predicted_class", "FLAT")),
+    )
+    for label in LABELS:
+        by_predicted_class.setdefault(label, [])
+
+    by_coin_predicted_class = _stability_group_records(
+        accepted_trade_records,
+        key_fn=lambda record: (
+            f"{str(record.get('coin', 'UNKNOWN')).upper()}:"
+            f"{_normalize_predicted_class(record.get('predicted_class', 'FLAT'))}"
+        ),
+    )
+
+    by_hour = _stability_group_records(
+        accepted_trade_records,
+        key_fn=lambda record: (
+            f"{parsed.hour:02d}"
+            if (parsed := _parse_timestamp_iso(record.get("timestamp_iso"))) is not None
+            else None
+        ),
+    )
+    by_date = _stability_group_records(
+        accepted_trade_records,
+        key_fn=lambda record: (
+            parsed.date().isoformat()
+            if (parsed := _parse_timestamp_iso(record.get("timestamp_iso"))) is not None
+            else None
+        ),
+    )
+    by_window_index = _stability_group_records(
+        accepted_trade_records,
+        key_fn=lambda record: (
+            str(record["window_index"])
+            if record.get("window_index") is not None
+            else None
+        ),
+    )
+
+    def _metrics_map(grouped: dict[str, list[dict[str, Any]]]) -> dict[str, dict[str, Any]]:
+        return {
+            key: aggregate_stability_bucket_metrics(records)
+            for key, records in sorted(grouped.items())
+        }
+
+    return {
+        "by_coin": _metrics_map(by_coin),
+        "by_predicted_class": _metrics_map(by_predicted_class),
+        "by_coin_predicted_class": _metrics_map(by_coin_predicted_class),
+        "by_hour": _metrics_map(by_hour),
+        "by_date": _metrics_map(by_date),
+        "by_window_index": _metrics_map(by_window_index),
+    }
+
+
+def _iter_stability_buckets(
+    stability_diagnostics: dict[str, dict[str, dict[str, Any]]],
+) -> list[tuple[str, str, dict[str, Any]]]:
+    buckets: list[tuple[str, str, dict[str, Any]]] = []
+    for group_name, group in stability_diagnostics.items():
+        for bucket_key, metrics in group.items():
+            buckets.append((group_name, bucket_key, metrics))
+    return buckets
+
+
+def _dimension_has_concentration(
+    group: dict[str, dict[str, Any]],
+    *,
+    concentration_fraction: float = STABILITY_CONCENTRATION_FRACTION,
+) -> bool:
+    positive_values = [
+        float(metrics["cumulative_net_return_bps"])
+        for metrics in group.values()
+        if metrics.get("trades", 0) > 0
+        and float(metrics.get("cumulative_net_return_bps", 0.0)) > 0
+    ]
+    if not positive_values:
+        return False
+    total_positive = float(sum(positive_values))
+    if total_positive <= 0:
+        return False
+    largest_positive = max(positive_values)
+    return largest_positive / total_positive > concentration_fraction
+
+
+def compute_stability_summary(
+    stability_diagnostics: dict[str, dict[str, dict[str, Any]]],
+    *,
+    min_trades_per_bucket: int,
+) -> dict[str, Any]:
+    """Summarize stability diagnostics across all buckets."""
+    buckets = _iter_stability_buckets(stability_diagnostics)
+    active_buckets = [
+        metrics for _, _, metrics in buckets if int(metrics.get("trades", 0)) > 0
+    ]
+
+    if not active_buckets:
+        return {
+            "profitable_bucket_fraction": 0.0,
+            "unprofitable_bucket_fraction": 0.0,
+            "buckets_with_too_few_trades": 0,
+            "largest_positive_bucket_net_bps": 0.0,
+            "largest_negative_bucket_net_bps": 0.0,
+            "concentration_warning": False,
+            "sparse_stability_warning": False,
+        }
+
+    profitable = sum(1 for metrics in active_buckets if metrics.get("positive_after_costs"))
+    total_active = len(active_buckets)
+    sparse_buckets = sum(
+        1
+        for metrics in active_buckets
+        if 0 < int(metrics.get("trades", 0)) < min_trades_per_bucket
+    )
+    cumulative_values = [
+        float(metrics.get("cumulative_net_return_bps", 0.0)) for metrics in active_buckets
+    ]
+    positive_values = [value for value in cumulative_values if value > 0]
+    negative_values = [value for value in cumulative_values if value < 0]
+
+    concentration_groups = ("by_hour", "by_date", "by_window_index")
+    concentration_warning = any(
+        _dimension_has_concentration(stability_diagnostics.get(group_name, {}))
+        for group_name in concentration_groups
+        if stability_diagnostics.get(group_name)
+    )
+
+    return {
+        "profitable_bucket_fraction": profitable / total_active,
+        "unprofitable_bucket_fraction": (total_active - profitable) / total_active,
+        "buckets_with_too_few_trades": sparse_buckets,
+        "largest_positive_bucket_net_bps": max(positive_values) if positive_values else 0.0,
+        "largest_negative_bucket_net_bps": min(negative_values) if negative_values else 0.0,
+        "concentration_warning": concentration_warning,
+        "sparse_stability_warning": sparse_buckets > 0,
+    }
+
+
+def build_stability_warnings(
+    stability_summary: dict[str, Any],
+    *,
+    min_trades_per_bucket: int,
+) -> list[str]:
+    """Build human-readable stability warnings from summary metrics."""
+    warnings: list[str] = []
+    if stability_summary.get("concentration_warning"):
+        warnings.append(
+            "stability_concentration: one time/window bucket contributes more than "
+            f"{STABILITY_CONCENTRATION_FRACTION:.0%} of total positive net bps"
+        )
+    if stability_summary.get("sparse_stability_warning"):
+        warnings.append(
+            "stability_sparse_buckets: "
+            f"{stability_summary.get('buckets_with_too_few_trades', 0)} bucket(s) have "
+            f"fewer than {min_trades_per_bucket} trades"
+        )
+    return warnings
+
+
+def apply_stability_readiness(
+    readiness: dict[str, bool],
+    stability_summary: dict[str, Any],
+) -> dict[str, bool]:
+    """Adjust readiness when stability validation fails."""
+    updated = dict(readiness)
+    if stability_summary.get("concentration_warning") or stability_summary.get(
+        "sparse_stability_warning"
+    ):
+        updated["ready_for_more_research"] = False
+    updated["real_execution_ready"] = False
+    return updated
+
+
+def _format_stability_bucket_lines(
+    *,
+    heading: str,
+    buckets: dict[str, dict[str, Any]],
+) -> list[str]:
+    lines = [heading, ""]
+    if not buckets:
+        lines.append("- no buckets")
+        lines.append("")
+        return lines
+
+    for bucket_key, metrics in sorted(buckets.items()):
+        lines.extend(
+            [
+                f"### {bucket_key}",
+                "",
+                f"- trades: {metrics.get('trades', 0)}",
+                f"- cumulative_net_return_bps: {metrics.get('cumulative_net_return_bps', 0.0):.4f}",
+                f"- average_net_return_bps: {metrics.get('average_net_return_bps', 0.0):.4f}",
+                f"- win_rate_after_costs: {metrics.get('win_rate_after_costs', 0.0):.4f}",
+                f"- average_cost_bps: {metrics.get('average_cost_bps', 0.0):.4f}",
+                f"- average_confidence: {metrics.get('average_confidence', 0.0):.4f}",
+                f"- positive_after_costs: {str(metrics.get('positive_after_costs', False)).lower()}",
+                "",
+            ]
+        )
+    return lines
+
+
 def simulate_paper_signal_returns(
     test_df: pd.DataFrame,
     predictions: list[str],
@@ -1926,6 +2211,8 @@ def build_walk_forward_report(
     feature_columns: tuple[str, ...] | None = None,
     skipped_microstructure_features: list[str] | None = None,
     feature_warning: str | None = None,
+    stability_report_enabled: bool = False,
+    stability_min_trades_per_bucket: int = DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
 ) -> dict[str, Any]:
     """Aggregate per-coin walk-forward results into one combined report."""
     normalized_source = normalize_source(source)
@@ -2035,6 +2322,25 @@ def build_walk_forward_report(
         min_trades=min_trades,
     )
 
+    stability_diagnostics: dict[str, dict[str, dict[str, Any]]] | None = None
+    stability_summary: dict[str, Any] | None = None
+    stability_warnings: list[str] = []
+    if stability_report_enabled:
+        stability_diagnostics = compute_stability_diagnostics(
+            accepted_trade_records,
+            coins=coins,
+        )
+        stability_summary = compute_stability_summary(
+            stability_diagnostics,
+            min_trades_per_bucket=stability_min_trades_per_bucket,
+        )
+        stability_warnings = build_stability_warnings(
+            stability_summary,
+            min_trades_per_bucket=stability_min_trades_per_bucket,
+        )
+        readiness = apply_stability_readiness(readiness, stability_summary)
+        warnings.extend(stability_warnings)
+
     per_coin_summary = {
         item["coin"]: {
             "status": item.get("status"),
@@ -2083,7 +2389,7 @@ def build_walk_forward_report(
     if feature_warning:
         feature_metadata["feature_warning"] = feature_warning
 
-    return {
+    report: dict[str, Any] = {
         "report_id": uuid.uuid4().hex,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "coins": coins,
@@ -2159,6 +2465,17 @@ def build_walk_forward_report(
         "safety_note": SAFETY_NOTE,
         **feature_metadata,
     }
+
+    report["stability_report_enabled"] = stability_report_enabled
+    if stability_report_enabled and stability_diagnostics is not None and stability_summary is not None:
+        report["stability_min_trades_per_bucket"] = stability_min_trades_per_bucket
+        report["stability_diagnostics"] = stability_diagnostics
+        report["stability_summary"] = stability_summary
+        report["stability_warnings"] = stability_warnings
+        report.update(readiness)
+        report["readiness"] = readiness
+
+    return report
 
 
 def _report_stamp(report: dict[str, Any]) -> str:
@@ -2360,6 +2677,56 @@ def write_walk_forward_markdown(
             )
         )
 
+    if report.get("stability_report_enabled"):
+        stability_summary = report.get("stability_summary", {})
+        lines.extend(
+            [
+                "",
+                "## Stability Validation",
+                "",
+                f"- stability_report_enabled: true",
+                f"- stability_min_trades_per_bucket: "
+                f"{report.get('stability_min_trades_per_bucket', DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET)}",
+                f"- profitable_bucket_fraction: "
+                f"{stability_summary.get('profitable_bucket_fraction', 0.0):.4f}",
+                f"- unprofitable_bucket_fraction: "
+                f"{stability_summary.get('unprofitable_bucket_fraction', 0.0):.4f}",
+                f"- buckets_with_too_few_trades: "
+                f"{stability_summary.get('buckets_with_too_few_trades', 0)}",
+                f"- largest_positive_bucket_net_bps: "
+                f"{stability_summary.get('largest_positive_bucket_net_bps', 0.0):.4f}",
+                f"- largest_negative_bucket_net_bps: "
+                f"{stability_summary.get('largest_negative_bucket_net_bps', 0.0):.4f}",
+                f"- concentration_warning: "
+                f"{str(stability_summary.get('concentration_warning', False)).lower()}",
+                f"- sparse_stability_warning: "
+                f"{str(stability_summary.get('sparse_stability_warning', False)).lower()}",
+            ]
+        )
+        stability_warnings = report.get("stability_warnings", [])
+        lines.extend(["", "### Stability warnings", ""])
+        if stability_warnings:
+            for warning in stability_warnings:
+                lines.append(f"- {warning}")
+        else:
+            lines.append("- none")
+
+        stability_diagnostics = report.get("stability_diagnostics", {})
+        for group_name in (
+            "by_coin",
+            "by_predicted_class",
+            "by_coin_predicted_class",
+            "by_hour",
+            "by_date",
+            "by_window_index",
+        ):
+            lines.extend(
+                _format_stability_bucket_lines(
+                    heading=f"### {group_name}",
+                    buckets=stability_diagnostics.get(group_name, {}),
+                )
+            )
+
     lines.extend(["", "## Warnings", ""])
     warning_items = report.get("warnings", [])
     if not warning_items:
@@ -2444,6 +2811,8 @@ def run_walk_forward_evaluation(
     diagnostics_detail: str = DEFAULT_DIAGNOSTICS_DETAIL,
     save_accepted_trades: bool = False,
     accepted_trades_limit: int = DEFAULT_ACCEPTED_TRADES_LIMIT,
+    stability_report_enabled: bool = False,
+    stability_min_trades_per_bucket: int = DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
 ) -> dict[str, Any]:
     """Run walk-forward evaluation for one or more coins and write reports."""
     trade_filter = build_trade_filter(
@@ -2531,6 +2900,8 @@ def run_walk_forward_evaluation(
         feature_columns=aggregate_feature_columns,
         skipped_microstructure_features=aggregate_skipped,
         feature_warning=aggregate_feature_warning,
+        stability_report_enabled=stability_report_enabled,
+        stability_min_trades_per_bucket=stability_min_trades_per_bucket,
     )
 
     all_accepted_trade_records = list(report.get("accepted_trade_records", []))
@@ -2772,6 +3143,20 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_ACCEPTED_TRADES_LIMIT,
         help=f"Max accepted trades in CSV/full diagnostics (default: {DEFAULT_ACCEPTED_TRADES_LIMIT})",
     )
+    parser.add_argument(
+        "--stability-report",
+        action="store_true",
+        help="Include stability diagnostics from accepted paper trades (default: disabled)",
+    )
+    parser.add_argument(
+        "--stability-min-trades-per-bucket",
+        type=int,
+        default=DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
+        help=(
+            "Minimum trades per stability bucket before treating bucket as reliable "
+            f"(default: {DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET})"
+        ),
+    )
     return parser
 
 
@@ -2814,6 +3199,8 @@ def main(argv: list[str] | None = None) -> int:
         diagnostics_detail=args.diagnostics_detail,
         save_accepted_trades=args.save_accepted_trades,
         accepted_trades_limit=args.accepted_trades_limit,
+        stability_report_enabled=args.stability_report,
+        stability_min_trades_per_bucket=args.stability_min_trades_per_bucket,
     )
 
     readiness = report["readiness"]

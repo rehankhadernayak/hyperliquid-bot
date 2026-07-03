@@ -23,6 +23,7 @@ from bid_ask_walk_forward_evaluator import (
     DEFAULT_MIN_TRADES,
     DEFAULT_MIN_WINDOWS,
     DEFAULT_REPORTS_DIR,
+    DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
     MICROSTRUCTURE_EXTRA_COLUMNS,
     SAFETY_NOTE,
     TradeFilterConfig,
@@ -30,12 +31,17 @@ from bid_ask_walk_forward_evaluator import (
     aggregate_accepted_trade_metrics,
     aggregate_class_trade_diagnostics,
     aggregate_coin_class_trade_diagnostics,
+    aggregate_stability_bucket_metrics,
     apply_diagnostics_detail,
+    apply_stability_readiness,
     build_feature_metadata,
+    build_stability_warnings,
     build_trade_filter,
     build_walk_forward_report,
     compute_label_distribution,
     compute_readiness_flags,
+    compute_stability_diagnostics,
+    compute_stability_summary,
     cost_aware_label_warnings,
     create_cost_aware_labels,
     create_walk_forward_features,
@@ -1965,6 +1971,346 @@ class TestTradeDiagnostics:
         assert loaded["paper_only"] is True
         assert loaded["execution_enabled"] is False
         assert "class_trade_diagnostics" in loaded
+
+
+def _synthetic_accepted_trade(
+    *,
+    coin: str = "BTC",
+    predicted_class: str = "DOWN",
+    net_return_bps: float = 3.0,
+    cost_bps: float = 2.0,
+    confidence: float = 0.9,
+    timestamp_iso: str = "2024-06-10T06:00:00Z",
+    window_index: int | None = 0,
+) -> dict:
+    return {
+        "coin": coin,
+        "window_index": window_index,
+        "row_index": 0,
+        "timestamp_iso": timestamp_iso,
+        "predicted_class": predicted_class,
+        "actual_label": predicted_class,
+        "confidence": confidence,
+        "future_return_bps": abs(net_return_bps),
+        "gross_return_bps": abs(net_return_bps),
+        "cost_bps": cost_bps,
+        "net_return_bps": net_return_bps,
+        "spread_bps": 2.0,
+    }
+
+
+class TestStabilityValidation:
+    def test_bucket_metrics_are_correct(self) -> None:
+        records = [
+            _synthetic_accepted_trade(net_return_bps=4.0, cost_bps=1.0, confidence=0.8),
+            _synthetic_accepted_trade(net_return_bps=-2.0, cost_bps=3.0, confidence=0.6),
+        ]
+        metrics = aggregate_stability_bucket_metrics(records)
+
+        assert metrics["trades"] == 2
+        assert metrics["cumulative_net_return_bps"] == pytest.approx(2.0)
+        assert metrics["average_net_return_bps"] == pytest.approx(1.0)
+        assert metrics["win_rate_after_costs"] == pytest.approx(0.5)
+        assert metrics["average_cost_bps"] == pytest.approx(2.0)
+        assert metrics["average_confidence"] == pytest.approx(0.7)
+        assert metrics["positive_after_costs"] is True
+
+    def test_stability_by_hour_date_and_window(self) -> None:
+        records = [
+            _synthetic_accepted_trade(
+                timestamp_iso="2024-06-10T06:00:00Z",
+                window_index=0,
+                net_return_bps=5.0,
+            ),
+            _synthetic_accepted_trade(
+                timestamp_iso="2024-06-10T06:15:00Z",
+                window_index=0,
+                net_return_bps=4.0,
+            ),
+            _synthetic_accepted_trade(
+                timestamp_iso="2024-06-10T07:00:00Z",
+                window_index=1,
+                net_return_bps=-1.0,
+            ),
+        ]
+        diagnostics = compute_stability_diagnostics(records, coins=["BTC"])
+
+        assert diagnostics["by_hour"]["06"]["trades"] == 2
+        assert diagnostics["by_hour"]["07"]["trades"] == 1
+        assert diagnostics["by_date"]["2024-06-10"]["trades"] == 3
+        assert diagnostics["by_window_index"]["0"]["trades"] == 2
+        assert diagnostics["by_window_index"]["1"]["trades"] == 1
+        assert diagnostics["by_coin"]["BTC"]["trades"] == 3
+        assert diagnostics["by_predicted_class"]["DOWN"]["trades"] == 3
+        assert diagnostics["by_coin_predicted_class"]["BTC:DOWN"]["trades"] == 3
+
+    def test_concentration_warning_triggers(self) -> None:
+        records = [
+            _synthetic_accepted_trade(
+                timestamp_iso="2024-06-10T06:00:00Z",
+                window_index=0,
+                net_return_bps=8.0,
+            ),
+            _synthetic_accepted_trade(
+                timestamp_iso="2024-06-10T07:00:00Z",
+                window_index=1,
+                net_return_bps=1.0,
+            ),
+        ]
+        diagnostics = compute_stability_diagnostics(records, coins=["BTC"])
+        summary = compute_stability_summary(
+            diagnostics,
+            min_trades_per_bucket=3,
+        )
+
+        assert summary["concentration_warning"] is True
+        assert any(
+            "stability_concentration" in warning
+            for warning in build_stability_warnings(summary, min_trades_per_bucket=3)
+        )
+
+    def test_sparse_warning_triggers(self) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z", net_return_bps=2.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T07:00:00Z", net_return_bps=1.0),
+        ]
+        diagnostics = compute_stability_diagnostics(records, coins=["BTC"])
+        summary = compute_stability_summary(
+            diagnostics,
+            min_trades_per_bucket=3,
+        )
+
+        assert summary["sparse_stability_warning"] is True
+        assert summary["buckets_with_too_few_trades"] > 0
+        assert any(
+            "stability_sparse_buckets" in warning
+            for warning in build_stability_warnings(summary, min_trades_per_bucket=3)
+        )
+
+    def test_handles_missing_timestamp_iso_safely(self) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="", net_return_bps=2.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T08:00:00Z", net_return_bps=1.0),
+        ]
+        diagnostics = compute_stability_diagnostics(records, coins=["BTC"])
+
+        assert diagnostics["by_hour"] == {"08": diagnostics["by_hour"]["08"]}
+        assert diagnostics["by_date"] == {"2024-06-10": diagnostics["by_date"]["2024-06-10"]}
+        assert diagnostics["by_coin"]["BTC"]["trades"] == 2
+
+    def test_handles_zero_trades_safely(self) -> None:
+        diagnostics = compute_stability_diagnostics([], coins=["BTC"])
+        summary = compute_stability_summary(diagnostics, min_trades_per_bucket=3)
+
+        assert diagnostics["by_coin"]["BTC"]["trades"] == 0
+        assert summary["profitable_bucket_fraction"] == 0.0
+        assert summary["concentration_warning"] is False
+        assert summary["sparse_stability_warning"] is False
+        assert build_stability_warnings(summary, min_trades_per_bucket=3) == []
+
+    def test_stability_reduces_ready_for_more_research(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        readiness = compute_readiness_flags(
+            accuracy_edge_vs_baseline=0.1,
+            cumulative_net_return_bps=10.0,
+            completed_windows=10,
+            total_paper_trades=200,
+            min_windows=5,
+            min_trades=100,
+        )
+        adjusted = apply_stability_readiness(
+            readiness,
+            {
+                "concentration_warning": True,
+                "sparse_stability_warning": False,
+            },
+        )
+
+        assert readiness["ready_for_more_research"] is True
+        assert adjusted["ready_for_more_research"] is False
+        assert adjusted["real_execution_ready"] is False
+
+    def test_json_report_includes_stability_fields_when_enabled(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z", net_return_bps=3.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T07:00:00Z", net_return_bps=2.0),
+        ]
+        report = build_walk_forward_report(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            trade_filter=_permissive_filter(),
+            per_coin_results=[
+                {
+                    "coin": "BTC",
+                    "status": "completed",
+                    "completed_windows": 1,
+                    "total_windows": 1,
+                    "skipped_windows": 0,
+                    "model_accuracy_mean": 0.6,
+                    "baseline_accuracy_mean": 0.5,
+                    "accuracy_edge_vs_baseline": 0.1,
+                    "total_paper_signals": 2,
+                    "raw_predictions": 2,
+                    "filtered_paper_trades": 2,
+                    "total_paper_trades": 2,
+                    "accepted_trade_net_returns_bps": [3.0, 2.0],
+                    "trade_returns_bps": [3.0, 2.0],
+                    "cumulative_net_return_bps": 5.0,
+                    "average_net_return_bps": 2.5,
+                    "average_gross_return_bps": 2.5,
+                    "average_cost_bps": 0.0,
+                    "average_required_edge_bps": 0.0,
+                    "blocked_by_confidence": 0,
+                    "blocked_by_cost": 0,
+                    "blocked_by_spread": 0,
+                    "blocked_by_volatility": 0,
+                    "blocked_by_trade_class": 0,
+                    "accepted_trade_records": records,
+                    "warnings": [],
+                    "windows": [],
+                }
+            ],
+            data_root=data_root,
+            min_windows=1,
+            min_trades=1,
+            stability_report_enabled=True,
+            stability_min_trades_per_bucket=3,
+        )
+        json_path = write_walk_forward_json(report, reports_dir=reports_dir)
+        md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
+        loaded = json.loads(json_path.read_text(encoding="utf-8"))
+        md_text = md_path.read_text(encoding="utf-8")
+
+        assert report["stability_report_enabled"] is True
+        assert report["stability_min_trades_per_bucket"] == 3
+        assert "stability_diagnostics" in report
+        assert "stability_summary" in report
+        assert "stability_warnings" in report
+        assert loaded["stability_report_enabled"] is True
+        assert "stability_diagnostics" in loaded
+        assert "stability_summary" in loaded
+        assert "## Stability Validation" in md_text
+        assert "concentration_warning" in md_text
+
+    def test_stability_fields_absent_when_disabled(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        report = build_walk_forward_report(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            trade_filter=_permissive_filter(),
+            per_coin_results=[],
+            data_root=data_root,
+        )
+        json_path = write_walk_forward_json(report, reports_dir=reports_dir)
+        md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
+        loaded = json.loads(json_path.read_text(encoding="utf-8"))
+        md_text = md_path.read_text(encoding="utf-8")
+
+        assert report["stability_report_enabled"] is False
+        assert "stability_diagnostics" not in report
+        assert "stability_summary" not in report
+        assert "stability_warnings" not in report
+        assert loaded["stability_report_enabled"] is False
+        assert "stability_diagnostics" not in loaded
+        assert "## Stability Validation" not in md_text
+
+    def test_stability_safety_flags_preserved(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        report = build_walk_forward_report(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            trade_filter=_permissive_filter(),
+            per_coin_results=[
+                {
+                    "coin": "BTC",
+                    "status": "completed",
+                    "completed_windows": 1,
+                    "total_windows": 1,
+                    "skipped_windows": 0,
+                    "model_accuracy_mean": 0.6,
+                    "baseline_accuracy_mean": 0.5,
+                    "accuracy_edge_vs_baseline": 0.1,
+                    "total_paper_signals": 1,
+                    "raw_predictions": 1,
+                    "filtered_paper_trades": 1,
+                    "total_paper_trades": 1,
+                    "accepted_trade_net_returns_bps": [2.0],
+                    "trade_returns_bps": [2.0],
+                    "cumulative_net_return_bps": 2.0,
+                    "average_net_return_bps": 2.0,
+                    "average_gross_return_bps": 2.0,
+                    "average_cost_bps": 0.0,
+                    "average_required_edge_bps": 0.0,
+                    "blocked_by_confidence": 0,
+                    "blocked_by_cost": 0,
+                    "blocked_by_spread": 0,
+                    "blocked_by_volatility": 0,
+                    "blocked_by_trade_class": 0,
+                    "accepted_trade_records": [
+                        _synthetic_accepted_trade(net_return_bps=2.0),
+                    ],
+                    "warnings": [],
+                    "windows": [],
+                }
+            ],
+            data_root=data_root,
+            stability_report_enabled=True,
+        )
+
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+        assert report["readiness"]["real_execution_ready"] is False
+
+    def test_cli_parses_stability_options(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--stability-report",
+                "--stability-min-trades-per-bucket",
+                "5",
+            ]
+        )
+        assert args.stability_report is True
+        assert args.stability_min_trades_per_bucket == 5
+
+    def test_cli_stability_defaults(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args([])
+        assert args.stability_report is False
+        assert args.stability_min_trades_per_bucket == DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET
 
 
 class TestSafety:
