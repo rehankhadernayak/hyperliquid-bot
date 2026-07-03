@@ -12,11 +12,14 @@ from unittest.mock import MagicMock
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 from bid_ask_candidate_validator import (
     DEFAULT_CANDIDATE_NAME,
+    DEFAULT_LAUNCHD_LABEL,
     DEFAULT_SOURCE,
     DEFAULT_VALIDATION_REPORTS_DIR,
+    LAUNCHD_SETUP_MD,
     _build_arg_parser,
     build_candidate_config,
     build_candidate_validation_report,
+    cmd_write_launchd_template,
     compute_validation_status,
     load_candidate_validation_reports,
     main,
@@ -407,3 +410,158 @@ class TestReportWriters:
         assert len(loaded) == 2
         assert loaded[0]["run_timestamp"] == "2026-07-01T08:00:00Z"
         assert loaded[1]["run_timestamp"] == "2026-07-02T08:00:00Z"
+
+
+class TestLaunchdTemplate:
+    def test_writes_plist_and_setup(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        plist_path, setup_path = cmd_write_launchd_template(
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        assert plist_path.name == f"{DEFAULT_LAUNCHD_LABEL}.plist"
+        assert setup_path.name == LAUNCHD_SETUP_MD
+        assert plist_path.is_file()
+        assert setup_path.is_file()
+
+    def test_start_calendar_interval_defaults(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        plist_path, _ = cmd_write_launchd_template(
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<key>StartCalendarInterval</key>" in plist_text
+        assert "<key>Hour</key>" in plist_text
+        assert "<integer>23</integer>" in plist_text
+        assert "<key>Minute</key>" in plist_text
+        assert "<integer>30</integer>" in plist_text
+
+    def test_program_arguments_run_historical(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        plist_path, _ = cmd_write_launchd_template(
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "bid_ask_candidate_validator.py" in plist_text
+        assert "<string>run</string>" in plist_text
+        assert "<string>--source</string>" in plist_text
+        assert "<string>historical</string>" in plist_text
+
+    def test_custom_hour_minute_source(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        plist_path, _ = cmd_write_launchd_template(
+            hour=6,
+            minute=15,
+            source="combined",
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<integer>6</integer>" in plist_text
+        assert "<integer>15</integer>" in plist_text
+        assert "<string>combined</string>" in plist_text
+
+    def test_custom_label_and_log_paths(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        stdout_log = reports_dir / "custom.out.log"
+        stderr_log = reports_dir / "custom.err.log"
+        plist_path, _ = cmd_write_launchd_template(
+            label="com.example.validator",
+            stdout_log=stdout_log,
+            stderr_log=stderr_log,
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<string>com.example.validator</string>" in plist_text
+        assert str(stdout_log) in plist_text
+        assert str(stderr_log) in plist_text
+
+    def test_run_at_load_false_by_default(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        plist_path, _ = cmd_write_launchd_template(
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<key>RunAtLoad</key>" not in plist_text
+
+    def test_run_at_load_true(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        plist_path, _ = cmd_write_launchd_template(
+            run_at_load=True,
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        plist_text = plist_path.read_text(encoding="utf-8")
+        assert "<key>RunAtLoad</key>" in plist_text
+        assert "<true/>" in plist_text
+
+    def test_setup_includes_copy_load_tail_summarize(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        plist_path, setup_path = cmd_write_launchd_template(
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        setup_text = setup_path.read_text(encoding="utf-8")
+        assert "cp " in setup_text
+        assert "~/Library/LaunchAgents/" in setup_text
+        assert "launchctl unload" in setup_text
+        assert "launchctl load" in setup_text
+        assert "launchctl list | grep hyperliquid" in setup_text
+        assert "tail -50" in setup_text
+        assert "bid_ask_candidate_validator.py summarize" in setup_text
+        assert str(plist_path) in setup_text
+        assert "research-only" in setup_text.lower()
+        assert "paper-only" in setup_text.lower()
+
+    def test_does_not_auto_install_launchd(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        launch_agents = tmp_path / "Library" / "LaunchAgents"
+        plist_path, setup_path = cmd_write_launchd_template(
+            reports_dir=reports_dir,
+            project_root=tmp_path,
+        )
+        assert plist_path.parent == reports_dir
+        assert setup_path.parent == reports_dir
+        assert plist_path.is_file()
+        assert not launch_agents.exists()
+
+    def test_main_write_launchd_template(self, tmp_path: Path) -> None:
+        reports_dir = tmp_path / "validation"
+        exit_code = main(
+            [
+                "write-launchd-template",
+                "--reports-dir",
+                str(reports_dir),
+                "--project-root",
+                str(tmp_path),
+            ]
+        )
+        assert exit_code == 0
+        assert (reports_dir / f"{DEFAULT_LAUNCHD_LABEL}.plist").is_file()
+        assert (reports_dir / LAUNCHD_SETUP_MD).is_file()
+
+    def test_cli_custom_hour_minute(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            ["write-launchd-template", "--hour", "8", "--minute", "45", "--source", "local"]
+        )
+        assert args.hour == 8
+        assert args.minute == 45
+        assert args.source == "local"
+
+    def test_safety_fields_unaffected_by_launchd_template(self, tmp_path: Path) -> None:
+        report = build_candidate_validation_report(
+            _mock_walk_forward_report(),
+            config=_passing_config(),
+            run_timestamp="2026-07-03T08:00:00Z",
+        )
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+        cmd_write_launchd_template(reports_dir=tmp_path / "validation", project_root=tmp_path)
+        assert PAPER_ONLY is True
+        assert EXECUTION_ENABLED is False

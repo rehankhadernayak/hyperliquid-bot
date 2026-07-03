@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -47,6 +48,13 @@ DEFAULT_REQUIRE_POSITIVE = True
 TREND_RUN_LIMIT = 10
 
 VALIDATION_REPORT_GLOB = "candidate_validation_*.json"
+
+DEFAULT_LAUNCHD_LABEL = "com.hyperliquid.research.candidate-validator.daily"
+DEFAULT_LAUNCHD_HOUR = 23
+DEFAULT_LAUNCHD_MINUTE = 30
+DEFAULT_LAUNCHD_STDOUT_LOG = DEFAULT_VALIDATION_REPORTS_DIR / "daily_validator.out.log"
+DEFAULT_LAUNCHD_STDERR_LOG = DEFAULT_VALIDATION_REPORTS_DIR / "daily_validator.err.log"
+LAUNCHD_SETUP_MD = "launchd_candidate_validator_setup.md"
 
 
 def _utc_now_iso() -> str:
@@ -473,6 +481,140 @@ def summarize_candidate_validation_reports(
     return "\n".join(lines)
 
 
+def _resolve_project_root(project_root: Path | None = None) -> Path:
+    """Resolve repository root from explicit path or this module's location."""
+    if project_root is not None:
+        return project_root.resolve()
+    return Path(__file__).resolve().parent
+
+
+def cmd_write_launchd_template(
+    *,
+    hour: int = DEFAULT_LAUNCHD_HOUR,
+    minute: int = DEFAULT_LAUNCHD_MINUTE,
+    label: str = DEFAULT_LAUNCHD_LABEL,
+    source: str = DEFAULT_SOURCE,
+    run_at_load: bool = False,
+    stdout_log: Path = DEFAULT_LAUNCHD_STDOUT_LOG,
+    stderr_log: Path = DEFAULT_LAUNCHD_STDERR_LOG,
+    reports_dir: Path = DEFAULT_VALIDATION_REPORTS_DIR,
+    project_root: Path | None = None,
+) -> tuple[Path, Path]:
+    """Write macOS launchd plist template and setup instructions (does not install)."""
+    if not 0 <= hour <= 23:
+        raise ValueError("hour must be between 0 and 23")
+    if not 0 <= minute <= 59:
+        raise ValueError("minute must be between 0 and 59")
+    if source not in SOURCE_CHOICES:
+        raise ValueError(f"source must be one of {SOURCE_CHOICES}")
+
+    root = _resolve_project_root(project_root)
+    python_path = sys.executable
+    validator_script = root / "bid_ask_candidate_validator.py"
+    cmd_parts = [
+        python_path,
+        str(validator_script),
+        "run",
+        "--source",
+        source,
+    ]
+
+    plist_name = f"{label}.plist"
+    plist_path = reports_dir / plist_name
+    reports_dir.mkdir(parents=True, exist_ok=True)
+
+    run_at_load_block = ""
+    if run_at_load:
+        run_at_load_block = """    <key>RunAtLoad</key>
+    <true/>
+"""
+
+    plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+{''.join(f'        <string>{part}</string>\n' for part in cmd_parts)}    </array>
+    <key>WorkingDirectory</key>
+    <string>{root}</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{hour}</integer>
+        <key>Minute</key>
+        <integer>{minute}</integer>
+    </dict>
+{run_at_load_block}    <key>StandardOutPath</key>
+    <string>{stdout_log}</string>
+    <key>StandardErrorPath</key>
+    <string>{stderr_log}</string>
+</dict>
+</plist>
+"""
+    plist_path.write_text(plist_content, encoding="utf-8")
+
+    setup_md = reports_dir / LAUNCHD_SETUP_MD
+    setup_lines = [
+        "# macOS launchd Setup for Daily Candidate Validator",
+        "",
+        "This template runs `bid_ask_candidate_validator.py run` once per day "
+        f"at **{hour:02d}:{minute:02d}** local time with `--source {source}`. "
+        "It is **not installed automatically**.",
+        "",
+        "Research-only and paper-only; no orders, wallets, or execution endpoints.",
+        "",
+        "## 1. Copy plist to LaunchAgents",
+        "",
+        "```bash",
+        f"cp {plist_path} ~/Library/LaunchAgents/",
+        "```",
+        "",
+        "## 2. Unload old plist (if present)",
+        "",
+        "```bash",
+        f"launchctl unload ~/Library/LaunchAgents/{plist_name} 2>/dev/null || true",
+        "```",
+        "",
+        "## 3. Load plist",
+        "",
+        "```bash",
+        f"launchctl load ~/Library/LaunchAgents/{plist_name}",
+        "```",
+        "",
+        "## 4. Check launchctl status",
+        "",
+        "```bash",
+        "launchctl list | grep hyperliquid",
+        "```",
+        "",
+        "## 5. Inspect stdout/stderr logs",
+        "",
+        "```bash",
+        f"tail -50 {stdout_log}",
+        f"tail -50 {stderr_log}",
+        "```",
+        "",
+        "## 6. Summarize validation reports",
+        "",
+        "```bash",
+        "python3 bid_ask_candidate_validator.py summarize",
+        "```",
+        "",
+        "## Uninstall",
+        "",
+        "```bash",
+        f"launchctl unload ~/Library/LaunchAgents/{plist_name}",
+        f"rm ~/Library/LaunchAgents/{plist_name}",
+        "```",
+    ]
+    setup_md.write_text("\n".join(setup_lines) + "\n", encoding="utf-8")
+
+    return plist_path, setup_md
+
+
 def _add_run_arguments(parser: argparse.ArgumentParser) -> None:
     parser.add_argument("--coin", default=DEFAULT_COIN, help="Coin symbol (default: BTC)")
     parser.add_argument(
@@ -579,6 +721,64 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Directory containing candidate validation JSON reports",
     )
 
+    launchd_parser = subparsers.add_parser(
+        "write-launchd-template",
+        help="Write daily launchd plist template for candidate validation (does not install)",
+    )
+    launchd_parser.add_argument(
+        "--hour",
+        type=int,
+        default=DEFAULT_LAUNCHD_HOUR,
+        help=f"Daily run hour 0-23 (default: {DEFAULT_LAUNCHD_HOUR})",
+    )
+    launchd_parser.add_argument(
+        "--minute",
+        type=int,
+        default=DEFAULT_LAUNCHD_MINUTE,
+        help=f"Daily run minute 0-59 (default: {DEFAULT_LAUNCHD_MINUTE})",
+    )
+    launchd_parser.add_argument(
+        "--label",
+        default=DEFAULT_LAUNCHD_LABEL,
+        help="launchd Label key",
+    )
+    launchd_parser.add_argument(
+        "--source",
+        choices=SOURCE_CHOICES,
+        default=DEFAULT_SOURCE,
+        help=f"Bid/ask CSV source passed to run (default: {DEFAULT_SOURCE})",
+    )
+    launchd_parser.add_argument(
+        "--stdout-log",
+        type=Path,
+        default=DEFAULT_LAUNCHD_STDOUT_LOG,
+        help="StandardOutPath for launchd",
+    )
+    launchd_parser.add_argument(
+        "--stderr-log",
+        type=Path,
+        default=DEFAULT_LAUNCHD_STDERR_LOG,
+        help="StandardErrorPath for launchd",
+    )
+    launchd_parser.add_argument(
+        "--run-at-load",
+        type=parse_bool,
+        default=False,
+        help="Run immediately on load (default: false)",
+    )
+    launchd_parser.add_argument(
+        "--reports-dir",
+        type=Path,
+        default=DEFAULT_VALIDATION_REPORTS_DIR,
+        help="Directory for plist and setup doc",
+    )
+    launchd_parser.add_argument(
+        "--project-root",
+        type=Path,
+        default=None,
+        help="Repository root (default: parent of this script)",
+    )
+
     return parser
 
 
@@ -621,6 +821,22 @@ def main(argv: list[str] | None = None) -> int:
 
     if args.command == "summarize":
         print(summarize_candidate_validation_reports(reports_dir=args.reports_dir))
+        return 0
+
+    if args.command == "write-launchd-template":
+        plist_path, setup_path = cmd_write_launchd_template(
+            hour=args.hour,
+            minute=args.minute,
+            label=args.label,
+            source=args.source,
+            run_at_load=args.run_at_load,
+            stdout_log=args.stdout_log,
+            stderr_log=args.stderr_log,
+            reports_dir=args.reports_dir,
+            project_root=args.project_root,
+        )
+        print(f"Wrote launchd template: {plist_path}")
+        print(f"Wrote setup doc: {setup_path}")
         return 0
 
     return 1
