@@ -3,15 +3,23 @@
 from __future__ import annotations
 
 import ast
+import csv
 import json
 from pathlib import Path
 
 import pytest
 
-from bid_ask_schema import BID_ASK_CSV_COLUMNS, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS
+from bid_ask_schema import (
+    BID_ASK_CSV_COLUMNS,
+    FORBIDDEN_MODULE_NAMES,
+    FORBIDDEN_SOURCE_PATTERNS,
+    TIMESTAMP_ISO,
+    timestamp_ms_to_iso,
+)
 from historical_l2_importer import (
     DEFAULT_OUTPUT_ROOT,
     HistoricalImportReport,
+    HistoricalRepairReport,
     build_archive_s3_path,
     default_historical_output_path,
     import_decompressed_l2_file,
@@ -20,6 +28,8 @@ from historical_l2_importer import (
     merge_historical_bid_ask_rows,
     parse_l2_snapshot_line,
     read_historical_bid_ask_csv,
+    repair_historical_bid_ask_csv,
+    resolve_repair_csv_path,
     summarize_historical_coverage,
     write_historical_bid_ask_csv,
     write_historical_import_report,
@@ -572,3 +582,275 @@ class TestMergeHelpers:
         merged, removed = merge_historical_bid_ask_rows(existing, new)
         assert removed == 1
         assert merged[0]["best_bid"] == "2.0"
+
+
+def _make_bid_ask_row(
+    *,
+    timestamp_ms: int = BASE_TS,
+    coin: str = "BTC",
+    best_bid: float = 50000.0,
+    best_ask: float = 50001.0,
+    timestamp_iso: str | None = None,
+    bid_size: float | None = 1.0,
+    ask_size: float | None = 1.0,
+    allow_invalid: bool = False,
+) -> dict[str, str]:
+    if allow_invalid:
+        iso = timestamp_iso if timestamp_iso is not None else timestamp_ms_to_iso(timestamp_ms)
+        row = {
+            "timestamp_ms": str(timestamp_ms),
+            TIMESTAMP_ISO: iso,
+            "coin": coin,
+            "best_bid": str(best_bid),
+            "best_ask": str(best_ask),
+            "mid_price": "",
+            "spread": "",
+            "spread_bps": "",
+            "bid_size": "" if bid_size is None else str(bid_size),
+            "ask_size": "" if ask_size is None else str(ask_size),
+            "bbo_imbalance": "",
+            "source_session_id": "historical_archive",
+            "source_channel": "historical_l2Book",
+        }
+        return row
+
+    row = l2_snapshot_to_bid_ask_row(
+        {
+            "timestamp_ms": timestamp_ms,
+            "coin": coin,
+            "best_bid": best_bid,
+            "best_ask": best_ask,
+            "bid_size": bid_size,
+            "ask_size": ask_size,
+            "source_channel": "historical_l2Book",
+        }
+    )
+    assert row is not None
+    if timestamp_iso is not None:
+        row[TIMESTAMP_ISO] = timestamp_iso
+    return {column: "" if row.get(column) is None else str(row[column]) for column in BID_ASK_CSV_COLUMNS}
+
+
+def _write_test_csv(path: Path, rows: list[dict[str, str]]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(BID_ASK_CSV_COLUMNS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow(row)
+
+
+class TestRepairCsv:
+    def _setup_dirty_csv(self, tmp_path: Path) -> tuple[Path, Path, Path]:
+        data_root = tmp_path / "bid_ask_csv"
+        backup_dir = data_root / "backups"
+        csv_path = data_root / "historical_1s" / "BTC_1s.csv"
+        rows = [
+            _make_bid_ask_row(timestamp_ms=BASE_TS + 2000, best_bid=50100.0, best_ask=50101.0),
+            _make_bid_ask_row(timestamp_ms=BASE_TS, best_bid=50000.0, best_ask=50001.0),
+            _make_bid_ask_row(
+                timestamp_ms=BASE_TS,
+                best_bid=50010.0,
+                best_ask=50011.0,
+                timestamp_iso="NaN",
+            ),
+            _make_bid_ask_row(timestamp_ms=BASE_TS + 1000, best_bid=100.0, best_ask=100.1),
+            _make_bid_ask_row(timestamp_ms=BASE_TS + 3000, best_bid=0.0, best_ask=50101.0, allow_invalid=True),
+            _make_bid_ask_row(
+                timestamp_ms=BASE_TS + 4000,
+                best_bid=50200.0,
+                best_ask=50100.0,
+                allow_invalid=True,
+            ),
+            _make_bid_ask_row(timestamp_ms=BASE_TS + 5000, coin="ETH", best_bid=3000.0, best_ask=3001.0),
+        ]
+        bad_ts_row = _make_bid_ask_row(timestamp_ms=BASE_TS + 6000)
+        bad_ts_row["timestamp_ms"] = "not-a-number"
+        rows.append(bad_ts_row)
+        _write_test_csv(csv_path, rows)
+        return csv_path, backup_dir, data_root
+
+    def test_dry_run_does_not_modify_file(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+        original_content = csv_path.read_text(encoding="utf-8")
+
+        report, _ = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            dry_run=True,
+            csv_path=csv_path,
+        )
+
+        assert report.dry_run is True
+        assert report.backup_path is None
+        assert csv_path.read_text(encoding="utf-8") == original_content
+        assert not list(backup_dir.glob("*"))
+
+    def test_backup_created_before_overwrite(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+
+        report, _ = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            csv_path=csv_path,
+        )
+
+        assert report.backup_path is not None
+        backup_path = Path(report.backup_path)
+        assert backup_path.exists()
+        assert backup_path.parent == backup_dir.resolve()
+        assert "BTC_1s_repair_" in backup_path.name
+
+    def test_duplicates_removed_and_sorted(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+
+        report, _ = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            csv_path=csv_path,
+        )
+
+        assert report.duplicate_rows_removed == 1
+        assert report.monotonic_after is True
+        assert report.duplicate_timestamps_after == 0
+
+        rows = read_historical_bid_ask_csv(csv_path)
+        timestamps = [int(row["timestamp_ms"]) for row in rows]
+        assert timestamps == sorted(timestamps)
+        assert timestamps.count(BASE_TS) == 1
+        assert float(rows[0]["best_bid"]) == pytest.approx(50010.0)
+
+    def test_timestamp_iso_recomputed_from_timestamp_ms(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+
+        report, _ = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            csv_path=csv_path,
+        )
+
+        assert report.timestamp_iso_recomputed_count == report.rows_after_basic_filters
+        rows = read_historical_bid_ask_csv(csv_path)
+        for row in rows:
+            expected_iso = timestamp_ms_to_iso(int(row["timestamp_ms"]))
+            assert row[TIMESTAMP_ISO] == expected_iso
+            assert row[TIMESTAMP_ISO] != "NaN"
+
+    def test_invalid_bid_ask_rows_removed(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+
+        report, _ = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            csv_path=csv_path,
+        )
+
+        rows = read_historical_bid_ask_csv(csv_path)
+        for row in rows:
+            assert float(row["best_bid"]) > 0
+            assert float(row["best_ask"]) >= float(row["best_bid"])
+        assert report.rows_before == 8
+        assert report.rows_after == 3
+
+    def test_wrong_coin_rows_removed(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+
+        report, _ = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            csv_path=csv_path,
+        )
+
+        rows = read_historical_bid_ask_csv(csv_path)
+        assert all(row["coin"] == "BTC" for row in rows)
+        assert report.rows_after == 3
+
+    def test_drop_mock_rows_removes_defaults(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+
+        report, _ = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            drop_mock_rows=True,
+            csv_path=csv_path,
+        )
+
+        assert report.mock_rows_removed == 1
+        rows = read_historical_bid_ask_csv(csv_path)
+        assert not any(
+            float(row["best_bid"]) == 100.0 and float(row["best_ask"]) == 100.1 for row in rows
+        )
+        assert report.rows_after == 2
+
+    def test_default_keeps_mock_rows(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+
+        report, _ = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            csv_path=csv_path,
+        )
+
+        assert report.mock_rows_removed == 0
+        rows = read_historical_bid_ask_csv(csv_path)
+        assert any(
+            float(row["best_bid"]) == 100.0 and float(row["best_ask"]) == 100.1 for row in rows
+        )
+
+    def test_report_contains_safety_flags(self, tmp_path: Path) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+
+        report, report_path = repair_historical_bid_ask_csv(
+            "BTC",
+            data_root=data_root,
+            backup_dir=backup_dir,
+            csv_path=csv_path,
+        )
+
+        payload = json.loads(report_path.read_text(encoding="utf-8"))
+        assert payload["paper_only"] is True
+        assert payload["execution_enabled"] is False
+        assert payload["real_execution_ready"] is False
+        assert isinstance(report, HistoricalRepairReport)
+        assert report.paper_only is True
+        assert report.execution_enabled is False
+        assert report.real_execution_ready is False
+
+    def test_repair_no_network_aws_subprocess(self) -> None:
+        source = IMPORTER_FILE.read_text(encoding="utf-8").lower()
+        for token in ("boto3", "botocore", "subprocess", "requests.", "urllib."):
+            assert token not in source
+
+    def test_resolve_repair_csv_path(self, tmp_path: Path) -> None:
+        path = resolve_repair_csv_path("btc", source="historical", data_root=tmp_path / "bid_ask_csv")
+        assert path == tmp_path / "bid_ask_csv" / "historical_1s" / "BTC_1s.csv"
+
+    def test_repair_cli_dry_run(self, tmp_path: Path, capsys) -> None:
+        csv_path, backup_dir, data_root = self._setup_dirty_csv(tmp_path)
+        original_content = csv_path.read_text(encoding="utf-8")
+
+        exit_code = main(
+            [
+                "repair-csv",
+                "--coin",
+                "BTC",
+                "--data-root",
+                str(data_root),
+                "--backup-dir",
+                str(backup_dir),
+                "--dry-run",
+            ]
+        )
+        captured = capsys.readouterr().out
+
+        assert exit_code == 0
+        assert "dry_run=True" in captured
+        assert csv_path.read_text(encoding="utf-8") == original_content

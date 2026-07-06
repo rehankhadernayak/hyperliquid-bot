@@ -9,20 +9,29 @@ import argparse
 import ast
 import csv
 import json
+import shutil
 import sys
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
+from bid_ask_resampler import normalize_source, resolve_bid_ask_data_dir
 from bid_ask_schema import (
+    ASK_SIZE,
     BID_ASK_CSV_COLUMNS,
     BEST_ASK,
     BEST_BID,
+    BID_SIZE,
+    COIN,
     PAPER_ONLY,
     SAFETY_STATEMENT,
+    SOURCE_CHANNEL,
+    SOURCE_SESSION_ID,
+    TIMESTAMP_ISO,
     TIMESTAMP_MS,
     build_bid_ask_row,
+    timestamp_ms_to_iso,
     validate_bid_ask,
 )
 from historical_backfill_research import (
@@ -34,8 +43,11 @@ from historical_backfill_research import (
 )
 
 DEFAULT_OUTPUT_ROOT = Path("data/bid_ask_csv")
+DEFAULT_BACKUP_DIR = DEFAULT_OUTPUT_ROOT / "backups"
 HISTORICAL_1S_SUBDIR = "historical_1s"
 REPORTS_SUBDIR = "reports"
+DEFAULT_MOCK_BID = 100.0
+DEFAULT_MOCK_ASK = 100.1
 
 SOURCE_SESSION_ID_HISTORICAL = "historical_archive"
 SOURCE_CHANNEL_HISTORICAL = "historical_l2Book"
@@ -92,6 +104,37 @@ class HistoricalImportReport:
     execution_enabled: bool = EXECUTION_ENABLED
     download_enabled: bool = DOWNLOAD_ENABLED
     safety_statement: str = SAFETY_STATEMENT
+    generated_at: str = field(
+        default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+    )
+
+    def to_dict(self) -> dict[str, Any]:
+        return asdict(self)
+
+
+@dataclass
+class HistoricalRepairReport:
+    coin: str
+    source: str
+    interval: str
+    path: str
+    dry_run: bool
+    backup_path: str | None
+    rows_before: int
+    rows_after_basic_filters: int
+    duplicate_rows_removed: int
+    mock_rows_removed: int
+    rows_after: int
+    timestamp_iso_recomputed_count: int
+    first_timestamp_iso_before: str | None
+    last_timestamp_iso_before: str | None
+    first_timestamp_iso_after: str | None
+    last_timestamp_iso_after: str | None
+    duplicate_timestamps_after: int
+    monotonic_after: bool
+    paper_only: bool = PAPER_ONLY
+    execution_enabled: bool = EXECUTION_ENABLED
+    real_execution_ready: bool = False
     generated_at: str = field(
         default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     )
@@ -465,10 +508,308 @@ def default_historical_output_path(
     return output_root / HISTORICAL_1S_SUBDIR / f"{_normalize_coin(coin)}_1s.csv"
 
 
+def resolve_repair_csv_path(
+    coin: str,
+    *,
+    interval: str = "1s",
+    source: str = "historical",
+    data_root: Path = DEFAULT_OUTPUT_ROOT,
+) -> Path:
+    """Return the bid/ask CSV path for repair given source and interval."""
+    normalized_coin = _normalize_coin(coin)
+    normalized_source = normalize_source(source)
+    data_dir = resolve_bid_ask_data_dir(interval, normalized_source, data_root)
+    if interval == "1s":
+        return data_dir / f"{normalized_coin}_1s.csv"
+    return data_dir / f"{normalized_coin}_{interval}.csv"
+
+
+def _validate_repair_output_path(output_path: Path, data_root: Path, interval: str, source: str) -> None:
+    allowed_dir = resolve_bid_ask_data_dir(interval, normalize_source(source), data_root).resolve()
+    resolved = output_path.resolve()
+    if resolved != allowed_dir and allowed_dir not in resolved.parents:
+        raise ValueError(f"Output path must be under {allowed_dir}")
+
+
+def _first_last_timestamp_iso(rows: list[dict[str, Any]]) -> tuple[str | None, str | None]:
+    if not rows:
+        return None, None
+    iso_values = [str(row.get(TIMESTAMP_ISO, "")) for row in rows]
+    return iso_values[0], iso_values[-1]
+
+
+def _count_duplicate_timestamps(rows: list[dict[str, Any]]) -> int:
+    seen: dict[str, int] = {}
+    for row in rows:
+        key = str(row[TIMESTAMP_MS])
+        seen[key] = seen.get(key, 0) + 1
+    return sum(count - 1 for count in seen.values() if count > 1)
+
+
+def _is_monotonic_timestamps(rows: list[dict[str, Any]]) -> bool:
+    if len(rows) < 2:
+        return True
+    timestamps = [int(row[TIMESTAMP_MS]) for row in rows]
+    return all(timestamps[index] > timestamps[index - 1] for index in range(1, len(timestamps)))
+
+
+def _row_passes_basic_filters(raw_row: dict[str, Any], coin: str) -> bool:
+    timestamp_ms = _safe_float(raw_row.get(TIMESTAMP_MS))
+    if timestamp_ms is None:
+        return False
+    if timestamp_ms != int(timestamp_ms):
+        return False
+
+    best_bid = _safe_float(raw_row.get(BEST_BID))
+    best_ask = _safe_float(raw_row.get(BEST_ASK))
+    if best_bid is None or best_ask is None:
+        return False
+    if best_bid <= 0 or best_ask <= 0:
+        return False
+    if best_ask < best_bid:
+        return False
+
+    row_coin = str(raw_row.get(COIN, "")).strip().upper()
+    if row_coin != coin:
+        return False
+
+    return True
+
+
+def _recompute_repaired_row(
+    raw_row: dict[str, Any],
+    *,
+    timestamp_ms: int,
+    coin: str,
+    best_bid: float,
+    best_ask: float,
+) -> dict[str, Any]:
+    bid_size = _safe_float(raw_row.get(BID_SIZE))
+    ask_size = _safe_float(raw_row.get(ASK_SIZE))
+    source_session_id = str(raw_row.get(SOURCE_SESSION_ID, SOURCE_SESSION_ID_HISTORICAL))
+    source_channel = str(raw_row.get(SOURCE_CHANNEL, SOURCE_CHANNEL_HISTORICAL))
+    return build_bid_ask_row(
+        timestamp_ms=timestamp_ms,
+        coin=coin,
+        best_bid=best_bid,
+        best_ask=best_ask,
+        bid_size=bid_size,
+        ask_size=ask_size,
+        source_session_id=source_session_id,
+        source_channel=source_channel,
+    )
+
+
+def _is_mock_row(row: dict[str, Any], mock_bid: float, mock_ask: float) -> bool:
+    best_bid = _safe_float(row.get(BEST_BID))
+    best_ask = _safe_float(row.get(BEST_ASK))
+    if best_bid is None or best_ask is None:
+        return False
+    return best_bid == mock_bid and best_ask == mock_ask
+
+
+def write_repaired_bid_ask_csv(
+    rows: list[dict[str, Any]],
+    output_path: Path,
+    *,
+    data_root: Path = DEFAULT_OUTPUT_ROOT,
+    interval: str = "1s",
+    source: str = "historical",
+) -> Path:
+    """Write repaired bid/ask rows to the resolved source/interval CSV path."""
+    _validate_repair_output_path(output_path, data_root, interval, source)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    with output_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(BID_ASK_CSV_COLUMNS))
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({column: row.get(column) for column in BID_ASK_CSV_COLUMNS})
+    return output_path
+
+
+def write_historical_repair_report(
+    report: HistoricalRepairReport,
+    *,
+    data_root: Path = DEFAULT_OUTPUT_ROOT,
+) -> Path:
+    """Save a JSON repair report under data/bid_ask_csv/reports/."""
+    reports_dir = data_root / REPORTS_SUBDIR
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    report_path = reports_dir / f"{report.coin}_{report.interval}_repair_{timestamp}.json"
+    report_path.write_text(json.dumps(report.to_dict(), indent=2), encoding="utf-8")
+    return report_path
+
+
+def repair_historical_bid_ask_csv(
+    coin: str,
+    *,
+    interval: str = "1s",
+    source: str = "historical",
+    data_root: Path = DEFAULT_OUTPUT_ROOT,
+    backup_dir: Path = DEFAULT_BACKUP_DIR,
+    dry_run: bool = False,
+    drop_mock_rows: bool = False,
+    mock_bid: float = DEFAULT_MOCK_BID,
+    mock_ask: float = DEFAULT_MOCK_ASK,
+    csv_path: Path | None = None,
+) -> tuple[HistoricalRepairReport, Path]:
+    """Back up, clean, dedupe, sort, and rewrite a historical bid/ask CSV."""
+    normalized_coin = _normalize_coin(coin)
+    normalized_source = normalize_source(source)
+    output_path = csv_path or resolve_repair_csv_path(
+        normalized_coin,
+        interval=interval,
+        source=normalized_source,
+        data_root=data_root,
+    )
+
+    if not output_path.is_file():
+        raise FileNotFoundError(f"CSV file not found: {output_path}")
+
+    raw_rows = read_historical_bid_ask_csv(output_path)
+    rows_before = len(raw_rows)
+    first_iso_before, last_iso_before = _first_last_timestamp_iso(raw_rows)
+
+    filtered_rows: list[dict[str, Any]] = []
+    for raw_row in raw_rows:
+        if not _row_passes_basic_filters(raw_row, normalized_coin):
+            continue
+        timestamp_ms = int(float(raw_row[TIMESTAMP_MS]))
+        best_bid = float(raw_row[BEST_BID])
+        best_ask = float(raw_row[BEST_ASK])
+        filtered_rows.append(
+            _recompute_repaired_row(
+                raw_row,
+                timestamp_ms=timestamp_ms,
+                coin=normalized_coin,
+                best_bid=best_bid,
+                best_ask=best_ask,
+            )
+        )
+
+    rows_after_basic_filters = len(filtered_rows)
+    timestamp_iso_recomputed_count = rows_after_basic_filters
+
+    after_mock_rows = filtered_rows
+    mock_rows_removed = 0
+    if drop_mock_rows:
+        kept: list[dict[str, Any]] = []
+        for row in filtered_rows:
+            if _is_mock_row(row, mock_bid, mock_ask):
+                mock_rows_removed += 1
+            else:
+                kept.append(row)
+        after_mock_rows = kept
+
+    deduped: dict[int, dict[str, Any]] = {}
+    for row in after_mock_rows:
+        deduped[int(row[TIMESTAMP_MS])] = row
+
+    duplicate_rows_removed = len(after_mock_rows) - len(deduped)
+    final_rows = sorted(deduped.values(), key=lambda item: int(item[TIMESTAMP_MS]))
+
+    first_iso_after = timestamp_ms_to_iso(int(final_rows[0][TIMESTAMP_MS])) if final_rows else None
+    last_iso_after = timestamp_ms_to_iso(int(final_rows[-1][TIMESTAMP_MS])) if final_rows else None
+
+    backup_path: Path | None = None
+    if not dry_run:
+        backup_dir.mkdir(parents=True, exist_ok=True)
+        timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+        backup_path = backup_dir / f"{normalized_coin}_{interval}_repair_{timestamp}.csv"
+        shutil.copy2(output_path, backup_path)
+        write_repaired_bid_ask_csv(
+            final_rows,
+            output_path,
+            data_root=data_root,
+            interval=interval,
+            source=normalized_source,
+        )
+
+    report = HistoricalRepairReport(
+        coin=normalized_coin,
+        source=normalized_source,
+        interval=interval,
+        path=str(output_path.resolve()),
+        dry_run=dry_run,
+        backup_path=str(backup_path.resolve()) if backup_path is not None else None,
+        rows_before=rows_before,
+        rows_after_basic_filters=rows_after_basic_filters,
+        duplicate_rows_removed=duplicate_rows_removed,
+        mock_rows_removed=mock_rows_removed,
+        rows_after=len(final_rows),
+        timestamp_iso_recomputed_count=timestamp_iso_recomputed_count,
+        first_timestamp_iso_before=first_iso_before,
+        last_timestamp_iso_before=last_iso_before,
+        first_timestamp_iso_after=first_iso_after,
+        last_timestamp_iso_after=last_iso_after,
+        duplicate_timestamps_after=_count_duplicate_timestamps(final_rows),
+        monotonic_after=_is_monotonic_timestamps(final_rows),
+    )
+    report_path = write_historical_repair_report(report, data_root=data_root)
+    return report, report_path
+
+
 def _cmd_inspect_path(args: argparse.Namespace) -> int:
     path = build_archive_s3_path(args.date, args.hour, args.coin, datatype=args.datatype)
     print(path)
     return 0
+
+
+def _flatten_coins(coin_groups: list[list[str]]) -> list[str]:
+    coins: list[str] = []
+    for group in coin_groups:
+        for coin in group:
+            normalized = coin.strip().upper()
+            if normalized:
+                coins.append(normalized)
+    return coins
+
+
+def _cmd_repair_csv(args: argparse.Namespace) -> int:
+    coins = _flatten_coins(args.coin)
+    if not coins:
+        print("At least one --coin is required", file=sys.stderr)
+        return 1
+
+    data_root = Path(args.data_root)
+    backup_dir = Path(args.backup_dir)
+    drop_mock_rows = bool(args.drop_mock_rows)
+    exit_code = 0
+
+    for coin in coins:
+        try:
+            report, report_path = repair_historical_bid_ask_csv(
+                coin,
+                interval=args.interval,
+                source=args.source,
+                data_root=data_root,
+                backup_dir=backup_dir,
+                dry_run=args.dry_run,
+                drop_mock_rows=drop_mock_rows,
+                mock_bid=args.mock_bid,
+                mock_ask=args.mock_ask,
+            )
+        except Exception as exc:  # noqa: BLE001 - CLI boundary
+            print(f"coin={coin} error={exc}", file=sys.stderr)
+            exit_code = 1
+            continue
+
+        print(f"coin={report.coin} source={report.source} interval={report.interval}")
+        print(f"path={report.path}")
+        print(f"dry_run={report.dry_run}")
+        print(f"rows_before={report.rows_before}")
+        print(f"rows_after={report.rows_after}")
+        print(f"duplicate_rows_removed={report.duplicate_rows_removed}")
+        print(f"mock_rows_removed={report.mock_rows_removed}")
+        print(f"monotonic_after={report.monotonic_after}")
+        print(f"duplicate_timestamps_after={report.duplicate_timestamps_after}")
+        if report.backup_path:
+            print(f"backup_path={report.backup_path}")
+        print(f"report_path={report_path}")
+        print(SAFETY_STATEMENT)
+
+    return exit_code
 
 
 def _cmd_summarize(args: argparse.Namespace) -> int:
@@ -614,6 +955,67 @@ def build_parser() -> argparse.ArgumentParser:
         help="Bid/ask output root (default: data/bid_ask_csv)",
     )
     summarize_parser.set_defaults(func=_cmd_summarize)
+
+    repair_parser = subparsers.add_parser(
+        "repair-csv",
+        help="Back up, clean, dedupe, and rewrite historical bid/ask CSVs (local only)",
+    )
+    repair_parser.add_argument(
+        "--coin",
+        nargs="+",
+        action="append",
+        required=True,
+        help="Coin symbol(s), e.g. --coin BTC ETH or --coin BTC --coin ETH",
+    )
+    repair_parser.add_argument(
+        "--interval",
+        default="1s",
+        help="CSV interval (default: 1s)",
+    )
+    repair_parser.add_argument(
+        "--source",
+        default="historical",
+        help="Data source: historical or local (default: historical)",
+    )
+    repair_parser.add_argument(
+        "--data-root",
+        default=str(DEFAULT_OUTPUT_ROOT),
+        help="Bid/ask data root (default: data/bid_ask_csv)",
+    )
+    repair_parser.add_argument(
+        "--backup-dir",
+        default=str(DEFAULT_BACKUP_DIR),
+        help="Backup directory (default: data/bid_ask_csv/backups)",
+    )
+    repair_parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="Analyze and report without writing backup or modifying CSV",
+    )
+    mock_group = repair_parser.add_mutually_exclusive_group()
+    mock_group.add_argument(
+        "--drop-mock-rows",
+        action="store_true",
+        help="Drop rows matching mock bid/ask defaults (100.0/100.1)",
+    )
+    mock_group.add_argument(
+        "--keep-mock-rows",
+        action="store_true",
+        help="Keep mock-looking rows (default)",
+    )
+    repair_parser.add_argument(
+        "--mock-bid",
+        type=float,
+        default=DEFAULT_MOCK_BID,
+        help="Mock bid price used with --drop-mock-rows (default: 100.0)",
+    )
+    repair_parser.add_argument(
+        "--mock-ask",
+        type=float,
+        default=DEFAULT_MOCK_ASK,
+        help="Mock ask price used with --drop-mock-rows (default: 100.1)",
+    )
+    repair_parser.set_defaults(func=_cmd_repair_csv)
 
     return parser
 
