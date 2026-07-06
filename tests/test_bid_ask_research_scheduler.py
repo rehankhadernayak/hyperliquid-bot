@@ -2041,6 +2041,59 @@ class TestConfigurePhaseBackfill:
         )
         assert captured == [["BTC", "ETH"]]
 
+    def test_phase_mode_tick_preserves_daily_limits_when_ramp_would_apply(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            coins=["BTC", "ETH"],
+            target_days=14,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        state.autopilot.successful_days_in_row = 2
+        state.autopilot.ramp_every_successful_days = 2
+        scheduler.save_state(state, state_path)
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=6)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.daily_file_limit == 144
+        assert state.autopilot.daily_chunk_limit == 12
+        assert report.daily_file_limit == 144
+        assert report.daily_chunk_limit == 12
+        assert report.focused_coins == ["BTC", "ETH"]
+        assert report.phase_backfill_enabled is True
+        assert report.phase_backfill_name == "phase3_btc_eth_recent"
+        assert report.target_days == 14
+        assert report.ramp_skipped_for_phase_backfill is True
+        assert not any("Ramp applied" in warning for warning in report.warnings)
+
+        status = scheduler.cmd_autopilot_status(
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+        )
+        assert status["daily_file_limit"] == 144
+        assert status["daily_chunk_limit"] == 12
+        assert status["focused_coins"] == ["BTC", "ETH"]
+        assert status["estimated_real_days_to_complete"] == pytest.approx(4.6666666667)
+
+        saved = json.loads(Path(state.autopilot.last_autopilot_report_path).read_text(encoding="utf-8"))
+        assert saved["focused_coins"] == ["BTC", "ETH"]
+        assert saved["ramp_skipped_for_phase_backfill"] is True
+        assert saved["daily_file_limit"] == 144
+        assert saved["daily_chunk_limit"] == 12
+
     def test_safety_flags_remain_paper_only(self, tmp_path: Path) -> None:
         state_path = _init_state(tmp_path)
         scheduler.cmd_configure_phase_backfill(

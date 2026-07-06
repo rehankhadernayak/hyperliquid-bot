@@ -260,6 +260,11 @@ class AutopilotReport:
     daily_file_limit: int | None = None
     chunks_completed_today: int | None = None
     files_downloaded_today: int | None = None
+    phase_backfill_enabled: bool = False
+    phase_backfill_name: str | None = None
+    focused_coins: list[str] = field(default_factory=list)
+    target_days: int | None = None
+    ramp_skipped_for_phase_backfill: bool = False
     autopilot_snapshot: dict[str, Any] = field(default_factory=dict)
     workflows_run: list[str] = field(default_factory=list)
     historical_date: str | None = None
@@ -288,6 +293,11 @@ class AutopilotReport:
             "daily_file_limit": self.daily_file_limit,
             "chunks_completed_today": self.chunks_completed_today,
             "files_downloaded_today": self.files_downloaded_today,
+            "phase_backfill_enabled": self.phase_backfill_enabled,
+            "phase_backfill_name": self.phase_backfill_name,
+            "focused_coins": self.focused_coins,
+            "target_days": self.target_days,
+            "ramp_skipped_for_phase_backfill": self.ramp_skipped_for_phase_backfill,
             "autopilot_snapshot": self.autopilot_snapshot,
             "workflows_run": self.workflows_run,
             "historical_date": self.historical_date,
@@ -523,6 +533,11 @@ def _populate_autopilot_report_limits(
     report.daily_file_limit = autopilot.daily_file_limit
     report.chunks_completed_today = autopilot.chunks_completed_today
     report.files_downloaded_today = autopilot.files_downloaded_today
+    report.phase_backfill_enabled = autopilot.phase_backfill_enabled
+    report.phase_backfill_name = autopilot.phase_backfill_name
+    report.focused_coins = list(autopilot.focused_coins)
+    report.target_days = autopilot.target_days if autopilot.target_days > 0 else None
+    report.ramp_skipped_for_phase_backfill = autopilot.phase_backfill_enabled
 
 
 def _autopilot_would_exceed_daily_limits(
@@ -563,18 +578,29 @@ def _maybe_ramp_autopilot_limits(
     num_coins: int,
 ) -> bool:
     """Apply ramp when streak threshold met. Returns True if limits were increased."""
+    if autopilot.phase_backfill_enabled:
+        return False
     if not autopilot.ramp_enabled:
         return False
     if autopilot.successful_days_in_row < autopilot.ramp_every_successful_days:
         return False
-    autopilot.daily_chunk_limit = min(
+    prior_chunk_limit = autopilot.daily_chunk_limit
+    prior_file_limit = autopilot.daily_file_limit
+    new_chunk_limit = min(
         autopilot.max_daily_chunk_limit,
         autopilot.daily_chunk_limit + autopilot.ramp_chunk_increment,
     )
-    autopilot.daily_file_limit = min(
+    computed_file_limit = min(
         autopilot.max_daily_file_limit,
-        autopilot.daily_chunk_limit * chunk_size_hours * num_coins,
+        new_chunk_limit * chunk_size_hours * num_coins,
     )
+    autopilot.daily_chunk_limit = max(prior_chunk_limit, new_chunk_limit)
+    autopilot.daily_file_limit = max(prior_file_limit, computed_file_limit)
+    if (
+        autopilot.daily_chunk_limit == prior_chunk_limit
+        and autopilot.daily_file_limit == prior_file_limit
+    ):
+        return False
     autopilot.successful_days_in_row = 0
     return True
 
