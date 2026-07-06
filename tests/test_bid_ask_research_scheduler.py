@@ -945,15 +945,24 @@ def _mock_auto_daily_cycle(
     *,
     failures: list[str] | None = None,
     validation_warning: str | None = None,
+    advance_csv: bool = True,
 ) -> list[dict[str, object]]:
     captured: list[dict[str, object]] = []
 
     def fake_daily_cycle(**kwargs: object) -> scheduler.SchedulerReport:
         captured.append(dict(kwargs))
         hours = kwargs.get("historical_hours") or []
+        data_root = kwargs.get("data_root")
+        coins = list(kwargs.get("coins") or ["BTC", "ETH", "SOL"])
+        date = str(kwargs.get("date") or "20230916")
+        if failures is None and advance_csv and isinstance(data_root, Path):
+            for coin in coins:
+                hour = int(hours[0]) if hours else 9
+                _append_historical_csv(data_root, coin, date=date, hour=hour)
+
         report = scheduler.SchedulerReport(
             workflows_run=["daily-cycle", "resample-validate", "train-evaluate-historical"],
-            historical_date=str(kwargs.get("date")),
+            historical_date=date,
             historical_hours=[str(h) for h in hours],
             train_interval=str(kwargs.get("train_interval")),
             horizon=int(kwargs.get("horizon") or 5),
@@ -967,8 +976,19 @@ def _mock_auto_daily_cycle(
                     "details": {
                         "orchestrator_batch": {
                             "download": {
-                                "file_results": [{"status": "downloaded"}],
-                            }
+                                "file_results": [
+                                    {"status": "downloaded", "download_status": "downloaded"}
+                                ],
+                                "downloaded_count": 1,
+                            },
+                            "import": [
+                                {
+                                    "coin": coin,
+                                    "import_status": "imported",
+                                    "rows_written": 100,
+                                }
+                                for coin in coins
+                            ],
                         }
                     }
                 },
@@ -1006,17 +1026,122 @@ def _enable_autopilot(
     )
 
 
+def _append_historical_csv(
+    data_root: Path,
+    coin: str,
+    *,
+    date: str,
+    hour: int,
+) -> Path:
+    from bid_ask_schema import (
+        ASK_SIZE,
+        BEST_ASK,
+        BEST_BID,
+        BID_ASK_CSV_COLUMNS,
+        BID_SIZE,
+        TIMESTAMP_MS,
+    )
+
+    csv_dir = data_root / "historical_1s"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / f"{coin}_1s.csv"
+    base_ms = int(
+        __import__("datetime")
+        .datetime.strptime(date, "%Y%m%d")
+        .replace(hour=hour, tzinfo=__import__("datetime").timezone.utc)
+        .timestamp()
+        * 1000
+    )
+    row = {
+        TIMESTAMP_MS: str(base_ms + 1000),
+        BEST_BID: "100.0",
+        BEST_ASK: "100.1",
+        BID_SIZE: "1.0",
+        ASK_SIZE: "1.0",
+        "coin": coin,
+        "source_session_id": "historical_archive",
+        "source_channel": "historical_l2Book",
+    }
+    import csv
+
+    write_header = not csv_path.is_file()
+    with csv_path.open("a", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=BID_ASK_CSV_COLUMNS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        writer.writerow(row)
+    return csv_path
+
+
 def _mock_auto_backfill_next(
     monkeypatch: pytest.MonkeyPatch,
     *,
     failures: list[str] | None = None,
     validation_warning: str | None = None,
     downloaded_files: int = 1,
+    skipped_existing: int = 0,
+    advance_csv: bool = True,
+    inject_import_progress: bool = True,
+    import_failures: list[str] | None = None,
 ) -> list[dict[str, object]]:
     captured: list[dict[str, object]] = []
+    call_counter = {"n": 0}
+
+    def _build_import_progress(coins: list[str]) -> dict[str, object]:
+        if import_failures:
+            return {
+                "any_import_progress": False,
+                "files_downloaded_new": downloaded_files,
+                "files_skipped_existing": skipped_existing,
+                "files_imported": 0,
+                "files_requested": downloaded_files + skipped_existing,
+                "import_failures": list(import_failures),
+                "import_progress_by_coin": {coin: False for coin in coins},
+                "rows_added_by_coin": {coin: 0 for coin in coins},
+                "timestamp_advanced_by_coin": {coin: False for coin in coins},
+                "pre_import_coverage": {},
+                "post_import_coverage": {},
+            }
+        progressed = failures is None and advance_csv
+        return {
+            "any_import_progress": progressed,
+            "files_downloaded_new": downloaded_files if progressed else 0,
+            "files_skipped_existing": skipped_existing,
+            "files_imported": downloaded_files if progressed else 0,
+            "files_requested": downloaded_files + skipped_existing,
+            "import_failures": [],
+            "import_progress_by_coin": {coin: progressed for coin in coins},
+            "rows_added_by_coin": {coin: (1 if progressed else 0) for coin in coins},
+            "timestamp_advanced_by_coin": {coin: progressed for coin in coins},
+            "pre_import_coverage": {},
+            "post_import_coverage": {},
+        }
 
     def fake_auto_backfill(**kwargs: object) -> scheduler.SchedulerReport:
         captured.append(dict(kwargs))
+        data_root = kwargs.get("data_root")
+        coins = list(kwargs.get("coins") or ["BTC", "ETH", "SOL"])
+        if failures is None and advance_csv and isinstance(data_root, Path):
+            call_counter["n"] += 1
+            hour = 9 + call_counter["n"]
+            for coin in coins:
+                _append_historical_csv(data_root, coin, date="20230916", hour=hour)
+
+        file_results: list[dict[str, str]] = []
+        for _ in range(downloaded_files):
+            file_results.append({"status": "downloaded", "download_status": "downloaded"})
+        for _ in range(skipped_existing):
+            file_results.append(
+                {"status": "skipped_existing", "download_status": "skipped_existing"}
+            )
+
+        import_payload: list[dict[str, object]] = []
+        if downloaded_files > 0 and failures is None and advance_csv:
+            import_payload = [
+                {"coin": coin, "import_status": "imported", "rows_written": 100}
+                for coin in coins[: max(1, downloaded_files // max(1, len(coins)))]
+            ]
+
         hours = kwargs.get("chunk_size_hours")
         report = scheduler.SchedulerReport(
             workflows_run=["auto-backfill-next", "daily-cycle"],
@@ -1034,8 +1159,11 @@ def _mock_auto_backfill_next(
                     "details": {
                         "orchestrator_batch": {
                             "download": {
-                                "file_results": [{"status": "downloaded"}] * downloaded_files,
-                            }
+                                "file_results": file_results,
+                                "downloaded_count": downloaded_files,
+                                "skipped_count": skipped_existing,
+                            },
+                            "import": import_payload,
                         }
                     }
                 },
@@ -1045,6 +1173,8 @@ def _mock_auto_backfill_next(
                 },
             },
         )
+        if inject_import_progress:
+            report.details["import_progress"] = _build_import_progress(coins)
         if failures:
             report.failures.extend(failures)
         return report
@@ -1536,6 +1666,268 @@ class TestAutopilotTick:
         assert autopilot["failed_runs_in_row"] == 1
 
 
+class TestAutopilotImportProgress:
+    def test_chunk_completed_only_when_historical_1s_advances(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        data_root = tmp_path / "data"
+        _mock_auto_backfill_next(
+            monkeypatch,
+            downloaded_files=3,
+            inject_import_progress=False,
+            advance_csv=True,
+        )
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            data_root=data_root,
+            today_override="20230916",
+        )
+
+        assert report.action == "chunk_completed"
+        assert report.import_progress_by_coin.get("BTC") is True
+        assert report.rows_added_by_coin.get("BTC", 0) > 0
+
+    def test_no_import_progress_when_csv_unchanged(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH", "SOL"]:
+            _write_historical_csv(data_root, coin, date="20230916", hour=12)
+        _mock_auto_backfill_next(
+            monkeypatch,
+            downloaded_files=3,
+            skipped_existing=0,
+            advance_csv=False,
+            inject_import_progress=False,
+        )
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            data_root=data_root,
+            today_override="20230916",
+        )
+
+        assert report.action == "no_import_progress"
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.chunks_completed_today == 0
+        assert state.autopilot.files_downloaded_today == 0
+
+    def test_skipped_existing_files_not_counted_as_new_downloads(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(
+            monkeypatch,
+            downloaded_files=0,
+            skipped_existing=9,
+            advance_csv=False,
+        )
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        assert report.action == "no_import_progress"
+        assert report.files_downloaded_new == 0
+        assert report.files_skipped_existing == 9
+
+    def test_report_includes_pre_post_coverage_and_rows_added(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        data_root = tmp_path / "data"
+        _mock_auto_backfill_next(
+            monkeypatch,
+            downloaded_files=2,
+            inject_import_progress=False,
+            advance_csv=True,
+        )
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            data_root=data_root,
+            today_override="20230916",
+        )
+
+        assert report.pre_import_coverage
+        assert report.post_import_coverage
+        assert "BTC" in report.rows_added_by_coin
+        saved = json.loads(
+            Path(report.details["scheduler_report_paths"]["json"]).read_text(encoding="utf-8")
+        )
+        assert "pre_import_coverage" in saved
+        assert "rows_added_by_coin" in saved
+
+    def test_files_downloaded_today_increments_only_for_new_files(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=3, skipped_existing=6)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        assert report.action == "chunk_completed"
+        assert report.files_downloaded_new == 3
+        assert report.files_skipped_existing == 6
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.files_downloaded_today == 3
+
+    def test_phase_mode_no_progress_does_not_consume_daily_chunk_quota(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            coins=["BTC", "ETH"],
+            target_days=14,
+            daily_file_limit=144,
+            daily_chunk_limit=24,
+            require_confirmation_text=scheduler.PHASE_BACKFILL_CONFIRMATION_TEXT,
+            state_path=state_path,
+        )
+        _mock_auto_backfill_next(
+            monkeypatch,
+            downloaded_files=0,
+            skipped_existing=6,
+            advance_csv=False,
+        )
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        assert report.action == "no_import_progress"
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.chunks_completed_today == 0
+        assert state.autopilot.runs_today == 0
+
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=3)
+        second = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+        assert second.action == "chunk_completed"
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.chunks_completed_today == 1
+
+    def test_audit_recommends_importer_issue_for_no_import_progress(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        runs_dir = tmp_path / "runs"
+        _write_autopilot_report(
+            runs_dir,
+            action="no_import_progress",
+            files_downloaded_today=0,
+            chunks_completed_today=0,
+        )
+
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC", "ETH"],
+            data_root=tmp_path / "data",
+            downloads_root=tmp_path / "downloads",
+            reports_dir=runs_dir,
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+        )
+
+        assert audit["scheduler_progress"]["latest_action"] == "no_import_progress"
+        assert audit["next_recommended_action"] == "investigate date/hour planning or importer path"
+
+    def test_import_failed_action_on_importer_errors(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(
+            monkeypatch,
+            import_failures=["BTC: import failed: corrupt jsonl"],
+        )
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+        )
+
+        assert report.action == "import_failed"
+        assert state_path
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.chunks_completed_today == 0
+
+
+class TestImportProgressHelpers:
+    def test_compute_import_progress_delta(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        pre = scheduler._historical_1s_coverage_by_coin(["BTC"], data_root)
+        _append_historical_csv(data_root, "BTC", date="20230916", hour=10)
+        post = scheduler._historical_1s_coverage_by_coin(["BTC"], data_root)
+        delta = scheduler._compute_import_progress_delta(pre, post)
+
+        assert delta["rows_added_by_coin"]["BTC"] == 1
+        assert delta["timestamp_advanced_by_coin"]["BTC"] is True
+        assert delta["import_progress_by_coin"]["BTC"] is True
+        assert delta["any_import_progress"] is True
+
+    def test_summarize_batch_file_stats_uses_download_status(self) -> None:
+        stats = scheduler._summarize_batch_file_stats(
+            {
+                "download": {
+                    "file_results": [
+                        {"download_status": "downloaded"},
+                        {"download_status": "skipped_existing"},
+                    ]
+                },
+                "import": [{"import_status": "imported", "rows_written": 50}],
+            }
+        )
+        assert stats["files_downloaded_new"] == 1
+        assert stats["files_skipped_existing"] == 1
+        assert stats["files_imported"] == 1
+
+
 class TestLaunchdAutopilot:
     def test_autopilot_template(self, tmp_path: Path) -> None:
         state_dir = tmp_path / "scheduler"
@@ -1746,6 +2138,7 @@ class TestAutoBackfillNext:
             state_path=state_path,
             runs_dir=tmp_path / "runs",
             daily_summary_dir=tmp_path / "daily",
+            data_root=tmp_path / "data",
         )
 
         state = scheduler.load_state(state_path)
@@ -1766,6 +2159,7 @@ class TestAutoBackfillNext:
             state_path=state_path,
             runs_dir=tmp_path / "runs",
             daily_summary_dir=tmp_path / "daily",
+            data_root=tmp_path / "data",
         )
 
         state = scheduler.load_state(state_path)

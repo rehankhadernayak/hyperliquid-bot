@@ -54,6 +54,10 @@ REPAIR_INFERRED_WARNING = (
 AUTOPILOT_FAILURE_PAUSE_THRESHOLD = 3
 AUTOPILOT_DISABLED_MESSAGE = "Autopilot is disabled; no work performed."
 AUTOPILOT_PAUSED_MESSAGE = "Autopilot is paused; no work performed."
+NO_IMPORT_PROGRESS_MESSAGE = (
+    "Chunk cycle completed but historical_1s CSVs did not advance; "
+    "check date/hour planning or importer path."
+)
 LAUNCHD_PLIST_NAME_AUTOPILOT = "com.hyperliquid.research.autopilot.plist"
 LAUNCHD_PLIST_NAME_AUTOPILOT_HOURLY = "com.hyperliquid.research.autopilot.hourly.plist"
 LAUNCHD_SETUP_MD_HOURLY = "launchd_hourly_autopilot_setup.md"
@@ -265,7 +269,17 @@ class AutopilotReport:
     chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS
     estimated_files: int = 0
     requested_files: int = 0
+    files_requested: int = 0
     files_downloaded: int = 0
+    files_downloaded_new: int = 0
+    files_skipped_existing: int = 0
+    files_imported: int = 0
+    pre_import_coverage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    post_import_coverage: dict[str, dict[str, Any]] = field(default_factory=dict)
+    import_progress_by_coin: dict[str, bool] = field(default_factory=dict)
+    rows_added_by_coin: dict[str, int] = field(default_factory=dict)
+    timestamp_advanced_by_coin: dict[str, bool] = field(default_factory=dict)
+    real_execution_ready: bool = False
     daily_chunk_limit: int | None = None
     daily_file_limit: int | None = None
     effective_daily_file_capacity: int | None = None
@@ -299,7 +313,17 @@ class AutopilotReport:
             "chunk_size_hours": self.chunk_size_hours,
             "estimated_files": self.estimated_files,
             "requested_files": self.requested_files,
+            "files_requested": self.files_requested,
             "files_downloaded": self.files_downloaded,
+            "files_downloaded_new": self.files_downloaded_new,
+            "files_skipped_existing": self.files_skipped_existing,
+            "files_imported": self.files_imported,
+            "pre_import_coverage": self.pre_import_coverage,
+            "post_import_coverage": self.post_import_coverage,
+            "import_progress_by_coin": self.import_progress_by_coin,
+            "rows_added_by_coin": self.rows_added_by_coin,
+            "timestamp_advanced_by_coin": self.timestamp_advanced_by_coin,
+            "real_execution_ready": self.real_execution_ready,
             "daily_chunk_limit": self.daily_chunk_limit,
             "daily_file_limit": self.daily_file_limit,
             "effective_daily_file_capacity": self.effective_daily_file_capacity,
@@ -501,7 +525,8 @@ def _reconcile_autopilot_usage_from_reports(
             continue
         chunks += 1
         files += int(
-            payload.get("files_downloaded")
+            payload.get("files_downloaded_new")
+            or payload.get("files_downloaded")
             or payload.get("requested_files")
             or payload.get("estimated_files")
             or 0
@@ -884,6 +909,156 @@ def _csv_coverage_entry(csv_path: Path) -> dict[str, Any]:
     return entry
 
 
+def _historical_1s_coverage_by_coin(
+    coins: list[str],
+    data_root: Path,
+) -> dict[str, dict[str, Any]]:
+    return {
+        coin: _csv_coverage_entry(default_historical_output_path(coin, output_root=data_root))
+        for coin in coins
+    }
+
+
+def _compute_import_progress_delta(
+    pre_coverage: dict[str, dict[str, Any]],
+    post_coverage: dict[str, dict[str, Any]],
+) -> dict[str, Any]:
+    rows_added_by_coin: dict[str, int] = {}
+    timestamp_advanced_by_coin: dict[str, bool] = {}
+    import_progress_by_coin: dict[str, bool] = {}
+
+    for coin in pre_coverage:
+        pre = pre_coverage.get(coin) or {}
+        post = post_coverage.get(coin) or {}
+        pre_rows = int(pre.get("row_count") or 0)
+        post_rows = int(post.get("row_count") or 0)
+        pre_last = pre.get("last_timestamp_ms")
+        post_last = post.get("last_timestamp_ms")
+
+        rows_added = max(0, post_rows - pre_rows)
+        ts_advanced = post_last is not None and (
+            pre_last is None or int(post_last) > int(pre_last)
+        )
+        rows_added_by_coin[coin] = rows_added
+        timestamp_advanced_by_coin[coin] = ts_advanced
+        import_progress_by_coin[coin] = rows_added > 0 or ts_advanced
+
+    return {
+        "rows_added_by_coin": rows_added_by_coin,
+        "timestamp_advanced_by_coin": timestamp_advanced_by_coin,
+        "import_progress_by_coin": import_progress_by_coin,
+        "any_import_progress": any(import_progress_by_coin.values()),
+    }
+
+
+def _orchestrator_batch_from_scheduler_report(report: SchedulerReport) -> dict[str, Any]:
+    backfill = (report.details or {}).get("historical_backfill") or {}
+    if not isinstance(backfill, dict):
+        return {}
+    details = backfill.get("details") or {}
+    if not isinstance(details, dict):
+        return {}
+    batch = details.get("orchestrator_batch") or {}
+    return batch if isinstance(batch, dict) else {}
+
+
+def _summarize_batch_file_stats(batch_payload: dict[str, Any]) -> dict[str, int]:
+    download = batch_payload.get("download") or {}
+    file_results = download.get("file_results") or []
+    if not isinstance(file_results, list):
+        file_results = []
+
+    files_downloaded_new = int(download.get("downloaded_count") or 0)
+    files_skipped_existing = int(download.get("skipped_count") or 0)
+
+    if file_results:
+        files_downloaded_new = sum(
+            1
+            for item in file_results
+            if item.get("download_status") == "downloaded" or item.get("status") == "downloaded"
+        )
+        files_skipped_existing = sum(
+            1
+            for item in file_results
+            if item.get("download_status") == "skipped_existing"
+            or item.get("decompress_status") == "skipped_existing"
+            or item.get("status") in {"skipped", "skipped_existing"}
+        )
+
+    import_results = batch_payload.get("import") or []
+    if not isinstance(import_results, list):
+        import_results = []
+    files_imported = sum(
+        1
+        for item in import_results
+        if item.get("import_status") == "imported" and int(item.get("rows_written") or 0) > 0
+    )
+
+    command_plan = batch_payload.get("command_plan") or {}
+    files_requested = int(command_plan.get("total_files") or command_plan.get("max_files") or 0)
+    if files_requested == 0:
+        files_requested = int(download.get("selected_files") or download.get("requested_files") or 0)
+
+    return {
+        "files_requested": files_requested,
+        "files_downloaded_new": files_downloaded_new,
+        "files_skipped_existing": files_skipped_existing,
+        "files_imported": files_imported,
+    }
+
+
+def _extract_import_failures(batch_payload: dict[str, Any]) -> list[str]:
+    import_results = batch_payload.get("import") or []
+    if not isinstance(import_results, list):
+        return []
+    failures: list[str] = []
+    for item in import_results:
+        if item.get("import_status") == "failed":
+            coin = item.get("coin") or "unknown"
+            error = item.get("error") or "unknown import error"
+            failures.append(f"{coin}: import failed: {error}")
+    return failures
+
+
+def _build_import_progress_report(
+    *,
+    coins: list[str],
+    data_root: Path,
+    pre_coverage: dict[str, dict[str, Any]],
+    batch_payload: dict[str, Any],
+) -> dict[str, Any]:
+    post_coverage = _historical_1s_coverage_by_coin(coins, data_root)
+    delta = _compute_import_progress_delta(pre_coverage, post_coverage)
+    file_stats = _summarize_batch_file_stats(batch_payload)
+    import_failures = _extract_import_failures(batch_payload)
+    return {
+        "pre_import_coverage": pre_coverage,
+        "post_import_coverage": post_coverage,
+        "import_failures": import_failures,
+        **delta,
+        **file_stats,
+    }
+
+
+def _populate_autopilot_import_fields(
+    report: AutopilotReport,
+    progress: dict[str, Any],
+    *,
+    requested_files: int,
+) -> None:
+    report.files_requested = requested_files
+    report.files_downloaded = int(progress.get("files_downloaded_new") or 0)
+    report.files_downloaded_new = int(progress.get("files_downloaded_new") or 0)
+    report.files_skipped_existing = int(progress.get("files_skipped_existing") or 0)
+    report.files_imported = int(progress.get("files_imported") or 0)
+    report.pre_import_coverage = dict(progress.get("pre_import_coverage") or {})
+    report.post_import_coverage = dict(progress.get("post_import_coverage") or {})
+    report.import_progress_by_coin = dict(progress.get("import_progress_by_coin") or {})
+    report.rows_added_by_coin = dict(progress.get("rows_added_by_coin") or {})
+    report.timestamp_advanced_by_coin = dict(progress.get("timestamp_advanced_by_coin") or {})
+    report.real_execution_ready = False
+
+
 def _resampled_coverage_entry(
     coin: str,
     interval: str,
@@ -988,6 +1163,9 @@ def _build_scheduler_progress(
             snapshot.get("files_downloaded_today"),
             autopilot.files_downloaded_today,
         ),
+        "files_downloaded_new": _pick_int((report or {}).get("files_downloaded_new")),
+        "files_imported": _pick_int((report or {}).get("files_imported")),
+        "files_skipped_existing": _pick_int((report or {}).get("files_skipped_existing")),
         "chunks_completed_today": _pick_int(
             (report or {}).get("chunks_completed_today"),
             snapshot.get("chunks_completed_today"),
@@ -1159,7 +1337,15 @@ def _recommend_phase_audit_action(
     resampled: dict[str, dict[str, dict[str, Any]]],
     candidate: dict[str, Any],
     coins: list[str],
+    scheduler_progress: dict[str, Any] | None = None,
 ) -> str:
+    progress = scheduler_progress or {}
+    latest_action = progress.get("latest_action")
+    if latest_action == "no_import_progress":
+        return "investigate date/hour planning or importer path"
+    if latest_action == "import_failed":
+        return "investigate importer errors in latest autopilot report"
+
     has_downloads = int(downloads.get("total_files") or 0) > 0
     any_1s_stale = any(
         imported_1s.get(coin, {}).get("freshness_status") in {"stale", "missing"}
@@ -1245,6 +1431,7 @@ def build_phase_backfill_audit(
     downloads = _summarize_downloads(downloads_root, coins)
     candidate = _build_candidate_freshness(candidate_reports_dir)
     autopilot = state.autopilot if state else AutopilotState()
+    scheduler_progress = _build_scheduler_progress(state=state, runs_dir=reports_dir)
 
     audit: dict[str, Any] = {
         "generated_at": _utc_now_iso(),
@@ -1257,7 +1444,7 @@ def build_phase_backfill_audit(
         "source": normalized_source,
         "coins": coins,
         "phase_config": _build_phase_config(autopilot, chunk_size_hours=chunk_size_hours),
-        "scheduler_progress": _build_scheduler_progress(state=state, runs_dir=reports_dir),
+        "scheduler_progress": scheduler_progress,
         "downloads": downloads,
         "imported_historical_1s": imported_1s,
         "resampled_coverage": resampled,
@@ -1269,10 +1456,24 @@ def build_phase_backfill_audit(
         resampled=resampled,
         candidate=candidate,
         coins=coins,
+        scheduler_progress=scheduler_progress,
     )
     if candidate.get("repeated_unchanged_warning"):
         audit.setdefault("warnings", []).append(
             "Candidate validation results unchanged across recent reports"
+        )
+    claimed_new = int(scheduler_progress.get("files_downloaded_new") or 0)
+    claimed_today = int(scheduler_progress.get("files_downloaded_today") or 0)
+    newest_mtime = downloads.get("newest_mtime_iso")
+    if (
+        (claimed_new > 0 or claimed_today > 0)
+        and newest_mtime
+        and str(newest_mtime) < "2026-07-04"
+        and scheduler_progress.get("latest_action") == "chunk_completed"
+    ):
+        audit.setdefault("warnings", []).append(
+            "Autopilot reports downloads but downloads_newest_mtime is old; "
+            "skipped/existing files may have been counted as new downloads"
         )
     return audit
 
@@ -1569,8 +1770,13 @@ def write_autopilot_report(
         f"- coins: {', '.join(report.coins) or 'none'}",
         f"- chunk_size_hours: {report.chunk_size_hours}",
         f"- requested_files: {report.requested_files}",
+        f"- files_requested: {report.files_requested}",
         f"- estimated_files: {report.estimated_files}",
         f"- files_downloaded: {report.files_downloaded}",
+        f"- files_downloaded_new: {report.files_downloaded_new}",
+        f"- files_skipped_existing: {report.files_skipped_existing}",
+        f"- files_imported: {report.files_imported}",
+        f"- real_execution_ready: {report.real_execution_ready}",
     ]
     if report.daily_chunk_limit is not None:
         lines.append(f"- daily_chunk_limit: {report.daily_chunk_limit}")
@@ -1588,6 +1794,16 @@ def write_autopilot_report(
         lines.append(f"- historical_date: {report.historical_date}")
     if report.historical_hours:
         lines.append(f"- historical_hours: {', '.join(report.historical_hours)}")
+    if report.import_progress_by_coin:
+        lines.append(
+            "- import_progress_by_coin: "
+            + ", ".join(f"{coin}={value}" for coin, value in report.import_progress_by_coin.items())
+        )
+    if report.rows_added_by_coin:
+        lines.append(
+            "- rows_added_by_coin: "
+            + ", ".join(f"{coin}={value}" for coin, value in report.rows_added_by_coin.items())
+        )
     if report.train_interval:
         lines.append(f"- train_interval: {report.train_interval}")
     if report.horizon is not None:
@@ -1981,8 +2197,14 @@ def _chunk_hours_completed(state: SchedulerState, date: str, hours: list[str]) -
 
 def _count_downloaded_files(batch_report: orchestrator.OrchestratorReport) -> int:
     download = batch_report.details.get("download") or {}
+    if download.get("downloaded_count") is not None:
+        return int(download.get("downloaded_count") or 0)
     file_results = download.get("file_results") or []
-    return sum(1 for item in file_results if item.get("status") == "downloaded")
+    return sum(
+        1
+        for item in file_results
+        if item.get("download_status") == "downloaded" or item.get("status") == "downloaded"
+    )
 
 
 def _extract_evaluation_paths(train_report: orchestrator.OrchestratorReport) -> list[str]:
@@ -2642,6 +2864,8 @@ def cmd_auto_backfill_next(
     report.historical_date = target_date
     report.historical_hours = chunk_hours
 
+    pre_coverage = _historical_1s_coverage_by_coin(normalized_coins, data_root)
+
     cycle_report = cmd_daily_cycle(
         coins=normalized_coins,
         historical_hours=[int(h) for h in chunk_hours],
@@ -2679,7 +2903,33 @@ def cmd_auto_backfill_next(
     json_path_str = cycle_paths.get("json")
     md_path_str = cycle_paths.get("markdown")
 
-    if _cycle_succeeded(cycle_report):
+    batch_payload = _orchestrator_batch_from_scheduler_report(cycle_report)
+    import_progress = _build_import_progress_report(
+        coins=normalized_coins,
+        data_root=data_root,
+        pre_coverage=pre_coverage,
+        batch_payload=batch_payload,
+    )
+    report.details["import_progress"] = import_progress
+    import_failures = list(import_progress.get("import_failures") or [])
+    files_downloaded_new = int(import_progress.get("files_downloaded_new") or 0)
+    files_skipped_existing = int(import_progress.get("files_skipped_existing") or 0)
+    any_import_progress = bool(import_progress.get("any_import_progress"))
+
+    if import_failures:
+        report.failures.extend(import_failures)
+        failed_entry = {
+            "date": target_date,
+            "hours": chunk_hours,
+            "failed_at": _utc_now_iso(),
+            "reason": "; ".join(import_failures),
+            "report_path": json_path_str,
+        }
+        state.failed_batches.append(failed_entry)
+        report.next_recommended_action = (
+            "Review importer failures, fix data/tooling, then rerun auto-backfill-next"
+        )
+    elif _cycle_succeeded(cycle_report) and any_import_progress:
         batch_entry = {
             "date": target_date,
             "hours": chunk_hours,
@@ -2687,12 +2937,7 @@ def cmd_auto_backfill_next(
             "report_path": json_path_str,
         }
         state.completed_batches.append(batch_entry)
-        backfill_details = (cycle_report.details or {}).get("historical_backfill") or {}
-        orch_batch = (backfill_details.get("details") or {}).get("orchestrator_batch") or {}
-        downloaded = _count_downloaded_files(
-            orchestrator.OrchestratorReport(details=orch_batch)
-        )
-        state.total_historical_files_downloaded += downloaded
+        state.total_historical_files_downloaded += files_downloaded_new
         _advance_date_if_complete(state)
         report.next_recommended_action = (
             "python3 bid_ask_research_scheduler.py auto-backfill-next "
@@ -2702,6 +2947,24 @@ def cmd_auto_backfill_next(
         )
         if state.next_historical_date is None:
             report.next_recommended_action = "python3 bid_ask_research_scheduler.py status"
+    elif _cycle_succeeded(cycle_report):
+        report.warnings.append(NO_IMPORT_PROGRESS_MESSAGE)
+        if files_downloaded_new == 0 and files_skipped_existing > 0:
+            report.warnings.append(
+                f"All {files_skipped_existing} file(s) were skipped as existing; "
+                "historical_1s did not advance"
+            )
+        failed_entry = {
+            "date": target_date,
+            "hours": chunk_hours,
+            "failed_at": _utc_now_iso(),
+            "reason": "no import progress on historical_1s",
+            "report_path": json_path_str,
+        }
+        state.failed_batches.append(failed_entry)
+        report.next_recommended_action = (
+            "Investigate date/hour planning or importer path, then rerun auto-backfill-next"
+        )
     else:
         reason_parts = list(cycle_report.failures)
         reason_parts.extend(
@@ -3047,6 +3310,8 @@ def cmd_autopilot_tick(
     state.autopilot = autopilot
     save_state(state, state_path)
 
+    pre_coverage = _historical_1s_coverage_by_coin(normalized_coins, data_root)
+
     backfill_report = cmd_auto_backfill_next(
         coins=normalized_coins,
         chunk_size_hours=chunk_size_hours,
@@ -3074,6 +3339,20 @@ def cmd_autopilot_tick(
     report.failures.extend(backfill_report.failures)
     report.details["auto_backfill"] = backfill_report.to_dict()
 
+    stored_progress = (backfill_report.details or {}).get("import_progress")
+    batch_payload = _orchestrator_batch_from_scheduler_report(backfill_report)
+    if isinstance(stored_progress, dict) and stored_progress:
+        import_progress = stored_progress
+    else:
+        import_progress = _build_import_progress_report(
+            coins=normalized_coins,
+            data_root=data_root,
+            pre_coverage=pre_coverage,
+            batch_payload=batch_payload,
+        )
+    report.details["import_progress"] = import_progress
+    _populate_autopilot_import_fields(report, import_progress, requested_files=requested_files)
+
     _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files)
 
     if any(AUTO_BACKFILL_COMPLETE_MESSAGE in w for w in backfill_report.warnings):
@@ -3082,22 +3361,31 @@ def cmd_autopilot_tick(
         state.autopilot = autopilot
         return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
+    import_failures = list(import_progress.get("import_failures") or [])
+    any_import_progress = bool(import_progress.get("any_import_progress"))
+    files_downloaded_new = int(import_progress.get("files_downloaded_new") or 0)
+    files_skipped_existing = int(import_progress.get("files_skipped_existing") or 0)
     chunk_succeeded = _cycle_succeeded(backfill_report) and not backfill_report.failures
 
-    if chunk_succeeded:
+    if import_failures:
+        autopilot.failed_runs_in_row += 1
+        autopilot.last_run_date = today
+        report.action = "import_failed"
+        report.failures.extend(import_failures)
+        if autopilot.failed_runs_in_row >= AUTOPILOT_FAILURE_PAUSE_THRESHOLD:
+            autopilot.paused = True
+            autopilot.pause_reason = (
+                f"Paused after {autopilot.failed_runs_in_row} consecutive failed autopilot runs"
+            )
+            report.warnings.append(autopilot.pause_reason)
+        report.next_recommended_action = (
+            "Review importer failures, fix data/tooling, then "
+            "configure-autopilot --resume and rerun autopilot-tick"
+        )
+    elif chunk_succeeded and any_import_progress:
         autopilot.runs_today += 1
         autopilot.chunks_completed_today += 1
-        backfill_details = (backfill_report.details or {}).get("historical_backfill") or {}
-        if isinstance(backfill_details, dict):
-            orch_batch = (backfill_details.get("details") or {}).get("orchestrator_batch") or {}
-            actual_files = _count_downloaded_files(
-                orchestrator.OrchestratorReport(details=orch_batch if isinstance(orch_batch, dict) else {})
-            )
-        else:
-            actual_files = 0
-        files_added = actual_files if actual_files > 0 else requested_files
-        autopilot.files_downloaded_today += files_added
-        report.files_downloaded = files_added
+        autopilot.files_downloaded_today += files_downloaded_new
         autopilot.failed_runs_in_row = 0
         autopilot.last_run_date = today
         _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files)
@@ -3114,6 +3402,17 @@ def cmd_autopilot_tick(
                 f"daily_file_limit={autopilot.daily_file_limit}"
             )
         report.next_recommended_action = backfill_report.next_recommended_action
+    elif chunk_succeeded:
+        report.action = "no_import_progress"
+        report.warnings.append(NO_IMPORT_PROGRESS_MESSAGE)
+        if files_downloaded_new == 0 and files_skipped_existing > 0:
+            report.warnings.append(
+                f"All {files_skipped_existing} file(s) were skipped as existing; "
+                "historical_1s did not advance"
+            )
+        report.next_recommended_action = (
+            "Investigate date/hour planning or importer path, then rerun autopilot-tick"
+        )
     else:
         autopilot.failed_runs_in_row += 1
         autopilot.last_run_date = today
