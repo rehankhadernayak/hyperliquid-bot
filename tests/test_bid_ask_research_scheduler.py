@@ -1864,15 +1864,31 @@ class TestAutoBackfillNext:
 
 
 class TestPhaseBackfillEstimate:
-    def test_btc_eth_14_days_at_144_files_per_day(self) -> None:
+    def test_btc_eth_14_days_at_144_files_per_day_with_chunk_limit_24(self) -> None:
         estimate = scheduler.compute_phase_backfill_estimate(
             target_days=14,
             coins=["BTC", "ETH"],
             daily_file_limit=144,
+            daily_chunk_limit=24,
         )
         assert estimate["files_required"] == 672
+        assert estimate["effective_daily_file_capacity"] == 144
         assert estimate["archive_days_per_real_day"] == pytest.approx(3.0)
         assert estimate["estimated_real_days_to_complete"] == pytest.approx(4.6666666667)
+        assert estimate["warnings"] == []
+
+    def test_btc_eth_14_days_at_144_files_per_day_with_chunk_limit_12(self) -> None:
+        estimate = scheduler.compute_phase_backfill_estimate(
+            target_days=14,
+            coins=["BTC", "ETH"],
+            daily_file_limit=144,
+            daily_chunk_limit=12,
+        )
+        assert estimate["files_required"] == 672
+        assert estimate["effective_daily_file_capacity"] == 72
+        assert estimate["archive_days_per_real_day"] == pytest.approx(1.5)
+        assert estimate["estimated_real_days_to_complete"] == pytest.approx(9.3333333333)
+        assert scheduler.PHASE_CHUNK_LIMIT_BOTTLENECK_WARNING in estimate["warnings"]
 
     def test_dry_run_command_does_not_change_state(self, tmp_path: Path) -> None:
         state_path = _init_state(tmp_path)
@@ -1881,10 +1897,12 @@ class TestPhaseBackfillEstimate:
             coins=["BTC", "ETH"],
             target_days=14,
             daily_file_limit=144,
+            daily_chunk_limit=24,
         )
         after = json.loads(state_path.read_text(encoding="utf-8"))
         assert before == after
         assert estimate["files_required"] == 672
+        assert estimate["effective_daily_file_capacity"] == 144
 
 
 class TestConfigurePhaseBackfill:
@@ -1928,17 +1946,39 @@ class TestConfigurePhaseBackfill:
         scheduler.cmd_configure_phase_backfill(
             enable=True,
             daily_file_limit=999,
-            daily_chunk_limit=99,
+            daily_chunk_limit=24,
             max_daily_file_limit=999,
-            max_daily_chunk_limit=99,
+            max_daily_chunk_limit=24,
             require_confirmation_text=self.CONFIRMATION,
             state_path=state_path,
         )
         state = scheduler.load_state(state_path)
         assert state.autopilot.daily_file_limit == scheduler.PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_FILE_LIMIT
         assert state.autopilot.max_daily_file_limit == scheduler.PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_FILE_LIMIT
-        assert state.autopilot.daily_chunk_limit == scheduler.PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_CHUNK_LIMIT
-        assert state.autopilot.max_daily_chunk_limit == scheduler.PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_CHUNK_LIMIT
+        assert state.autopilot.daily_chunk_limit == 24
+        assert state.autopilot.max_daily_chunk_limit == 24
+
+    def test_accepts_daily_chunk_limit_24(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        result = scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            daily_chunk_limit=24,
+            max_daily_chunk_limit=24,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        assert result["daily_chunk_limit"] == 24
+        assert result["max_daily_chunk_limit"] == 24
+
+    def test_rejects_daily_chunk_limit_25(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        with pytest.raises(ValueError, match="absolute max"):
+            scheduler.cmd_configure_phase_backfill(
+                enable=True,
+                daily_chunk_limit=25,
+                require_confirmation_text=self.CONFIRMATION,
+                state_path=state_path,
+            )
 
     def test_disable_restores_conservative_limits(self, tmp_path: Path) -> None:
         state_path = _init_state(tmp_path)
@@ -1974,9 +2014,27 @@ class TestConfigurePhaseBackfill:
         assert status["target_days"] == 14
         assert status["estimated_files_required"] == 672
         assert status["estimated_real_days_to_complete"] == pytest.approx(4.6666666667)
-        assert status["daily_chunk_limit"] == 12
+        assert status["effective_daily_file_capacity"] == 144
+        assert status["daily_chunk_limit"] == 24
         assert status["daily_file_limit"] == 144
         assert status["requester_pays_warning"] == scheduler.PHASE_REQUESTER_PAYS_WARNING
+        assert status["warnings"] == []
+
+    def test_status_warns_when_chunk_limit_bottlenecks_file_limit(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            coins=["BTC", "ETH"],
+            target_days=14,
+            daily_chunk_limit=12,
+            max_daily_chunk_limit=12,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        status = scheduler.cmd_autopilot_status(state_path=state_path)
+        assert status["effective_daily_file_capacity"] == 72
+        assert status["estimated_real_days_to_complete"] == pytest.approx(9.3333333333)
+        assert scheduler.PHASE_CHUNK_LIMIT_BOTTLENECK_WARNING in status["warnings"]
 
     def test_reset_usage_clears_counters(self, tmp_path: Path) -> None:
         state_path = _init_state(tmp_path)
@@ -2069,9 +2127,10 @@ class TestConfigurePhaseBackfill:
 
         state = scheduler.load_state(state_path)
         assert state.autopilot.daily_file_limit == 144
-        assert state.autopilot.daily_chunk_limit == 12
+        assert state.autopilot.daily_chunk_limit == 24
         assert report.daily_file_limit == 144
-        assert report.daily_chunk_limit == 12
+        assert report.daily_chunk_limit == 24
+        assert report.effective_daily_file_capacity == 144
         assert report.focused_coins == ["BTC", "ETH"]
         assert report.phase_backfill_enabled is True
         assert report.phase_backfill_name == "phase3_btc_eth_recent"
@@ -2084,7 +2143,8 @@ class TestConfigurePhaseBackfill:
             runs_dir=tmp_path / "runs",
         )
         assert status["daily_file_limit"] == 144
-        assert status["daily_chunk_limit"] == 12
+        assert status["daily_chunk_limit"] == 24
+        assert status["effective_daily_file_capacity"] == 144
         assert status["focused_coins"] == ["BTC", "ETH"]
         assert status["estimated_real_days_to_complete"] == pytest.approx(4.6666666667)
 
@@ -2092,7 +2152,8 @@ class TestConfigurePhaseBackfill:
         assert saved["focused_coins"] == ["BTC", "ETH"]
         assert saved["ramp_skipped_for_phase_backfill"] is True
         assert saved["daily_file_limit"] == 144
-        assert saved["daily_chunk_limit"] == 12
+        assert saved["daily_chunk_limit"] == 24
+        assert saved["effective_daily_file_capacity"] == 144
 
     def test_safety_flags_remain_paper_only(self, tmp_path: Path) -> None:
         state_path = _init_state(tmp_path)
