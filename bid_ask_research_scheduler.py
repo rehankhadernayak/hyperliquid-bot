@@ -76,8 +76,16 @@ PHASE_BACKFILL_DEFAULT_DAILY_CHUNK_LIMIT = 24
 PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_FILE_LIMIT = 144
 PHASE_BACKFILL_ABSOLUTE_MAX_DAILY_CHUNK_LIMIT = 24
 PHASE_BACKFILL_CONFIRMATION_TEXT = "I understand this may increase AWS Requester Pays costs"
+DEFAULT_AWS_PROFILE = "hyperliquid-research"
+DEFAULT_REQUESTER_PAYS = True
 PHASE_REQUESTER_PAYS_WARNING = (
     "Phase backfill enabled: downloads may incur AWS Requester Pays costs."
+)
+REQUESTER_PAYS_DISABLED_WARNING = (
+    "requester_pays disabled; downloads may fail for Requester Pays buckets"
+)
+REQUESTER_PAYS_AUTH_NEXT_ACTION = (
+    "Check AWS profile and requester pays settings, then rerun autopilot-tick"
 )
 PHASE_CHUNK_LIMIT_BOTTLENECK_WARNING = (
     "daily_chunk_limit bottlenecks requested daily_file_limit"
@@ -118,6 +126,8 @@ class AutopilotState:
     phase_backfill_name: str | None = None
     focused_coins: list[str] = field(default_factory=list)
     target_days: int = 0
+    aws_profile: str = DEFAULT_AWS_PROFILE
+    requester_pays: bool = DEFAULT_REQUESTER_PAYS
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +154,8 @@ class AutopilotState:
             "phase_backfill_name": self.phase_backfill_name,
             "focused_coins": self.focused_coins,
             "target_days": self.target_days,
+            "aws_profile": self.aws_profile,
+            "requester_pays": self.requester_pays,
         }
 
     @classmethod
@@ -174,6 +186,10 @@ class AutopilotState:
             phase_backfill_name=payload.get("phase_backfill_name"),
             focused_coins=list(payload.get("focused_coins") or []),
             target_days=int(payload.get("target_days") or 0),
+            aws_profile=str(payload.get("aws_profile") or DEFAULT_AWS_PROFILE),
+            requester_pays=bool(
+                payload.get("requester_pays", DEFAULT_REQUESTER_PAYS)
+            ),
         )
 
 
@@ -290,6 +306,10 @@ class AutopilotReport:
     focused_coins: list[str] = field(default_factory=list)
     target_days: int | None = None
     ramp_skipped_for_phase_backfill: bool = False
+    aws_profile: str | None = None
+    requester_pays: bool | None = None
+    download_error_type: str | None = None
+    files_failed: int = 0
     autopilot_snapshot: dict[str, Any] = field(default_factory=dict)
     workflows_run: list[str] = field(default_factory=list)
     historical_date: str | None = None
@@ -334,6 +354,10 @@ class AutopilotReport:
             "focused_coins": self.focused_coins,
             "target_days": self.target_days,
             "ramp_skipped_for_phase_backfill": self.ramp_skipped_for_phase_backfill,
+            "aws_profile": self.aws_profile,
+            "requester_pays": self.requester_pays,
+            "download_error_type": self.download_error_type,
+            "files_failed": self.files_failed,
             "autopilot_snapshot": self.autopilot_snapshot,
             "workflows_run": self.workflows_run,
             "historical_date": self.historical_date,
@@ -374,6 +398,12 @@ class SchedulerReport:
     failures: list[str] = field(default_factory=list)
     next_recommended_action: str | None = None
     details: dict[str, Any] = field(default_factory=dict)
+    aws_profile: str | None = None
+    requester_pays: bool | None = None
+    download_error_type: str | None = None
+    files_downloaded_new: int = 0
+    files_skipped_existing: int = 0
+    files_failed: int = 0
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -400,6 +430,12 @@ class SchedulerReport:
             "failures": self.failures,
             "next_recommended_action": self.next_recommended_action,
             "details": self.details,
+            "aws_profile": self.aws_profile,
+            "requester_pays": self.requester_pays,
+            "download_error_type": self.download_error_type,
+            "files_downloaded_new": self.files_downloaded_new,
+            "files_skipped_existing": self.files_skipped_existing,
+            "files_failed": self.files_failed,
         }
 
 
@@ -595,6 +631,79 @@ def _populate_autopilot_report_limits(
             chunk_size_hours=report.chunk_size_hours,
             num_coins=num_coins,
         )
+
+
+def _resolve_aws_access_settings(
+    autopilot: AutopilotState,
+    *,
+    aws_profile: str | None = None,
+    requester_pays: bool | None = None,
+) -> tuple[str, bool]:
+    """Resolve AWS profile and requester_pays from CLI overrides or autopilot state."""
+    resolved_profile = (
+        aws_profile if aws_profile is not None else autopilot.aws_profile
+    )
+    resolved_requester_pays = (
+        requester_pays if requester_pays is not None else autopilot.requester_pays
+    )
+    return resolved_profile, resolved_requester_pays
+
+
+def _extract_download_failures(
+    batch_payload: dict[str, Any],
+) -> tuple[list[str], str | None, int]:
+    """Return download failure messages, primary error type, and failed file count."""
+    download = batch_payload.get("download") or {}
+    file_results = download.get("file_results") or []
+    if not isinstance(file_results, list):
+        file_results = []
+
+    failures: list[str] = []
+    error_types: list[str] = []
+    files_failed = 0
+    for item in file_results:
+        if not isinstance(item, dict):
+            continue
+        if item.get("download_status") != "failed":
+            continue
+        files_failed += 1
+        error_type = str(item.get("download_error_type") or "unknown_error")
+        error_types.append(error_type)
+        coin = item.get("coin") or "unknown"
+        s3_path = item.get("s3_path") or "unknown path"
+        failures.append(f"{coin}: download failed ({error_type}): {s3_path}")
+
+    primary_error_type = error_types[0] if error_types else None
+    return failures, primary_error_type, files_failed
+
+
+def _download_failure_next_action(
+    *,
+    aws_profile: str,
+    requester_pays: bool,
+    download_error_type: str | None,
+) -> str:
+    if download_error_type == "requester_pays_auth_required":
+        return (
+            f"{REQUESTER_PAYS_AUTH_NEXT_ACTION} "
+            f"(aws_profile={aws_profile!r}, requester_pays={requester_pays})"
+        )
+    return (
+        "Review download failure report, fix data/tooling/network, then rerun auto-backfill-next"
+    )
+
+
+def _populate_aws_access_report_fields(
+    report: AutopilotReport | SchedulerReport,
+    *,
+    aws_profile: str,
+    requester_pays: bool,
+) -> None:
+    report.aws_profile = aws_profile
+    report.requester_pays = requester_pays
+    if hasattr(report, "details") and isinstance(report.details, dict):
+        report.details["aws_profile"] = aws_profile
+        report.details["requester_pays"] = requester_pays
 
 
 def _autopilot_would_exceed_daily_limits(
@@ -796,6 +905,8 @@ def _phase_backfill_status_fields(
         "phase_backfill_name": autopilot.phase_backfill_name,
         "focused_coins": list(autopilot.focused_coins),
         "target_days": autopilot.target_days,
+        "aws_profile": autopilot.aws_profile,
+        "requester_pays": autopilot.requester_pays,
         "estimated_files_required": None,
         "estimated_real_days_to_complete": None,
         "archive_days_per_real_day": None,
@@ -994,6 +1105,14 @@ def _summarize_batch_file_stats(batch_payload: dict[str, Any]) -> dict[str, int]
         if item.get("import_status") == "imported" and int(item.get("rows_written") or 0) > 0
     )
 
+    files_failed = int(download.get("failed_count") or 0)
+    if file_results:
+        files_failed = sum(
+            1
+            for item in file_results
+            if isinstance(item, dict) and item.get("download_status") == "failed"
+        )
+
     command_plan = batch_payload.get("command_plan") or {}
     files_requested = int(command_plan.get("total_files") or command_plan.get("max_files") or 0)
     if files_requested == 0:
@@ -1004,7 +1123,13 @@ def _summarize_batch_file_stats(batch_payload: dict[str, Any]) -> dict[str, int]
         "files_downloaded_new": files_downloaded_new,
         "files_skipped_existing": files_skipped_existing,
         "files_imported": files_imported,
+        "files_failed": files_failed,
     }
+
+
+def _extract_download_error_type(batch_payload: dict[str, Any]) -> str | None:
+    _, error_type, _ = _extract_download_failures(batch_payload)
+    return error_type
 
 
 def _extract_import_failures(batch_payload: dict[str, Any]) -> list[str]:
@@ -1031,10 +1156,13 @@ def _build_import_progress_report(
     delta = _compute_import_progress_delta(pre_coverage, post_coverage)
     file_stats = _summarize_batch_file_stats(batch_payload)
     import_failures = _extract_import_failures(batch_payload)
+    download_failures, download_error_type, _ = _extract_download_failures(batch_payload)
     return {
         "pre_import_coverage": pre_coverage,
         "post_import_coverage": post_coverage,
         "import_failures": import_failures,
+        "download_failures": download_failures,
+        "download_error_type": download_error_type,
         **delta,
         **file_stats,
     }
@@ -1051,6 +1179,8 @@ def _populate_autopilot_import_fields(
     report.files_downloaded_new = int(progress.get("files_downloaded_new") or 0)
     report.files_skipped_existing = int(progress.get("files_skipped_existing") or 0)
     report.files_imported = int(progress.get("files_imported") or 0)
+    report.files_failed = int(progress.get("files_failed") or 0)
+    report.download_error_type = progress.get("download_error_type")
     report.pre_import_coverage = dict(progress.get("pre_import_coverage") or {})
     report.post_import_coverage = dict(progress.get("post_import_coverage") or {})
     report.import_progress_by_coin = dict(progress.get("import_progress_by_coin") or {})
@@ -1671,6 +1801,8 @@ def cmd_configure_phase_backfill(
     daily_chunk_limit: int = PHASE_BACKFILL_DEFAULT_DAILY_CHUNK_LIMIT,
     max_daily_file_limit: int = PHASE_BACKFILL_DEFAULT_DAILY_FILE_LIMIT,
     max_daily_chunk_limit: int = PHASE_BACKFILL_DEFAULT_DAILY_CHUNK_LIMIT,
+    aws_profile: str = DEFAULT_AWS_PROFILE,
+    requester_pays: bool = DEFAULT_REQUESTER_PAYS,
     reset_usage: bool = False,
     require_confirmation_text: str | None = None,
     state_path: Path = DEFAULT_STATE_PATH,
@@ -1721,6 +1853,8 @@ def cmd_configure_phase_backfill(
         autopilot.daily_file_limit = bounded_daily_file
         autopilot.max_daily_chunk_limit = bounded_max_chunk
         autopilot.max_daily_file_limit = bounded_max_file
+        autopilot.aws_profile = aws_profile.strip() or DEFAULT_AWS_PROFILE
+        autopilot.requester_pays = requester_pays
     else:
         autopilot.phase_backfill_enabled = False
         autopilot.daily_chunk_limit = CONSERVATIVE_DAILY_CHUNK_LIMIT
@@ -1741,8 +1875,12 @@ def cmd_configure_phase_backfill(
         "max_daily_chunk_limit": autopilot.max_daily_chunk_limit,
         "max_daily_file_limit": autopilot.max_daily_file_limit,
         "autopilot_enabled": autopilot.enabled,
+        "aws_profile": autopilot.aws_profile,
+        "requester_pays": autopilot.requester_pays,
     }
     result.update(_phase_backfill_status_fields(autopilot))
+    if enable and not autopilot.requester_pays:
+        result["warnings"] = list(result.get("warnings") or []) + [REQUESTER_PAYS_DISABLED_WARNING]
     return result
 
 
@@ -1808,6 +1946,14 @@ def write_autopilot_report(
         lines.append(f"- train_interval: {report.train_interval}")
     if report.horizon is not None:
         lines.append(f"- horizon: {report.horizon}")
+    if report.aws_profile is not None:
+        lines.append(f"- aws_profile: {report.aws_profile}")
+    if report.requester_pays is not None:
+        lines.append(f"- requester_pays: {report.requester_pays}")
+    if report.download_error_type:
+        lines.append(f"- download_error_type: {report.download_error_type}")
+    if report.files_failed:
+        lines.append(f"- files_failed: {report.files_failed}")
 
     ap = report.autopilot_snapshot
     if ap:
@@ -2088,6 +2234,18 @@ def write_scheduler_report(
         lines.append(f"- train_interval: {report.train_interval}")
     if report.horizon is not None:
         lines.append(f"- horizon: {report.horizon}")
+    if report.aws_profile is not None:
+        lines.append(f"- aws_profile: {report.aws_profile}")
+    if report.requester_pays is not None:
+        lines.append(f"- requester_pays: {report.requester_pays}")
+    if report.download_error_type:
+        lines.append(f"- download_error_type: {report.download_error_type}")
+    if report.files_downloaded_new:
+        lines.append(f"- files_downloaded_new: {report.files_downloaded_new}")
+    if report.files_skipped_existing:
+        lines.append(f"- files_skipped_existing: {report.files_skipped_existing}")
+    if report.files_failed:
+        lines.append(f"- files_failed: {report.files_failed}")
 
     lines.extend(["", "## Row counts", ""])
     for key, value in report.row_counts.items():
@@ -2357,7 +2515,7 @@ def cmd_historical_backfill_next(
     allow_more: bool = False,
     all_time: bool = False,
     aws_profile: str | None = None,
-    requester_pays: bool = False,
+    requester_pays: bool | None = None,
     data_root: Path = orchestrator.DEFAULT_DATA_ROOT,
     report_dir: Path = orchestrator.DEFAULT_REPORT_DIR,
     state_path: Path = DEFAULT_STATE_PATH,
@@ -2371,6 +2529,11 @@ def cmd_historical_backfill_next(
     """Run the next bounded historical batch from scheduler state."""
     orchestrator.reject_all_time(all_time=all_time)
     state = load_state(state_path)
+    resolved_aws_profile, resolved_requester_pays = _resolve_aws_access_settings(
+        state.autopilot,
+        aws_profile=aws_profile,
+        requester_pays=requester_pays,
+    )
     normalized_coins = orchestrator._normalize_coins(coins or state.coins)
     selected_hours = hours if hours is not None else DEFAULT_HOURS
     normalized_hours = orchestrator._normalize_hours(selected_hours)
@@ -2385,6 +2548,13 @@ def cmd_historical_backfill_next(
         train_interval=train_interval,
         horizon=horizon,
     )
+    _populate_aws_access_report_fields(
+        report,
+        aws_profile=resolved_aws_profile,
+        requester_pays=resolved_requester_pays,
+    )
+    if not resolved_requester_pays:
+        report.warnings.append(REQUESTER_PAYS_DISABLED_WARNING)
 
     if not state.next_historical_date and not date:
         report.warnings.append("No next historical date; backfill may be complete")
@@ -2429,8 +2599,8 @@ def cmd_historical_backfill_next(
             max_files=resolved_max,
             allow_more=allow_more,
             all_time=all_time,
-            aws_profile=aws_profile,
-            requester_pays=requester_pays,
+            aws_profile=resolved_aws_profile,
+            requester_pays=resolved_requester_pays,
             data_root=data_root,
             report_dir=report_dir,
             s3_client=s3_client,
@@ -2468,6 +2638,15 @@ def cmd_historical_backfill_next(
     report.row_counts.update(batch_report.row_counts)
     report.warnings.extend(batch_report.warnings)
     report.details["orchestrator_batch"] = batch_report.to_dict()
+    batch_payload = batch_report.details if isinstance(batch_report.details, dict) else {}
+    file_stats = _summarize_batch_file_stats(batch_payload)
+    report.files_downloaded_new = file_stats["files_downloaded_new"]
+    report.files_skipped_existing = file_stats["files_skipped_existing"]
+    report.files_failed = file_stats["files_failed"]
+    report.download_error_type = _extract_download_error_type(batch_payload)
+    download_failures, _, _ = _extract_download_failures(batch_payload)
+    if download_failures:
+        report.failures.extend(download_failures)
 
     if not defer_batch_completion:
         state.completed_batches.append(
@@ -2497,7 +2676,7 @@ def cmd_daily_cycle(
     max_files: int | None = None,
     allow_more: bool = False,
     aws_profile: str | None = None,
-    requester_pays: bool = False,
+    requester_pays: bool | None = None,
     train_interval: str = "15s",
     horizon: int = 5,
     include_combined: bool = False,
@@ -2815,7 +2994,7 @@ def cmd_auto_backfill_next(
     max_files: int | None = None,
     allow_more: bool = False,
     aws_profile: str | None = None,
-    requester_pays: bool = False,
+    requester_pays: bool | None = None,
     train_interval: str = "15s",
     horizon: int = 5,
     include_combined: bool = False,
@@ -2829,6 +3008,11 @@ def cmd_auto_backfill_next(
     """Run one bounded historical chunk: backfill, validate, train, update state, exit."""
     orchestrator.reject_all_time(all_time=False)
     state = load_state(state_path)
+    resolved_aws_profile, resolved_requester_pays = _resolve_aws_access_settings(
+        state.autopilot,
+        aws_profile=aws_profile,
+        requester_pays=requester_pays,
+    )
     if state.next_historical_date and _all_hours_completed_for_date(
         state, state.next_historical_date
     ):
@@ -2845,6 +3029,13 @@ def cmd_auto_backfill_next(
         horizon=horizon,
         details={"chunk_size_hours": chunk_size_hours},
     )
+    _populate_aws_access_report_fields(
+        report,
+        aws_profile=resolved_aws_profile,
+        requester_pays=resolved_requester_pays,
+    )
+    if not resolved_requester_pays:
+        report.warnings.append(REQUESTER_PAYS_DISABLED_WARNING)
 
     next_chunk = find_next_incomplete_chunk(state, chunk_size_hours)
     if next_chunk is None:
@@ -2872,8 +3063,8 @@ def cmd_auto_backfill_next(
         date=target_date,
         max_files=max_files,
         allow_more=allow_more,
-        aws_profile=aws_profile,
-        requester_pays=requester_pays,
+        aws_profile=resolved_aws_profile,
+        requester_pays=resolved_requester_pays,
         train_interval=train_interval,
         horizon=horizon,
         include_combined=include_combined,
@@ -2891,6 +3082,10 @@ def cmd_auto_backfill_next(
     report.warnings.extend(cycle_report.warnings)
     report.failures.extend(cycle_report.failures)
     report.details.update(cycle_report.details)
+    report.files_downloaded_new = cycle_report.files_downloaded_new
+    report.files_skipped_existing = cycle_report.files_skipped_existing
+    report.files_failed = cycle_report.files_failed
+    report.download_error_type = cycle_report.download_error_type
     report.training_reports.extend(cycle_report.training_reports)
     report.model_artifact_paths.extend(cycle_report.model_artifact_paths)
     report.evaluation_report_paths.extend(cycle_report.evaluation_report_paths)
@@ -2912,11 +3107,31 @@ def cmd_auto_backfill_next(
     )
     report.details["import_progress"] = import_progress
     import_failures = list(import_progress.get("import_failures") or [])
+    download_failures = list(import_progress.get("download_failures") or [])
+    download_error_type = import_progress.get("download_error_type")
     files_downloaded_new = int(import_progress.get("files_downloaded_new") or 0)
     files_skipped_existing = int(import_progress.get("files_skipped_existing") or 0)
+    files_failed = int(import_progress.get("files_failed") or 0)
     any_import_progress = bool(import_progress.get("any_import_progress"))
+    report.files_failed = files_failed
+    report.download_error_type = download_error_type
 
-    if import_failures:
+    if download_failures:
+        report.failures.extend(download_failures)
+        failed_entry = {
+            "date": target_date,
+            "hours": chunk_hours,
+            "failed_at": _utc_now_iso(),
+            "reason": "; ".join(download_failures),
+            "report_path": json_path_str,
+        }
+        state.failed_batches.append(failed_entry)
+        report.next_recommended_action = _download_failure_next_action(
+            aws_profile=resolved_aws_profile,
+            requester_pays=resolved_requester_pays,
+            download_error_type=str(download_error_type) if download_error_type else None,
+        )
+    elif import_failures:
         report.failures.extend(import_failures)
         failed_entry = {
             "date": target_date,
@@ -2929,7 +3144,7 @@ def cmd_auto_backfill_next(
         report.next_recommended_action = (
             "Review importer failures, fix data/tooling, then rerun auto-backfill-next"
         )
-    elif _cycle_succeeded(cycle_report) and any_import_progress:
+    elif _cycle_succeeded(cycle_report) and any_import_progress and not download_failures:
         batch_entry = {
             "date": target_date,
             "hours": chunk_hours,
@@ -3233,7 +3448,8 @@ def _finalize_autopilot_report(
     runs_dir: Path,
 ) -> AutopilotReport:
     report.autopilot_snapshot = state.autopilot.to_dict()
-    report.next_recommended_action = _autopilot_next_recommended_action(state, state.autopilot)
+    if report.next_recommended_action is None:
+        report.next_recommended_action = _autopilot_next_recommended_action(state, state.autopilot)
     json_path, md_path = write_autopilot_report(report, runs_dir=runs_dir, label="autopilot")
     state.autopilot.last_autopilot_report_path = str(json_path)
     save_state(state, state_path)
@@ -3248,7 +3464,7 @@ def cmd_autopilot_tick(
     max_files: int | None = None,
     allow_more: bool = False,
     aws_profile: str | None = None,
-    requester_pays: bool = False,
+    requester_pays: bool | None = None,
     train_interval: str = "15s",
     horizon: int = 5,
     include_combined: bool = False,
@@ -3264,6 +3480,11 @@ def cmd_autopilot_tick(
     orchestrator.reject_all_time(all_time=False)
     state = load_state(state_path)
     autopilot = state.autopilot
+    resolved_aws_profile, resolved_requester_pays = _resolve_aws_access_settings(
+        autopilot,
+        aws_profile=aws_profile,
+        requester_pays=requester_pays,
+    )
     normalized_coins = _effective_scheduler_coins(state, coins)
     today = today_override or _utc_today_yyyymmdd()
     requested_files = _estimate_chunk_files(len(normalized_coins), chunk_size_hours)
@@ -3276,6 +3497,13 @@ def cmd_autopilot_tick(
         train_interval=train_interval,
         horizon=horizon,
     )
+    _populate_aws_access_report_fields(
+        report,
+        aws_profile=resolved_aws_profile,
+        requester_pays=resolved_requester_pays,
+    )
+    if not resolved_requester_pays:
+        report.warnings.append(REQUESTER_PAYS_DISABLED_WARNING)
 
     if not autopilot.enabled:
         report.action = "disabled"
@@ -3317,8 +3545,8 @@ def cmd_autopilot_tick(
         chunk_size_hours=chunk_size_hours,
         max_files=max_files,
         allow_more=allow_more,
-        aws_profile=aws_profile,
-        requester_pays=requester_pays,
+        aws_profile=resolved_aws_profile,
+        requester_pays=resolved_requester_pays,
         train_interval=train_interval,
         horizon=horizon,
         include_combined=include_combined,
@@ -3337,6 +3565,14 @@ def cmd_autopilot_tick(
     report.historical_hours = backfill_report.historical_hours
     report.warnings.extend(backfill_report.warnings)
     report.failures.extend(backfill_report.failures)
+    report.aws_profile = backfill_report.aws_profile or resolved_aws_profile
+    report.requester_pays = (
+        backfill_report.requester_pays
+        if backfill_report.requester_pays is not None
+        else resolved_requester_pays
+    )
+    report.download_error_type = backfill_report.download_error_type
+    report.files_failed = backfill_report.files_failed
     report.details["auto_backfill"] = backfill_report.to_dict()
 
     stored_progress = (backfill_report.details or {}).get("import_progress")
@@ -3362,12 +3598,32 @@ def cmd_autopilot_tick(
         return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
     import_failures = list(import_progress.get("import_failures") or [])
+    download_failures = list(import_progress.get("download_failures") or [])
+    download_error_type = import_progress.get("download_error_type")
     any_import_progress = bool(import_progress.get("any_import_progress"))
     files_downloaded_new = int(import_progress.get("files_downloaded_new") or 0)
     files_skipped_existing = int(import_progress.get("files_skipped_existing") or 0)
     chunk_succeeded = _cycle_succeeded(backfill_report) and not backfill_report.failures
+    if download_error_type:
+        report.download_error_type = str(download_error_type)
 
-    if import_failures:
+    if download_failures:
+        autopilot.failed_runs_in_row += 1
+        autopilot.last_run_date = today
+        report.action = "download_failed"
+        report.failures.extend(download_failures)
+        if autopilot.failed_runs_in_row >= AUTOPILOT_FAILURE_PAUSE_THRESHOLD:
+            autopilot.paused = True
+            autopilot.pause_reason = (
+                f"Paused after {autopilot.failed_runs_in_row} consecutive failed autopilot runs"
+            )
+            report.warnings.append(autopilot.pause_reason)
+        report.next_recommended_action = _download_failure_next_action(
+            aws_profile=resolved_aws_profile,
+            requester_pays=resolved_requester_pays,
+            download_error_type=str(download_error_type) if download_error_type else None,
+        )
+    elif import_failures:
         autopilot.failed_runs_in_row += 1
         autopilot.last_run_date = today
         report.action = "import_failed"
@@ -3382,7 +3638,7 @@ def cmd_autopilot_tick(
             "Review importer failures, fix data/tooling, then "
             "configure-autopilot --resume and rerun autopilot-tick"
         )
-    elif chunk_succeeded and any_import_progress:
+    elif chunk_succeeded and any_import_progress and not download_failures:
         autopilot.runs_today += 1
         autopilot.chunks_completed_today += 1
         autopilot.files_downloaded_today += files_downloaded_new
@@ -3447,6 +3703,24 @@ def _parse_bool_arg(value: str) -> bool:
     if lowered in {"false", "0", "no", "off"}:
         return False
     raise argparse.ArgumentTypeError(f"expected true/false, got {value!r}")
+
+
+def _parse_cli_requester_pays(args: argparse.Namespace) -> bool | None:
+    """Return explicit CLI requester_pays override, or None to use autopilot state."""
+    if getattr(args, "no_requester_pays", False):
+        return False
+    if getattr(args, "requester_pays", None):
+        return True
+    return None
+
+
+def _parse_configure_phase_requester_pays(args: argparse.Namespace) -> bool:
+    """Return requester_pays for configure-phase-backfill (default enabled)."""
+    if getattr(args, "no_requester_pays", False):
+        return False
+    if getattr(args, "requester_pays", None):
+        return True
+    return DEFAULT_REQUESTER_PAYS
 
 
 def cmd_write_launchd_template(
@@ -3812,7 +4086,9 @@ def build_parser() -> argparse.ArgumentParser:
     backfill.add_argument("--allow-more", action="store_true")
     backfill.add_argument("--all-time", action="store_true", help="Rejected: unbounded downloads")
     backfill.add_argument("--aws-profile", default=None)
-    backfill.add_argument("--requester-pays", action="store_true")
+    backfill_requester_pays = backfill.add_mutually_exclusive_group()
+    backfill_requester_pays.add_argument("--requester-pays", action="store_true", default=None)
+    backfill_requester_pays.add_argument("--no-requester-pays", action="store_true", default=None)
     backfill.add_argument("--data-root", type=Path, default=orchestrator.DEFAULT_DATA_ROOT)
     backfill.add_argument("--report-dir", type=Path, default=orchestrator.DEFAULT_REPORT_DIR)
     backfill.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
@@ -3882,7 +4158,9 @@ def build_parser() -> argparse.ArgumentParser:
     auto_backfill.add_argument("--max-files", type=int, default=None)
     auto_backfill.add_argument("--allow-more", action="store_true")
     auto_backfill.add_argument("--aws-profile", default=None)
-    auto_backfill.add_argument("--requester-pays", action="store_true")
+    auto_backfill_requester_pays = auto_backfill.add_mutually_exclusive_group()
+    auto_backfill_requester_pays.add_argument("--requester-pays", action="store_true", default=None)
+    auto_backfill_requester_pays.add_argument("--no-requester-pays", action="store_true", default=None)
     auto_backfill.add_argument("--train-interval", default="15s", choices=["15s", "1m"])
     auto_backfill.add_argument("--horizon", type=int, default=5)
     auto_backfill.add_argument("--include-combined", action="store_true")
@@ -4063,6 +4341,24 @@ def build_parser() -> argparse.ArgumentParser:
         default=None,
         help=f"Required exact text when using --enable: {PHASE_BACKFILL_CONFIRMATION_TEXT!r}",
     )
+    configure_phase_backfill.add_argument(
+        "--aws-profile",
+        default=DEFAULT_AWS_PROFILE,
+        help=f"AWS profile for Requester Pays downloads (default: {DEFAULT_AWS_PROFILE})",
+    )
+    phase_requester_pays = configure_phase_backfill.add_mutually_exclusive_group()
+    phase_requester_pays.add_argument(
+        "--requester-pays",
+        action="store_true",
+        default=None,
+        help="Use authenticated Requester Pays S3 access (default when enabling)",
+    )
+    phase_requester_pays.add_argument(
+        "--no-requester-pays",
+        action="store_true",
+        default=None,
+        help="Disable Requester Pays (may fail for Requester Pays buckets)",
+    )
     configure_phase_backfill.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
 
     phase_backfill_estimate = subparsers.add_parser(
@@ -4160,7 +4456,9 @@ def build_parser() -> argparse.ArgumentParser:
     autopilot_tick.add_argument("--max-files", type=int, default=None)
     autopilot_tick.add_argument("--allow-more", action="store_true")
     autopilot_tick.add_argument("--aws-profile", default=None)
-    autopilot_tick.add_argument("--requester-pays", action="store_true")
+    autopilot_requester_pays = autopilot_tick.add_mutually_exclusive_group()
+    autopilot_requester_pays.add_argument("--requester-pays", action="store_true", default=None)
+    autopilot_requester_pays.add_argument("--no-requester-pays", action="store_true", default=None)
     autopilot_tick.add_argument("--train-interval", default="15s", choices=["15s", "1m"])
     autopilot_tick.add_argument("--horizon", type=int, default=5)
     autopilot_tick.add_argument("--include-combined", action="store_true")
@@ -4225,6 +4523,10 @@ def _print_autopilot_status(status: dict[str, Any]) -> None:
         print(f"  warning: {warning}")
     if status.get("requester_pays_warning"):
         print(f"  requester_pays_warning: {status['requester_pays_warning']}")
+    if status.get("aws_profile"):
+        print(f"  aws_profile: {status['aws_profile']}")
+    if status.get("requester_pays") is not None:
+        print(f"  requester_pays: {status['requester_pays']}")
 
 
 def _print_phase_backfill_estimate(estimate: dict[str, Any]) -> None:
@@ -4291,7 +4593,7 @@ def main(argv: list[str] | None = None) -> int:
                 allow_more=args.allow_more,
                 all_time=args.all_time,
                 aws_profile=args.aws_profile,
-                requester_pays=args.requester_pays,
+                requester_pays=_parse_cli_requester_pays(args),
                 data_root=args.data_root,
                 report_dir=args.report_dir,
                 state_path=args.state_path,
@@ -4356,7 +4658,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_files=args.max_files,
                 allow_more=args.allow_more,
                 aws_profile=args.aws_profile,
-                requester_pays=args.requester_pays,
+                requester_pays=_parse_cli_requester_pays(args),
                 train_interval=args.train_interval,
                 horizon=args.horizon,
                 include_combined=args.include_combined,
@@ -4467,6 +4769,8 @@ def main(argv: list[str] | None = None) -> int:
                 daily_chunk_limit=args.daily_chunk_limit,
                 max_daily_file_limit=args.max_daily_file_limit,
                 max_daily_chunk_limit=args.max_daily_chunk_limit,
+                aws_profile=args.aws_profile,
+                requester_pays=_parse_configure_phase_requester_pays(args),
                 reset_usage=args.reset_usage,
                 require_confirmation_text=args.require_confirmation_text,
                 state_path=args.state_path,
@@ -4510,7 +4814,7 @@ def main(argv: list[str] | None = None) -> int:
                 max_files=args.max_files,
                 allow_more=args.allow_more,
                 aws_profile=args.aws_profile,
-                requester_pays=args.requester_pays,
+                requester_pays=_parse_cli_requester_pays(args),
                 train_interval=args.train_interval,
                 horizon=args.horizon,
                 include_combined=args.include_combined,

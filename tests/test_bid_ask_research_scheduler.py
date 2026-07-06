@@ -2335,6 +2335,31 @@ class TestConfigurePhaseBackfill:
         assert result["phase_backfill_enabled"] is True
         assert result["focused_coins"] == ["BTC", "ETH"]
 
+    def test_enable_stores_aws_profile_and_requester_pays(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        result = scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.aws_profile == "hyperliquid-research"
+        assert state.autopilot.requester_pays is True
+        assert result["aws_profile"] == "hyperliquid-research"
+        assert result["requester_pays"] is True
+
+    def test_no_requester_pays_allowed_with_warning(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        result = scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            requester_pays=False,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.requester_pays is False
+        assert scheduler.REQUESTER_PAYS_DISABLED_WARNING in result["warnings"]
+
     def test_limits_bounded_by_hard_caps(self, tmp_path: Path) -> None:
         state_path = _init_state(tmp_path)
         scheduler.cmd_configure_phase_backfill(
@@ -2412,7 +2437,22 @@ class TestConfigurePhaseBackfill:
         assert status["daily_chunk_limit"] == 24
         assert status["daily_file_limit"] == 144
         assert status["requester_pays_warning"] == scheduler.PHASE_REQUESTER_PAYS_WARNING
+        assert status["aws_profile"] == "hyperliquid-research"
+        assert status["requester_pays"] is True
         assert status["warnings"] == []
+
+    def test_status_does_not_expose_credentials(self, tmp_path: Path) -> None:
+        state_path = _init_state(tmp_path)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        status = scheduler.cmd_autopilot_status(state_path=state_path)
+        combined = json.dumps(status).lower()
+        assert "secret_access_key" not in combined
+        assert "akia" not in combined
+        assert status["aws_profile"] == "hyperliquid-research"
 
     def test_status_warns_when_chunk_limit_bottlenecks_file_limit(self, tmp_path: Path) -> None:
         state_path = _init_state(tmp_path)
@@ -2492,6 +2532,149 @@ class TestConfigurePhaseBackfill:
             today_override="20230916",
         )
         assert captured == [["BTC", "ETH"]]
+
+    def test_autopilot_tick_passes_aws_settings_to_backfill(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=15, end_hour=17)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            coins=["BTC", "ETH"],
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        captured: list[dict[str, object]] = []
+
+        def fake_auto_backfill(**kwargs: object) -> scheduler.SchedulerReport:
+            captured.append(dict(kwargs))
+            return scheduler.SchedulerReport(
+                workflows_run=["auto-backfill-next"],
+                historical_date="20230917",
+                historical_hours=["15", "16", "17"],
+                aws_profile=str(kwargs.get("aws_profile")),
+                requester_pays=bool(kwargs.get("requester_pays")),
+                details={
+                    "import_progress": {
+                        "any_import_progress": True,
+                        "files_downloaded_new": 6,
+                        "files_skipped_existing": 0,
+                        "files_failed": 0,
+                        "import_failures": [],
+                        "download_failures": [],
+                    },
+                    "historical_backfill": {
+                        "details": {
+                            "orchestrator_batch": {
+                                "download": {
+                                    "file_results": [
+                                        {"download_status": "downloaded"},
+                                    ],
+                                },
+                                "import": [
+                                    {"coin": "BTC", "import_status": "imported", "rows_written": 1},
+                                ],
+                            }
+                        }
+                    },
+                },
+            )
+
+        monkeypatch.setattr(scheduler, "cmd_auto_backfill_next", fake_auto_backfill)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230917",
+        )
+
+        assert captured
+        assert captured[0]["aws_profile"] == "hyperliquid-research"
+        assert captured[0]["requester_pays"] is True
+        assert report.aws_profile == "hyperliquid-research"
+        assert report.requester_pays is True
+
+    def test_requester_pays_auth_required_is_download_failed_without_quota(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=15, end_hour=17)
+        scheduler.cmd_configure_phase_backfill(
+            enable=True,
+            coins=["BTC", "ETH"],
+            require_confirmation_text=self.CONFIRMATION,
+            state_path=state_path,
+        )
+        state = scheduler.load_state(state_path)
+        state.autopilot.chunks_completed_today = 0
+        state.autopilot.files_downloaded_today = 0
+        scheduler.save_state(state, state_path)
+
+        error_type = "requester_pays_auth_required"
+        s3_path = "s3://hyperliquid-archive/market_data/20230917/15/l2Book/BTC.lz4"
+
+        def fake_auto_backfill(**kwargs: object) -> scheduler.SchedulerReport:
+            download_failure = (
+                f"BTC: download failed ({error_type}): {s3_path}"
+            )
+            return scheduler.SchedulerReport(
+                workflows_run=["auto-backfill-next", "daily-cycle"],
+                historical_date="20230917",
+                historical_hours=["15", "16", "17"],
+                aws_profile="hyperliquid-research",
+                requester_pays=True,
+                download_error_type=error_type,
+                files_failed=1,
+                failures=[download_failure],
+                details={
+                    "import_progress": {
+                        "any_import_progress": False,
+                        "files_downloaded_new": 0,
+                        "files_skipped_existing": 0,
+                        "files_failed": 1,
+                        "download_error_type": error_type,
+                        "download_failures": [download_failure],
+                        "import_failures": [],
+                    },
+                    "historical_backfill": {
+                        "details": {
+                            "orchestrator_batch": {
+                                "download": {
+                                    "file_results": [
+                                        {
+                                            "coin": "BTC",
+                                            "download_status": "failed",
+                                            "download_error_type": error_type,
+                                            "s3_path": s3_path,
+                                        }
+                                    ],
+                                }
+                            }
+                        }
+                    },
+                },
+            )
+
+        monkeypatch.setattr(scheduler, "cmd_auto_backfill_next", fake_auto_backfill)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230917",
+        )
+
+        assert report.action == "download_failed"
+        assert report.download_error_type == error_type
+        assert report.files_failed == 1
+        assert report.files_downloaded_new == 0
+        assert "aws profile" in (report.next_recommended_action or "").lower()
+        state = scheduler.load_state(state_path)
+        assert state.autopilot.chunks_completed_today == 0
+        assert state.autopilot.files_downloaded_today == 0
 
     def test_phase_mode_tick_preserves_daily_limits_when_ramp_would_apply(
         self,
