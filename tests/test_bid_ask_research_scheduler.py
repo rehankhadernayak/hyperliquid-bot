@@ -2242,3 +2242,347 @@ class TestRepairStateFromExistingData:
         assert scheduler.REPAIR_INFERRED_WARNING in report.warnings
         assert report.paper_only is True
         assert report.execution_enabled is False
+
+
+def _write_historical_csv(
+    data_root: Path,
+    coin: str,
+    *,
+    date: str,
+    hour: int,
+) -> Path:
+    from bid_ask_schema import (
+        ASK_SIZE,
+        BEST_ASK,
+        BEST_BID,
+        BID_ASK_CSV_COLUMNS,
+        BID_SIZE,
+        TIMESTAMP_MS,
+    )
+
+    csv_dir = data_root / "historical_1s"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / f"{coin}_1s.csv"
+    base_ms = int(
+        __import__("datetime")
+        .datetime.strptime(date, "%Y%m%d")
+        .replace(hour=hour, tzinfo=__import__("datetime").timezone.utc)
+        .timestamp()
+        * 1000
+    )
+    row = {
+        TIMESTAMP_MS: str(base_ms + 1000),
+        BEST_BID: "100.0",
+        BEST_ASK: "100.1",
+        BID_SIZE: "1.0",
+        ASK_SIZE: "1.0",
+        "coin": coin,
+        "source_session_id": "historical_archive",
+        "source_channel": "historical_l2Book",
+    }
+    import csv
+
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=BID_ASK_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerow(row)
+    return csv_path
+
+
+def _write_resampled_csv(
+    data_root: Path,
+    coin: str,
+    interval: str,
+    *,
+    date: str,
+    hour: int,
+) -> Path:
+    from bid_ask_resampler import RESAMPLED_COLUMNS
+
+    csv_dir = data_root / f"historical_{interval}"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / f"{coin}_{interval}.csv"
+    base_ms = int(
+        __import__("datetime")
+        .datetime.strptime(date, "%Y%m%d")
+        .replace(hour=hour, tzinfo=__import__("datetime").timezone.utc)
+        .timestamp()
+        * 1000
+    )
+    interval_ms = 15_000 if interval == "15s" else 60_000
+    row = {
+        "start_timestamp_ms": str(base_ms),
+        "end_timestamp_ms": str(base_ms + interval_ms - 1),
+        "timestamp_iso": "2023-09-16T12:00:01Z",
+        "coin": coin,
+        "open_mid": "100.05",
+        "high_mid": "100.05",
+        "low_mid": "100.05",
+        "close_mid": "100.05",
+        "avg_bid": "100.0",
+        "avg_ask": "100.1",
+        "avg_mid": "100.05",
+        "avg_spread": "0.1",
+        "avg_spread_bps": "10.0",
+        "avg_bbo_imbalance": "0.0",
+        "row_count": "15",
+        "missing_seconds": "0",
+    }
+    import csv
+
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=list(RESAMPLED_COLUMNS), extrasaction="ignore")
+        writer.writeheader()
+        writer.writerow(row)
+    return csv_path
+
+
+def _write_autopilot_report(
+    runs_dir: Path,
+    *,
+    action: str = "chunk_completed",
+    files_downloaded_today: int = 3,
+    chunks_completed_today: int = 1,
+    coins: list[str] | None = None,
+) -> Path:
+    runs_dir.mkdir(parents=True, exist_ok=True)
+    report = scheduler.AutopilotReport(
+        action=action,
+        coins=coins or ["BTC", "ETH"],
+        files_downloaded_today=files_downloaded_today,
+        chunks_completed_today=chunks_completed_today,
+        autopilot_snapshot={
+            "failed_runs_in_row": 0,
+            "paused": False,
+            "files_downloaded_today": files_downloaded_today,
+            "chunks_completed_today": chunks_completed_today,
+        },
+    )
+    json_path, _ = scheduler.write_autopilot_report(report, runs_dir=runs_dir, label="autopilot")
+    return json_path
+
+
+def _write_candidate_report(
+    reports_dir: Path,
+    *,
+    run_timestamp: str,
+    filtered_paper_trades: int = 25,
+    cumulative_net_return_bps: float = 12.5,
+) -> Path:
+    from bid_ask_candidate_validator import (
+        build_candidate_config,
+        build_candidate_validation_report,
+        write_candidate_validation_json,
+    )
+
+    reports_dir.mkdir(parents=True, exist_ok=True)
+    report = build_candidate_validation_report(
+        {
+            "filtered_paper_trades": filtered_paper_trades,
+            "cumulative_net_return_bps": cumulative_net_return_bps,
+            "beats_baseline_accuracy": True,
+            "positive_after_costs": True,
+            "stability_summary": {
+                "concentration_warning": False,
+                "sparse_stability_warning": False,
+            },
+        },
+        config=build_candidate_config(),
+        run_timestamp=run_timestamp,
+    )
+    return write_candidate_validation_json(report, reports_dir=reports_dir)
+
+
+class TestPhaseBackfillAudit:
+    def test_detects_stale_historical_1s(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv(data_root, coin, date="20230916", hour=12)
+
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC", "ETH"],
+            data_root=data_root,
+            downloads_root=tmp_path / "downloads",
+            reports_dir=tmp_path / "runs",
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+        )
+
+        assert audit["imported_historical_1s"]["BTC"]["freshness_status"] == "stale"
+        assert audit["imported_historical_1s"]["ETH"]["freshness_status"] == "stale"
+        assert audit["next_recommended_action"] == "check autopilot/download reports and AWS access"
+
+    def test_detects_advanced_historical_1s(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv(data_root, coin, date="20230917", hour=10)
+
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC", "ETH"],
+            data_root=data_root,
+            downloads_root=tmp_path / "downloads",
+            reports_dir=tmp_path / "runs",
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+        )
+
+        assert audit["imported_historical_1s"]["BTC"]["freshness_status"] == "advancing"
+        assert audit["imported_historical_1s"]["ETH"]["freshness_status"] == "advancing"
+
+    def test_detects_resample_stale_while_1s_advanced(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv(data_root, coin, date="20230917", hour=10)
+            _write_resampled_csv(data_root, coin, "15s", date="20230916", hour=12)
+            _write_resampled_csv(data_root, coin, "1m", date="20230916", hour=12)
+
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC", "ETH"],
+            data_root=data_root,
+            downloads_root=tmp_path / "downloads",
+            reports_dir=tmp_path / "runs",
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+        )
+
+        assert audit["imported_historical_1s"]["BTC"]["freshness_status"] == "advancing"
+        assert audit["next_recommended_action"] == "run historical resample"
+
+    def test_detects_repeated_unchanged_candidate_reports(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        candidate_dir = tmp_path / "candidate"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv(data_root, coin, date="20230917", hour=10)
+            _write_resampled_csv(data_root, coin, "15s", date="20230917", hour=10)
+            _write_resampled_csv(data_root, coin, "1m", date="20230917", hour=10)
+
+        for index in range(3):
+            _write_candidate_report(
+                candidate_dir,
+                run_timestamp=f"2026-07-0{index + 1}T08:00:00Z",
+                filtered_paper_trades=25,
+                cumulative_net_return_bps=12.5,
+            )
+
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC", "ETH"],
+            data_root=data_root,
+            downloads_root=tmp_path / "downloads",
+            reports_dir=tmp_path / "runs",
+            candidate_reports_dir=candidate_dir,
+            state_path=tmp_path / "missing-state.json",
+        )
+
+        assert audit["candidate_freshness"]["repeated_unchanged_warning"] is True
+        assert audit["next_recommended_action"] == "rerun validator/robustness"
+        assert any("unchanged" in warning.lower() for warning in audit.get("warnings", []))
+
+    def test_recommends_import_issue_when_downloads_exist_but_csv_stale(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        data_root = tmp_path / "data"
+        downloads_root = tmp_path / "downloads"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv(data_root, coin, date="20230916", hour=12)
+            download_dir = downloads_root / "20230917" / "10"
+            download_dir.mkdir(parents=True, exist_ok=True)
+            (download_dir / f"{coin}.lz4").write_bytes(b"fake")
+
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC", "ETH"],
+            data_root=data_root,
+            downloads_root=downloads_root,
+            reports_dir=tmp_path / "runs",
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+        )
+
+        assert audit["downloads"]["total_files"] == 2
+        assert audit["imported_historical_1s"]["BTC"]["freshness_status"] == "stale"
+        assert audit["next_recommended_action"] == "import step likely failing or not appending"
+
+    def test_writes_json_and_markdown(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "data"
+        json_path = tmp_path / "audit.json"
+        markdown_path = tmp_path / "audit.md"
+
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC"],
+            data_root=data_root,
+            downloads_root=tmp_path / "downloads",
+            reports_dir=tmp_path / "runs",
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+            json_path=json_path,
+            markdown_path=markdown_path,
+        )
+
+        saved = json.loads(json_path.read_text(encoding="utf-8"))
+        markdown = markdown_path.read_text(encoding="utf-8")
+        assert saved["command"] == "phase-backfill-audit"
+        assert saved["paper_only"] is True
+        assert saved["execution_enabled"] is False
+        assert saved["real_execution_ready"] is False
+        assert "Phase Backfill Audit" in markdown
+        assert audit["paper_only"] is True
+
+    def test_report_includes_safety_fields(self, tmp_path: Path) -> None:
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC", "ETH"],
+            data_root=tmp_path / "data",
+            downloads_root=tmp_path / "downloads",
+            reports_dir=tmp_path / "runs",
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+        )
+
+        assert audit["paper_only"] is True
+        assert audit["execution_enabled"] is False
+        assert audit["real_execution_ready"] is False
+
+    def test_reads_scheduler_progress_from_autopilot_report(self, tmp_path: Path) -> None:
+        runs_dir = tmp_path / "runs"
+        report_path = _write_autopilot_report(
+            runs_dir,
+            action="chunk_completed",
+            files_downloaded_today=6,
+            chunks_completed_today=2,
+        )
+
+        audit = scheduler.cmd_phase_backfill_audit(
+            coins=["BTC", "ETH"],
+            data_root=tmp_path / "data",
+            downloads_root=tmp_path / "downloads",
+            reports_dir=runs_dir,
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+        )
+
+        progress = audit["scheduler_progress"]
+        assert progress["latest_autopilot_report_path"] == str(report_path)
+        assert progress["latest_action"] == "chunk_completed"
+        assert progress["files_downloaded_today"] == 6
+        assert progress["chunks_completed_today"] == 2
+
+    def test_no_network_subprocess_or_aws_calls(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        def _blocked(*args: object, **kwargs: object) -> None:
+            raise AssertionError("network/subprocess call attempted during audit")
+
+        monkeypatch.setattr("urllib.request.urlopen", _blocked)
+        monkeypatch.setattr("subprocess.run", _blocked)
+        monkeypatch.setattr("subprocess.Popen", _blocked)
+        monkeypatch.setattr("boto3.client", _blocked)
+
+        scheduler.cmd_phase_backfill_audit(
+            coins=["BTC"],
+            data_root=tmp_path / "data",
+            downloads_root=tmp_path / "downloads",
+            reports_dir=tmp_path / "runs",
+            candidate_reports_dir=tmp_path / "candidate",
+            state_path=tmp_path / "missing-state.json",
+        )

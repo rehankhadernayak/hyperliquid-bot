@@ -16,8 +16,10 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
+import bid_ask_candidate_validator as candidate_validator
 import bid_ask_daily_summary
 import bid_ask_research_orchestrator as orchestrator
+from bid_ask_resampler import normalize_source, resampled_csv_path
 from bid_ask_schema import SAFETY_STATEMENT, TIMESTAMP_MS
 from historical_l2_backfill_planner import validate_date_yyyymmdd
 from historical_l2_importer import default_historical_output_path, summarize_historical_coverage
@@ -76,6 +78,11 @@ PHASE_REQUESTER_PAYS_WARNING = (
 PHASE_CHUNK_LIMIT_BOTTLENECK_WARNING = (
     "daily_chunk_limit bottlenecks requested daily_file_limit"
 )
+PHASE_BACKFILL_BASELINE_DATE = "20230916"
+DEFAULT_DOWNLOADS_ROOT = Path("downloads/hyperliquid")
+DEFAULT_CANDIDATE_VALIDATION_REPORTS_DIR = Path("reports/bid_ask_candidate_validation")
+PHASE_AUDIT_CANDIDATE_UNCHANGED_LIMIT = 3
+AUTOPILOT_REPORT_GLOB = "bid_ask_scheduler_autopilot_*.json"
 CONSERVATIVE_DAILY_CHUNK_LIMIT = 4
 CONSERVATIVE_DAILY_FILE_LIMIT = 24
 CONSERVATIVE_MAX_DAILY_CHUNK_LIMIT = 4
@@ -807,6 +814,649 @@ def cmd_phase_backfill_estimate(
         daily_chunk_limit=daily_chunk_limit,
         chunk_size_hours=chunk_size_hours,
     )
+
+
+def _load_state_optional(state_path: Path) -> SchedulerState | None:
+    if not state_path.is_file():
+        return None
+    return load_state(state_path)
+
+
+def _phase_baseline_end_ms() -> int:
+    base = datetime.strptime(PHASE_BACKFILL_BASELINE_DATE, "%Y%m%d").replace(tzinfo=timezone.utc)
+    end_dt = base.replace(hour=23, minute=59, second=59, microsecond=999000)
+    return int(end_dt.timestamp() * 1000)
+
+
+def _timestamp_ms_to_iso(timestamp_ms: int | None) -> str | None:
+    if timestamp_ms is None:
+        return None
+    return datetime.fromtimestamp(timestamp_ms / 1000, tz=timezone.utc).isoformat().replace(
+        "+00:00", "Z"
+    )
+
+
+def _coverage_hours(start_ms: int | None, end_ms: int | None) -> float | None:
+    if start_ms is None or end_ms is None or end_ms < start_ms:
+        return None
+    return round((end_ms - start_ms) / 3_600_000, 4)
+
+
+def _historical_freshness_status(end_timestamp_ms: int | None) -> str:
+    if end_timestamp_ms is None:
+        return "missing"
+    if end_timestamp_ms > _phase_baseline_end_ms():
+        return "advancing"
+    return "stale"
+
+
+def _csv_coverage_entry(csv_path: Path) -> dict[str, Any]:
+    entry: dict[str, Any] = {
+        "path": str(csv_path),
+        "exists": csv_path.is_file(),
+        "row_count": 0,
+        "first_timestamp_ms": None,
+        "last_timestamp_ms": None,
+        "first_timestamp": None,
+        "last_timestamp": None,
+        "coverage_hours": None,
+        "freshness_status": "missing",
+    }
+    if not entry["exists"]:
+        return entry
+
+    try:
+        coverage = summarize_historical_coverage(csv_path)
+    except Exception as exc:  # noqa: BLE001
+        entry["error"] = str(exc)
+        return entry
+
+    entry["row_count"] = coverage.row_count
+    entry["first_timestamp_ms"] = coverage.start_timestamp_ms
+    entry["last_timestamp_ms"] = coverage.end_timestamp_ms
+    entry["first_timestamp"] = _timestamp_ms_to_iso(coverage.start_timestamp_ms)
+    entry["last_timestamp"] = _timestamp_ms_to_iso(coverage.end_timestamp_ms)
+    entry["coverage_hours"] = _coverage_hours(
+        coverage.start_timestamp_ms,
+        coverage.end_timestamp_ms,
+    )
+    entry["freshness_status"] = _historical_freshness_status(coverage.end_timestamp_ms)
+    return entry
+
+
+def _resampled_coverage_entry(
+    coin: str,
+    interval: str,
+    *,
+    source: str,
+    data_root: Path,
+) -> dict[str, Any]:
+    csv_path = resampled_csv_path(coin, interval, data_root, source=source)
+    entry: dict[str, Any] = {
+        "path": str(csv_path),
+        "exists": csv_path.is_file(),
+        "row_count": 0,
+        "first_timestamp_ms": None,
+        "last_timestamp_ms": None,
+        "first_timestamp": None,
+        "last_timestamp": None,
+        "coverage_hours": None,
+    }
+    if not entry["exists"]:
+        return entry
+
+    start_values: list[int] = []
+    end_values: list[int] = []
+    with csv_path.open(encoding="utf-8", newline="") as handle:
+        reader = csv.DictReader(handle)
+        for row in reader:
+            entry["row_count"] += 1
+            try:
+                start_values.append(int(row["start_timestamp_ms"]))
+                end_values.append(int(row["end_timestamp_ms"]))
+            except (KeyError, TypeError, ValueError):
+                continue
+
+    if start_values and end_values:
+        first_ms = min(start_values)
+        last_ms = max(end_values)
+        entry["first_timestamp_ms"] = first_ms
+        entry["last_timestamp_ms"] = last_ms
+        entry["first_timestamp"] = _timestamp_ms_to_iso(first_ms)
+        entry["last_timestamp"] = _timestamp_ms_to_iso(last_ms)
+        entry["coverage_hours"] = _coverage_hours(first_ms, last_ms)
+    return entry
+
+
+def _find_latest_autopilot_report(
+    runs_dir: Path,
+    state: SchedulerState | None,
+) -> tuple[str | None, dict[str, Any] | None]:
+    candidate_path: Path | None = None
+    if state and state.autopilot.last_autopilot_report_path:
+        saved = Path(state.autopilot.last_autopilot_report_path)
+        if saved.is_file():
+            candidate_path = saved
+
+    if candidate_path is None and runs_dir.is_dir():
+        matches = sorted(
+            runs_dir.glob(AUTOPILOT_REPORT_GLOB),
+            key=lambda path: path.stat().st_mtime,
+            reverse=True,
+        )
+        if matches:
+            candidate_path = matches[0]
+
+    if candidate_path is None:
+        return None, None
+
+    try:
+        payload = json.loads(candidate_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return str(candidate_path), None
+    return str(candidate_path), payload
+
+
+def _build_scheduler_progress(
+    *,
+    state: SchedulerState | None,
+    runs_dir: Path,
+) -> dict[str, Any]:
+    report_path, report = _find_latest_autopilot_report(runs_dir, state)
+    autopilot = state.autopilot if state else AutopilotState()
+    snapshot = (report or {}).get("autopilot_snapshot") or {}
+
+    def _pick_int(*values: Any) -> int:
+        for value in values:
+            if value is not None:
+                return int(value)
+        return 0
+
+    warnings = list((report or {}).get("warnings") or [])
+    failures = list((report or {}).get("failures") or [])
+    coins = list((report or {}).get("coins") or [])
+    if not coins and autopilot.focused_coins:
+        coins = list(autopilot.focused_coins)
+    if not coins and state:
+        coins = list(state.coins)
+
+    return {
+        "latest_autopilot_report_path": report_path,
+        "latest_action": (report or {}).get("action"),
+        "files_downloaded_today": _pick_int(
+            (report or {}).get("files_downloaded_today"),
+            snapshot.get("files_downloaded_today"),
+            autopilot.files_downloaded_today,
+        ),
+        "chunks_completed_today": _pick_int(
+            (report or {}).get("chunks_completed_today"),
+            snapshot.get("chunks_completed_today"),
+            autopilot.chunks_completed_today,
+        ),
+        "failed_runs_in_row": _pick_int(
+            snapshot.get("failed_runs_in_row"),
+            autopilot.failed_runs_in_row,
+        ),
+        "paused": bool(snapshot.get("paused", autopilot.paused)),
+        "warnings": warnings,
+        "errors": failures,
+        "latest_coins": coins,
+    }
+
+
+def _summarize_downloads(downloads_root: Path, coins: list[str]) -> dict[str, Any]:
+    coin_set = {coin.upper() for coin in coins}
+    summary: dict[str, Any] = {
+        "downloads_root": str(downloads_root),
+        "exists": downloads_root.is_dir(),
+        "total_files": 0,
+        "by_coin": {coin: 0 for coin in coins},
+        "by_date_hour": {},
+        "newest_mtime_iso": None,
+        "latest_files_per_coin": {},
+    }
+    if not downloads_root.is_dir():
+        return summary
+
+    newest_mtime = 0.0
+    latest_per_coin: dict[str, dict[str, Any]] = {}
+
+    for path in downloads_root.rglob("*"):
+        if not path.is_file() or path.suffix not in {".lz4", ".jsonl"}:
+            continue
+
+        try:
+            relative = path.relative_to(downloads_root)
+        except ValueError:
+            continue
+        if len(relative.parts) < 3:
+            continue
+
+        date_str, hour_str = relative.parts[0], relative.parts[1]
+        coin = path.stem.upper()
+        if coin not in coin_set:
+            continue
+
+        summary["total_files"] += 1
+        summary["by_coin"][coin] = int(summary["by_coin"].get(coin, 0)) + 1
+        date_hour_key = f"{date_str}/{hour_str}"
+        summary["by_date_hour"][date_hour_key] = (
+            int(summary["by_date_hour"].get(date_hour_key, 0)) + 1
+        )
+
+        mtime = path.stat().st_mtime
+        if mtime > newest_mtime:
+            newest_mtime = mtime
+
+        current = latest_per_coin.get(coin)
+        sort_key = (date_str, hour_str, path.name)
+        if current is None or sort_key > tuple(current["_sort_key"]):
+            latest_per_coin[coin] = {
+                "_sort_key": list(sort_key),
+                "path": str(path),
+                "date": date_str,
+                "hour": hour_str,
+                "suffix": path.suffix,
+                "mtime_iso": datetime.fromtimestamp(mtime, tz=timezone.utc)
+                .isoformat()
+                .replace("+00:00", "Z"),
+            }
+
+    for coin, payload in latest_per_coin.items():
+        payload.pop("_sort_key", None)
+        summary["latest_files_per_coin"][coin] = payload
+
+    if newest_mtime > 0:
+        summary["newest_mtime_iso"] = (
+            datetime.fromtimestamp(newest_mtime, tz=timezone.utc)
+            .isoformat()
+            .replace("+00:00", "Z")
+        )
+    return summary
+
+
+def _candidate_status_label(report: dict[str, Any]) -> str:
+    status = report.get("validation_status") or {}
+    if status.get("paper_candidate_pass"):
+        return "paper_candidate_pass"
+    return "not_market_ready"
+
+
+def _detect_repeated_unchanged_candidate_reports(
+    reports: list[dict[str, Any]],
+    *,
+    limit: int = PHASE_AUDIT_CANDIDATE_UNCHANGED_LIMIT,
+) -> bool:
+    if len(reports) < limit:
+        return False
+    recent = reports[-limit:]
+    signatures = {
+        (
+            item.get("filtered_paper_trades"),
+            float(item.get("cumulative_net_return_bps", 0.0)),
+            _candidate_status_label(item),
+        )
+        for item in recent
+    }
+    return len(signatures) == 1
+
+
+def _build_candidate_freshness(
+    candidate_reports_dir: Path,
+) -> dict[str, Any]:
+    reports = candidate_validator.load_candidate_validation_reports(
+        reports_dir=candidate_reports_dir
+    )
+    if not reports:
+        return {
+            "latest_candidate_report_path": None,
+            "latest_run_timestamp": None,
+            "filtered_paper_trades": None,
+            "cumulative_net_return_bps": None,
+            "status": None,
+            "repeated_unchanged_warning": False,
+            "unchanged_reports_checked": 0,
+        }
+
+    latest = reports[-1]
+    repeated_unchanged = _detect_repeated_unchanged_candidate_reports(reports)
+    return {
+        "latest_candidate_report_path": latest.get("json_report_path"),
+        "latest_run_timestamp": latest.get("run_timestamp"),
+        "filtered_paper_trades": latest.get("filtered_paper_trades"),
+        "cumulative_net_return_bps": latest.get("cumulative_net_return_bps"),
+        "status": _candidate_status_label(latest),
+        "repeated_unchanged_warning": repeated_unchanged,
+        "unchanged_reports_checked": min(len(reports), PHASE_AUDIT_CANDIDATE_UNCHANGED_LIMIT),
+    }
+
+
+def _is_resample_stale_for_coin(
+    coin: str,
+    *,
+    imported_1s: dict[str, dict[str, Any]],
+    resampled: dict[str, dict[str, dict[str, Any]]],
+) -> bool:
+    one_s = imported_1s.get(coin, {})
+    if one_s.get("freshness_status") != "advancing":
+        return False
+
+    one_s_end = one_s.get("last_timestamp_ms")
+    fifteen = resampled.get(coin, {}).get("15s", {})
+    if not fifteen.get("exists"):
+        return True
+
+    fifteen_end = fifteen.get("last_timestamp_ms")
+    if one_s_end and fifteen_end and fifteen_end < one_s_end:
+        return True
+    return False
+
+
+def _recommend_phase_audit_action(
+    *,
+    downloads: dict[str, Any],
+    imported_1s: dict[str, dict[str, Any]],
+    resampled: dict[str, dict[str, dict[str, Any]]],
+    candidate: dict[str, Any],
+    coins: list[str],
+) -> str:
+    has_downloads = int(downloads.get("total_files") or 0) > 0
+    any_1s_stale = any(
+        imported_1s.get(coin, {}).get("freshness_status") in {"stale", "missing"}
+        for coin in coins
+    )
+    any_1s_advancing = any(
+        imported_1s.get(coin, {}).get("freshness_status") == "advancing"
+        for coin in coins
+    )
+    resample_stale = any(
+        _is_resample_stale_for_coin(
+            coin,
+            imported_1s=imported_1s,
+            resampled=resampled,
+        )
+        for coin in coins
+    )
+
+    if has_downloads and any_1s_stale:
+        return "import step likely failing or not appending"
+    if any_1s_advancing and resample_stale:
+        return "run historical resample"
+    if any_1s_advancing and not resample_stale and candidate.get("repeated_unchanged_warning"):
+        return "rerun validator/robustness"
+    if not has_downloads:
+        return "check autopilot/download reports and AWS access"
+    return "continue phase backfill autopilot ticks"
+
+
+def _build_phase_config(
+    autopilot: AutopilotState,
+    *,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+) -> dict[str, Any]:
+    phase_fields = _phase_backfill_status_fields(autopilot, chunk_size_hours=chunk_size_hours)
+    return {
+        "phase_backfill_enabled": phase_fields["phase_backfill_enabled"],
+        "phase_backfill_name": phase_fields["phase_backfill_name"],
+        "focused_coins": list(phase_fields["focused_coins"]),
+        "target_days": phase_fields["target_days"],
+        "daily_file_limit": autopilot.daily_file_limit,
+        "daily_chunk_limit": autopilot.daily_chunk_limit,
+        "effective_daily_file_capacity": phase_fields["effective_daily_file_capacity"],
+        "estimated_real_days_to_complete": phase_fields["estimated_real_days_to_complete"],
+        "warnings": list(phase_fields.get("warnings") or []),
+    }
+
+
+def build_phase_backfill_audit(
+    *,
+    coins: list[str],
+    source: str = "historical",
+    reports_dir: Path = DEFAULT_RUNS_DIR,
+    data_root: Path = orchestrator.DEFAULT_DATA_ROOT,
+    downloads_root: Path = DEFAULT_DOWNLOADS_ROOT,
+    candidate_reports_dir: Path = DEFAULT_CANDIDATE_VALIDATION_REPORTS_DIR,
+    state: SchedulerState | None = None,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+) -> dict[str, Any]:
+    """Build a read-only Phase 3 progress and import audit report."""
+    normalized_source = normalize_source(source)
+    imported_1s: dict[str, dict[str, Any]] = {}
+    resampled: dict[str, dict[str, dict[str, Any]]] = {}
+
+    for coin in coins:
+        csv_path = default_historical_output_path(coin, output_root=data_root)
+        imported_1s[coin] = _csv_coverage_entry(csv_path)
+        resampled[coin] = {
+            "15s": _resampled_coverage_entry(
+                coin,
+                "15s",
+                source=normalized_source,
+                data_root=data_root,
+            ),
+            "1m": _resampled_coverage_entry(
+                coin,
+                "1m",
+                source=normalized_source,
+                data_root=data_root,
+            ),
+        }
+
+    downloads = _summarize_downloads(downloads_root, coins)
+    candidate = _build_candidate_freshness(candidate_reports_dir)
+    autopilot = state.autopilot if state else AutopilotState()
+
+    audit: dict[str, Any] = {
+        "generated_at": _utc_now_iso(),
+        "command": "phase-backfill-audit",
+        "paper_only": True,
+        "execution_enabled": False,
+        "real_execution_ready": False,
+        "safety_statement": SAFETY_STATEMENT,
+        "baseline_date": PHASE_BACKFILL_BASELINE_DATE,
+        "source": normalized_source,
+        "coins": coins,
+        "phase_config": _build_phase_config(autopilot, chunk_size_hours=chunk_size_hours),
+        "scheduler_progress": _build_scheduler_progress(state=state, runs_dir=reports_dir),
+        "downloads": downloads,
+        "imported_historical_1s": imported_1s,
+        "resampled_coverage": resampled,
+        "candidate_freshness": candidate,
+    }
+    audit["next_recommended_action"] = _recommend_phase_audit_action(
+        downloads=downloads,
+        imported_1s=imported_1s,
+        resampled=resampled,
+        candidate=candidate,
+        coins=coins,
+    )
+    if candidate.get("repeated_unchanged_warning"):
+        audit.setdefault("warnings", []).append(
+            "Candidate validation results unchanged across recent reports"
+        )
+    return audit
+
+
+def format_phase_backfill_audit_markdown(audit: dict[str, Any]) -> str:
+    lines = [
+        "# Phase Backfill Audit",
+        "",
+        f"- generated_at: {audit['generated_at']}",
+        f"- paper_only: {audit['paper_only']}",
+        f"- execution_enabled: {audit['execution_enabled']}",
+        f"- real_execution_ready: {audit['real_execution_ready']}",
+        f"- baseline_date: {audit['baseline_date']}",
+        f"- coins: {', '.join(audit.get('coins') or [])}",
+        f"- next_recommended_action: {audit.get('next_recommended_action')}",
+        "",
+        "## Phase config",
+        "",
+    ]
+    phase = audit.get("phase_config") or {}
+    for key in (
+        "phase_backfill_enabled",
+        "phase_backfill_name",
+        "focused_coins",
+        "target_days",
+        "daily_file_limit",
+        "daily_chunk_limit",
+        "effective_daily_file_capacity",
+        "estimated_real_days_to_complete",
+    ):
+        value = phase.get(key)
+        if value is not None:
+            lines.append(f"- {key}: {value}")
+
+    lines.extend(["", "## Scheduler progress", ""])
+    scheduler = audit.get("scheduler_progress") or {}
+    for key in (
+        "latest_autopilot_report_path",
+        "latest_action",
+        "files_downloaded_today",
+        "chunks_completed_today",
+        "failed_runs_in_row",
+        "paused",
+        "latest_coins",
+    ):
+        lines.append(f"- {key}: {scheduler.get(key)}")
+
+    lines.extend(["", "## Downloads", ""])
+    downloads = audit.get("downloads") or {}
+    lines.append(f"- total_files: {downloads.get('total_files')}")
+    lines.append(f"- newest_mtime_iso: {downloads.get('newest_mtime_iso')}")
+
+    lines.extend(["", "## Imported historical_1s", ""])
+    for coin, coverage in (audit.get("imported_historical_1s") or {}).items():
+        lines.append(
+            f"- {coin}: exists={coverage.get('exists')} "
+            f"rows={coverage.get('row_count')} "
+            f"last={coverage.get('last_timestamp')} "
+            f"freshness={coverage.get('freshness_status')}"
+        )
+
+    lines.extend(["", "## Resampled coverage", ""])
+    for coin, intervals in (audit.get("resampled_coverage") or {}).items():
+        for interval, coverage in intervals.items():
+            lines.append(
+                f"- {coin} {interval}: exists={coverage.get('exists')} "
+                f"rows={coverage.get('row_count')} last={coverage.get('last_timestamp')}"
+            )
+
+    lines.extend(["", "## Candidate freshness", ""])
+    candidate = audit.get("candidate_freshness") or {}
+    for key in (
+        "latest_candidate_report_path",
+        "latest_run_timestamp",
+        "filtered_paper_trades",
+        "cumulative_net_return_bps",
+        "status",
+        "repeated_unchanged_warning",
+    ):
+        lines.append(f"- {key}: {candidate.get(key)}")
+
+    for warning in audit.get("warnings") or []:
+        lines.extend(["", "## Warnings", "", f"- {warning}"])
+
+    lines.extend(["", audit.get("safety_statement", SAFETY_STATEMENT), ""])
+    return "\n".join(lines)
+
+
+def _print_phase_backfill_audit(audit: dict[str, Any]) -> None:
+    print("Phase Backfill Audit (read-only)")
+    print(f"  generated_at: {audit['generated_at']}")
+    print(f"  paper_only: {audit['paper_only']}")
+    print(f"  execution_enabled: {audit['execution_enabled']}")
+    print(f"  real_execution_ready: {audit['real_execution_ready']}")
+    print(f"  coins: {', '.join(audit.get('coins') or [])}")
+    print(f"  next_recommended_action: {audit.get('next_recommended_action')}")
+
+    phase = audit.get("phase_config") or {}
+    print("  phase_backfill_enabled:", phase.get("phase_backfill_enabled"))
+    if phase.get("phase_backfill_name"):
+        print(f"  phase_backfill_name: {phase['phase_backfill_name']}")
+    if phase.get("focused_coins"):
+        print(f"  focused_coins: {', '.join(phase['focused_coins'])}")
+    if phase.get("target_days"):
+        print(f"  target_days: {phase['target_days']}")
+    print(f"  daily_file_limit: {phase.get('daily_file_limit')}")
+    print(f"  daily_chunk_limit: {phase.get('daily_chunk_limit')}")
+    if phase.get("effective_daily_file_capacity") is not None:
+        print(f"  effective_daily_file_capacity: {phase['effective_daily_file_capacity']}")
+    if phase.get("estimated_real_days_to_complete") is not None:
+        print(
+            "  estimated_real_days_to_complete: "
+            f"{phase['estimated_real_days_to_complete']:.2f}"
+        )
+
+    scheduler = audit.get("scheduler_progress") or {}
+    print(f"  latest_autopilot_report: {scheduler.get('latest_autopilot_report_path')}")
+    print(f"  latest_action: {scheduler.get('latest_action')}")
+    print(f"  files_downloaded_today: {scheduler.get('files_downloaded_today')}")
+    print(f"  chunks_completed_today: {scheduler.get('chunks_completed_today')}")
+
+    downloads = audit.get("downloads") or {}
+    print(f"  downloads_total_files: {downloads.get('total_files')}")
+    print(f"  downloads_newest_mtime: {downloads.get('newest_mtime_iso')}")
+
+    for coin, coverage in (audit.get("imported_historical_1s") or {}).items():
+        print(
+            f"  {coin} historical_1s: rows={coverage.get('row_count')} "
+            f"last={coverage.get('last_timestamp')} "
+            f"freshness={coverage.get('freshness_status')}"
+        )
+
+    candidate = audit.get("candidate_freshness") or {}
+    print(f"  candidate_status: {candidate.get('status')}")
+    if candidate.get("repeated_unchanged_warning"):
+        print("  warning: candidate results unchanged across recent reports")
+
+    for warning in audit.get("warnings") or []:
+        print(f"  warning: {warning}")
+
+
+def cmd_phase_backfill_audit(
+    *,
+    coins: list[str] | None = None,
+    source: str = "historical",
+    reports_dir: Path = DEFAULT_RUNS_DIR,
+    data_root: Path = orchestrator.DEFAULT_DATA_ROOT,
+    downloads_root: Path = DEFAULT_DOWNLOADS_ROOT,
+    candidate_reports_dir: Path = DEFAULT_CANDIDATE_VALIDATION_REPORTS_DIR,
+    state_path: Path = DEFAULT_STATE_PATH,
+    json_path: Path | None = None,
+    markdown_path: Path | None = None,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+) -> dict[str, Any]:
+    """Read-only audit of Phase 3 backfill progress across downloads, imports, and reports."""
+    state = _load_state_optional(state_path)
+    autopilot = state.autopilot if state else AutopilotState()
+    if coins:
+        normalized_coins = orchestrator._normalize_coins(coins)
+    elif autopilot.phase_backfill_enabled and autopilot.focused_coins:
+        normalized_coins = orchestrator._normalize_coins(autopilot.focused_coins)
+    else:
+        normalized_coins = orchestrator._normalize_coins(PHASE_BACKFILL_DEFAULT_COINS)
+
+    audit = build_phase_backfill_audit(
+        coins=normalized_coins,
+        source=source,
+        reports_dir=reports_dir,
+        data_root=data_root,
+        downloads_root=downloads_root,
+        candidate_reports_dir=candidate_reports_dir,
+        state=state,
+        chunk_size_hours=chunk_size_hours,
+    )
+
+    if json_path is not None:
+        json_path.parent.mkdir(parents=True, exist_ok=True)
+        json_path.write_text(json.dumps(audit, indent=2), encoding="utf-8")
+
+    if markdown_path is not None:
+        markdown_path.parent.mkdir(parents=True, exist_ok=True)
+        markdown_path.write_text(format_phase_backfill_audit_markdown(audit), encoding="utf-8")
+
+    return audit
 
 
 def cmd_configure_phase_backfill(
@@ -3147,6 +3797,51 @@ def build_parser() -> argparse.ArgumentParser:
         default=DEFAULT_CHUNK_SIZE_HOURS,
     )
 
+    phase_backfill_audit = subparsers.add_parser(
+        "phase-backfill-audit",
+        help="Read-only Phase 3 progress and import audit",
+    )
+    phase_backfill_audit.add_argument(
+        "--coins",
+        nargs="+",
+        default=None,
+        help="Coins to audit (default phase focused_coins or BTC ETH)",
+    )
+    phase_backfill_audit.add_argument("--source", default="historical")
+    phase_backfill_audit.add_argument(
+        "--reports-dir",
+        type=Path,
+        default=DEFAULT_RUNS_DIR,
+    )
+    phase_backfill_audit.add_argument(
+        "--data-root",
+        type=Path,
+        default=orchestrator.DEFAULT_DATA_ROOT,
+    )
+    phase_backfill_audit.add_argument(
+        "--downloads-root",
+        type=Path,
+        default=DEFAULT_DOWNLOADS_ROOT,
+    )
+    phase_backfill_audit.add_argument(
+        "--candidate-reports-dir",
+        type=Path,
+        default=DEFAULT_CANDIDATE_VALIDATION_REPORTS_DIR,
+    )
+    phase_backfill_audit.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    phase_backfill_audit.add_argument("--json", type=Path, default=None, dest="json_path")
+    phase_backfill_audit.add_argument(
+        "--markdown",
+        type=Path,
+        default=None,
+        dest="markdown_path",
+    )
+    phase_backfill_audit.add_argument(
+        "--chunk-size-hours",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE_HOURS,
+    )
+
     autopilot_status = subparsers.add_parser(
         "autopilot-status",
         help="Print autopilot settings and usage",
@@ -3492,6 +4187,20 @@ def main(argv: list[str] | None = None) -> int:
                 chunk_size_hours=args.chunk_size_hours,
             )
             _print_phase_backfill_estimate(estimate)
+        elif args.command == "phase-backfill-audit":
+            audit = cmd_phase_backfill_audit(
+                coins=args.coins,
+                source=args.source,
+                reports_dir=args.reports_dir,
+                data_root=args.data_root,
+                downloads_root=args.downloads_root,
+                candidate_reports_dir=args.candidate_reports_dir,
+                state_path=args.state_path,
+                json_path=args.json_path,
+                markdown_path=args.markdown_path,
+                chunk_size_hours=args.chunk_size_hours,
+            )
+            _print_phase_backfill_audit(audit)
         elif args.command == "autopilot-status":
             status = cmd_autopilot_status(state_path=args.state_path)
             _print_autopilot_status(status)
