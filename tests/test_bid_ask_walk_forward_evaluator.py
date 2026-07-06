@@ -48,6 +48,7 @@ from bid_ask_walk_forward_evaluator import (
     create_walk_forward_labels,
     evaluate_coin_walk_forward,
     evaluate_trade_filter,
+    finalize_accepted_trades_csv,
     generate_walk_forward_windows,
     get_walk_forward_feature_columns,
     longest_losing_streak,
@@ -1873,7 +1874,6 @@ class TestTradeDiagnostics:
             data_root=data_root,
             reports_dir=reports_dir,
             save_reports=False,
-            save_accepted_trades=True,
             min_windows=1,
             min_trades=1,
         )
@@ -1881,12 +1881,105 @@ class TestTradeDiagnostics:
         csv_path = Path(report["accepted_trades_csv_path"])
         assert csv_path.is_file()
         assert csv_path.parent == reports_dir
+        assert report["accepted_trades_count"] > 0
         saved = pd.read_csv(csv_path)
         assert list(saved.columns) == list(ACCEPTED_TRADES_CSV_COLUMNS)
         for column in FORBIDDEN_ACCEPTED_TRADES_COLUMNS:
             assert column not in saved.columns
         if len(saved) > 0:
             assert saved["predicted_class"].isin(["UP", "DOWN"]).any()
+
+    def test_direct_evaluator_writes_accepted_trades_csv_by_default(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=True,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["filtered_paper_trades"] > 0
+        assert report["accepted_trades_csv_path"] is not None
+        assert report["accepted_trades_count"] > 0
+        assert Path(report["accepted_trades_csv_path"]).is_file()
+
+        loaded = json.loads(Path(report["json_report_path"]).read_text(encoding="utf-8"))
+        assert loaded["accepted_trades_csv_path"] == report["accepted_trades_csv_path"]
+        assert loaded["accepted_trades_count"] == report["accepted_trades_count"]
+        assert loaded["paper_only"] is True
+        assert loaded["execution_enabled"] is False
+        assert loaded["real_execution_ready"] is False
+
+    def test_no_accepted_trades_sets_null_path_and_zero_count(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            min_confidence=0.0,
+            min_edge_bps=500.0,
+            horizon_return_scale_bps=10.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=True,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["filtered_paper_trades"] == 0
+        assert report["accepted_trades_csv_path"] is None
+        assert report["accepted_trades_count"] == 0
+
+        loaded = json.loads(Path(report["json_report_path"]).read_text(encoding="utf-8"))
+        assert loaded["accepted_trades_csv_path"] is None
+        assert loaded["accepted_trades_count"] == 0
+
+    def test_finalize_accepted_trades_csv_writes_required_columns(
+        self, reports_dir: Path
+    ) -> None:
+        report = {
+            "generated_at": "2024-06-10T00:00:00+00:00",
+            "coins": ["BTC"],
+            "filtered_paper_trades": 1,
+        }
+        records = [_synthetic_accepted_trade()]
+
+        finalize_accepted_trades_csv(
+            report,
+            records,
+            reports_dir=reports_dir,
+            save_accepted_trades=True,
+        )
+
+        csv_path = Path(report["accepted_trades_csv_path"])
+        assert csv_path.is_file()
+        assert report["accepted_trades_count"] == 1
+        saved = pd.read_csv(csv_path)
+        assert list(saved.columns) == list(ACCEPTED_TRADES_CSV_COLUMNS)
 
     def test_diagnostics_detail_basic_strips_trade_records(self) -> None:
         report = {
@@ -1939,7 +2032,7 @@ class TestTradeDiagnostics:
         parser = _build_arg_parser()
         args = parser.parse_args([])
         assert args.diagnostics_detail == DEFAULT_DIAGNOSTICS_DETAIL
-        assert args.save_accepted_trades is False
+        assert args.save_accepted_trades is True
         assert args.accepted_trades_limit == DEFAULT_ACCEPTED_TRADES_LIMIT
 
     def test_trade_diagnostics_safety_flags_preserved(
@@ -1959,7 +2052,6 @@ class TestTradeDiagnostics:
             data_root=data_root,
             reports_dir=reports_dir,
             save_reports=True,
-            save_accepted_trades=True,
             min_windows=1,
             min_trades=1,
         )

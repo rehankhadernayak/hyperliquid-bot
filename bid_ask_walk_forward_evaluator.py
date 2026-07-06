@@ -1706,8 +1706,35 @@ def write_accepted_trades_csv(
         output_path, index=False
     )
     report["accepted_trades_csv_path"] = str(output_path)
-    report["accepted_trades_saved_count"] = len(limited_records)
+    report["accepted_trades_count"] = len(limited_records)
     return output_path
+
+
+def finalize_accepted_trades_csv(
+    report: dict[str, Any],
+    accepted_trade_records: list[dict[str, Any]],
+    *,
+    reports_dir: Path = DEFAULT_REPORTS_DIR,
+    save_accepted_trades: bool = True,
+    accepted_trades_limit: int = DEFAULT_ACCEPTED_TRADES_LIMIT,
+) -> None:
+    """Persist accepted filtered paper trades CSV and report metadata."""
+    filtered_paper_trades = int(report.get("filtered_paper_trades", 0))
+    if (
+        save_accepted_trades
+        and filtered_paper_trades > 0
+        and accepted_trade_records
+    ):
+        write_accepted_trades_csv(
+            accepted_trade_records,
+            reports_dir=reports_dir,
+            report=report,
+            limit=accepted_trades_limit,
+        )
+        return
+
+    report["accepted_trades_csv_path"] = None
+    report["accepted_trades_count"] = 0
 
 
 def evaluate_walk_forward_window(
@@ -2809,7 +2836,7 @@ def run_walk_forward_evaluation(
     min_windows: int = DEFAULT_MIN_WINDOWS,
     min_trades: int = DEFAULT_MIN_TRADES,
     diagnostics_detail: str = DEFAULT_DIAGNOSTICS_DETAIL,
-    save_accepted_trades: bool = False,
+    save_accepted_trades: bool = True,
     accepted_trades_limit: int = DEFAULT_ACCEPTED_TRADES_LIMIT,
     stability_report_enabled: bool = False,
     stability_min_trades_per_bucket: int = DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
@@ -2911,13 +2938,13 @@ def run_walk_forward_evaluation(
         accepted_trades_limit=accepted_trades_limit,
     )
 
-    if save_accepted_trades and all_accepted_trade_records:
-        write_accepted_trades_csv(
-            all_accepted_trade_records,
-            reports_dir=reports_dir,
-            report=report,
-            limit=accepted_trades_limit,
-        )
+    finalize_accepted_trades_csv(
+        report,
+        all_accepted_trade_records,
+        reports_dir=reports_dir,
+        save_accepted_trades=save_accepted_trades,
+        accepted_trades_limit=accepted_trades_limit,
+    )
 
     if save_reports:
         write_walk_forward_json(report, reports_dir=reports_dir)
@@ -3134,8 +3161,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--save-accepted-trades",
-        action="store_true",
-        help="Save accepted filtered paper trades CSV under reports dir",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help=(
+            "Save accepted filtered paper trades CSV when trades exist "
+            "(default: true)"
+        ),
     )
     parser.add_argument(
         "--accepted-trades-limit",
@@ -3224,6 +3255,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"markdown_report_path={report['markdown_report_path']}")
     if report.get("accepted_trades_csv_path"):
         print(f"accepted_trades_csv_path={report['accepted_trades_csv_path']}")
+    print(f"accepted_trades_count={report.get('accepted_trades_count', 0)}")
     for warning in report.get("warnings", []):
         if warning != SAFETY_NOTE:
             print(f"warning: {warning}")
