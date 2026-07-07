@@ -332,6 +332,11 @@ class AutopilotReport:
     import_progress_by_coin: dict[str, bool] = field(default_factory=dict)
     rows_added_by_coin: dict[str, int] = field(default_factory=dict)
     timestamp_advanced_by_coin: dict[str, bool] = field(default_factory=dict)
+    pre_max_timestamp_by_coin: dict[str, int | None] = field(default_factory=dict)
+    post_max_timestamp_by_coin: dict[str, int | None] = field(default_factory=dict)
+    pre_rows_by_coin: dict[str, int] = field(default_factory=dict)
+    post_rows_by_coin: dict[str, int] = field(default_factory=dict)
+    csv_summary_method: str = "numeric_max_timestamp_ms"
     real_execution_ready: bool = False
     daily_chunk_limit: int | None = None
     daily_file_limit: int | None = None
@@ -380,6 +385,11 @@ class AutopilotReport:
             "import_progress_by_coin": self.import_progress_by_coin,
             "rows_added_by_coin": self.rows_added_by_coin,
             "timestamp_advanced_by_coin": self.timestamp_advanced_by_coin,
+            "pre_max_timestamp_by_coin": self.pre_max_timestamp_by_coin,
+            "post_max_timestamp_by_coin": self.post_max_timestamp_by_coin,
+            "pre_rows_by_coin": self.pre_rows_by_coin,
+            "post_rows_by_coin": self.post_rows_by_coin,
+            "csv_summary_method": self.csv_summary_method,
             "real_execution_ready": self.real_execution_ready,
             "daily_chunk_limit": self.daily_chunk_limit,
             "daily_file_limit": self.daily_file_limit,
@@ -1023,37 +1033,119 @@ def _historical_freshness_status(end_timestamp_ms: int | None) -> str:
     return "stale"
 
 
-def _csv_coverage_entry(csv_path: Path) -> dict[str, Any]:
-    entry: dict[str, Any] = {
+CSV_SUMMARY_METHOD = "numeric_max_timestamp_ms"
+
+
+def _coverage_max_timestamp_ms(entry: dict[str, Any]) -> int | None:
+    max_ts = entry.get("max_timestamp_ms")
+    if max_ts is not None:
+        return int(max_ts)
+    last_ts = entry.get("last_timestamp_ms")
+    return int(last_ts) if last_ts is not None else None
+
+
+def _summarize_historical_1s_csv_path(csv_path: Path) -> dict[str, Any]:
+    """Scan a historical_1s CSV and compute numeric timestamp bounds across all rows."""
+    summary: dict[str, Any] = {
         "path": str(csv_path),
         "exists": csv_path.is_file(),
+        "rows_scanned": 0,
+        "min_timestamp_ms": None,
+        "first_row_timestamp_ms": None,
+        "last_row_timestamp_ms": None,
+        "max_timestamp_ms": None,
+        "missing_timestamp_ms_count": 0,
+        "latest_timestamp_iso": None,
+        "csv_summary_method": CSV_SUMMARY_METHOD,
+    }
+    if not summary["exists"]:
+        return summary
+
+    min_ts: int | None = None
+    max_ts: int | None = None
+    first_row_ts: int | None = None
+    last_row_ts: int | None = None
+    missing_count = 0
+    rows_scanned = 0
+
+    try:
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            for row in reader:
+                rows_scanned += 1
+                try:
+                    timestamp_ms = int(row[TIMESTAMP_MS])
+                except (KeyError, TypeError, ValueError):
+                    missing_count += 1
+                    continue
+                if first_row_ts is None:
+                    first_row_ts = timestamp_ms
+                last_row_ts = timestamp_ms
+                if min_ts is None or timestamp_ms < min_ts:
+                    min_ts = timestamp_ms
+                if max_ts is None or timestamp_ms > max_ts:
+                    max_ts = timestamp_ms
+    except OSError as exc:
+        summary["error"] = str(exc)
+        return summary
+
+    summary["rows_scanned"] = rows_scanned
+    summary["min_timestamp_ms"] = min_ts
+    summary["first_row_timestamp_ms"] = first_row_ts
+    summary["last_row_timestamp_ms"] = last_row_ts
+    summary["max_timestamp_ms"] = max_ts
+    summary["missing_timestamp_ms_count"] = missing_count
+    summary["latest_timestamp_iso"] = _timestamp_ms_to_iso(max_ts)
+    return summary
+
+
+def _summarize_historical_1s_csv(data_root: Path, coin: str) -> dict[str, Any]:
+    """Summarize one coin's historical_1s CSV using numeric max(timestamp_ms)."""
+    csv_path = default_historical_output_path(coin, output_root=data_root)
+    return _summarize_historical_1s_csv_path(csv_path)
+
+
+def _csv_coverage_entry(csv_path: Path) -> dict[str, Any]:
+    summary = _summarize_historical_1s_csv_path(csv_path)
+    entry: dict[str, Any] = {
+        "path": summary["path"],
+        "exists": summary["exists"],
         "row_count": 0,
         "first_timestamp_ms": None,
         "last_timestamp_ms": None,
+        "max_timestamp_ms": None,
+        "first_row_timestamp_ms": None,
+        "last_row_timestamp_ms": None,
         "first_timestamp": None,
         "last_timestamp": None,
+        "latest_timestamp_iso": None,
         "coverage_hours": None,
         "freshness_status": "missing",
+        "rows_scanned": 0,
+        "missing_timestamp_ms_count": 0,
+        "csv_summary_method": CSV_SUMMARY_METHOD,
     }
     if not entry["exists"]:
         return entry
-
-    try:
-        coverage = summarize_historical_coverage(csv_path)
-    except Exception as exc:  # noqa: BLE001
-        entry["error"] = str(exc)
+    if summary.get("error"):
+        entry["error"] = summary["error"]
         return entry
 
-    entry["row_count"] = coverage.row_count
-    entry["first_timestamp_ms"] = coverage.start_timestamp_ms
-    entry["last_timestamp_ms"] = coverage.end_timestamp_ms
-    entry["first_timestamp"] = _timestamp_ms_to_iso(coverage.start_timestamp_ms)
-    entry["last_timestamp"] = _timestamp_ms_to_iso(coverage.end_timestamp_ms)
-    entry["coverage_hours"] = _coverage_hours(
-        coverage.start_timestamp_ms,
-        coverage.end_timestamp_ms,
-    )
-    entry["freshness_status"] = _historical_freshness_status(coverage.end_timestamp_ms)
+    max_ts = summary.get("max_timestamp_ms")
+    min_ts = summary.get("min_timestamp_ms")
+    entry["row_count"] = int(summary.get("rows_scanned") or 0)
+    entry["rows_scanned"] = entry["row_count"]
+    entry["first_timestamp_ms"] = min_ts
+    entry["last_timestamp_ms"] = max_ts
+    entry["max_timestamp_ms"] = max_ts
+    entry["first_row_timestamp_ms"] = summary.get("first_row_timestamp_ms")
+    entry["last_row_timestamp_ms"] = summary.get("last_row_timestamp_ms")
+    entry["first_timestamp"] = _timestamp_ms_to_iso(min_ts)
+    entry["last_timestamp"] = _timestamp_ms_to_iso(max_ts)
+    entry["latest_timestamp_iso"] = summary.get("latest_timestamp_iso")
+    entry["missing_timestamp_ms_count"] = int(summary.get("missing_timestamp_ms_count") or 0)
+    entry["coverage_hours"] = _coverage_hours(min_ts, max_ts)
+    entry["freshness_status"] = _historical_freshness_status(max_ts)
     return entry
 
 
@@ -1083,14 +1175,14 @@ def _compute_import_progress_delta(
     for coin in pre_coverage:
         pre = pre_coverage.get(coin) or {}
         post = post_coverage.get(coin) or {}
-        pre_rows = int(pre.get("row_count") or 0)
-        post_rows = int(post.get("row_count") or 0)
-        pre_last = pre.get("last_timestamp_ms")
-        post_last = post.get("last_timestamp_ms")
+        pre_rows = int(pre.get("rows_scanned") or pre.get("row_count") or 0)
+        post_rows = int(post.get("rows_scanned") or post.get("row_count") or 0)
+        pre_max = _coverage_max_timestamp_ms(pre)
+        post_max = _coverage_max_timestamp_ms(post)
 
         rows_added = max(0, post_rows - pre_rows)
-        ts_advanced = post_last is not None and (
-            pre_last is None or int(post_last) > int(pre_last)
+        ts_advanced = post_max is not None and (
+            pre_max is None or int(post_max) > int(pre_max)
         )
         rows_added_by_coin[coin] = rows_added
         timestamp_advanced_by_coin[coin] = ts_advanced
@@ -1199,9 +1291,32 @@ def _build_import_progress_report(
     file_stats = _summarize_batch_file_stats(batch_payload)
     import_failures = _extract_import_failures(batch_payload)
     download_failures, download_error_type, _ = _extract_download_failures(batch_payload)
+    pre_max_timestamp_by_coin = {
+        coin: _coverage_max_timestamp_ms(pre_coverage.get(coin) or {}) for coin in coins
+    }
+    post_max_timestamp_by_coin = {
+        coin: _coverage_max_timestamp_ms(post_coverage.get(coin) or {}) for coin in coins
+    }
+    pre_rows_by_coin = {
+        coin: int((pre_coverage.get(coin) or {}).get("rows_scanned")
+        or (pre_coverage.get(coin) or {}).get("row_count")
+        or 0)
+        for coin in coins
+    }
+    post_rows_by_coin = {
+        coin: int((post_coverage.get(coin) or {}).get("rows_scanned")
+        or (post_coverage.get(coin) or {}).get("row_count")
+        or 0)
+        for coin in coins
+    }
     return {
         "pre_import_coverage": pre_coverage,
         "post_import_coverage": post_coverage,
+        "pre_max_timestamp_by_coin": pre_max_timestamp_by_coin,
+        "post_max_timestamp_by_coin": post_max_timestamp_by_coin,
+        "pre_rows_by_coin": pre_rows_by_coin,
+        "post_rows_by_coin": post_rows_by_coin,
+        "csv_summary_method": CSV_SUMMARY_METHOD,
         "import_failures": import_failures,
         "download_failures": download_failures,
         "download_error_type": download_error_type,
@@ -1228,6 +1343,11 @@ def _populate_autopilot_import_fields(
     report.import_progress_by_coin = dict(progress.get("import_progress_by_coin") or {})
     report.rows_added_by_coin = dict(progress.get("rows_added_by_coin") or {})
     report.timestamp_advanced_by_coin = dict(progress.get("timestamp_advanced_by_coin") or {})
+    report.pre_max_timestamp_by_coin = dict(progress.get("pre_max_timestamp_by_coin") or {})
+    report.post_max_timestamp_by_coin = dict(progress.get("post_max_timestamp_by_coin") or {})
+    report.pre_rows_by_coin = dict(progress.get("pre_rows_by_coin") or {})
+    report.post_rows_by_coin = dict(progress.get("post_rows_by_coin") or {})
+    report.csv_summary_method = str(progress.get("csv_summary_method") or CSV_SUMMARY_METHOD)
     report.real_execution_ready = False
 
 
@@ -2175,42 +2295,10 @@ def _hour_end_timestamp_ms(date: str, hour: int | str) -> int:
     return int(end_dt.timestamp() * 1000)
 
 
-def _read_latest_timestamp_ms_from_csv(csv_path: Path) -> int | None:
-    """Return the latest timestamp_ms from a historical CSV, preferring a tail read."""
-    if not csv_path.is_file():
-        return None
-
-    try:
-        with csv_path.open("rb") as handle:
-            handle.seek(0, 2)
-            file_size = handle.tell()
-            if file_size == 0:
-                return None
-            read_size = min(file_size, 8192)
-            handle.seek(-read_size, 2)
-            raw = handle.read(read_size)
-        text = raw.decode("utf-8", errors="replace")
-        lines = [line.strip() for line in text.splitlines() if line.strip()]
-        for line in reversed(lines):
-            if line.startswith(TIMESTAMP_MS):
-                continue
-            first_field = line.split(",", 1)[0].strip()
-            try:
-                return int(first_field)
-            except ValueError:
-                continue
-    except OSError:
-        pass
-
-    try:
-        return summarize_historical_coverage(csv_path).end_timestamp_ms
-    except Exception:  # noqa: BLE001
-        return None
-
-
 def _get_coin_latest_timestamp_ms(coin: str, data_root: Path) -> int | None:
-    csv_path = default_historical_output_path(coin, output_root=data_root)
-    return _read_latest_timestamp_ms_from_csv(csv_path)
+    summary = _summarize_historical_1s_csv(data_root, coin)
+    max_ts = summary.get("max_timestamp_ms")
+    return int(max_ts) if max_ts is not None else None
 
 
 def _is_hour_covered_by_latest_timestamp(
@@ -4186,9 +4274,9 @@ def _historical_1s_coverage_advanced(
     post = post_audit.get("imported_historical_1s") or {}
     watch_coins = coins or RESEARCH_SESSION_RESAMPLE_COINS
     for coin in watch_coins:
-        pre_last = (pre.get(coin) or {}).get("last_timestamp_ms")
-        post_last = (post.get(coin) or {}).get("last_timestamp_ms")
-        if post_last is not None and (pre_last is None or int(post_last) > int(pre_last)):
+        pre_max = _coverage_max_timestamp_ms(pre.get(coin) or {})
+        post_max = _coverage_max_timestamp_ms(post.get(coin) or {})
+        if post_max is not None and (pre_max is None or int(post_max) > int(pre_max)):
             return True
     return False
 
@@ -4197,8 +4285,10 @@ def _extract_coin_latest_timestamps(
     audit: dict[str, Any],
 ) -> tuple[str | None, str | None]:
     imported = audit.get("imported_historical_1s") or {}
-    btc = (imported.get("BTC") or {}).get("last_timestamp")
-    eth = (imported.get("ETH") or {}).get("last_timestamp")
+    btc_entry = imported.get("BTC") or {}
+    eth_entry = imported.get("ETH") or {}
+    btc = btc_entry.get("latest_timestamp_iso") or btc_entry.get("last_timestamp")
+    eth = eth_entry.get("latest_timestamp_iso") or eth_entry.get("last_timestamp")
     return btc, eth
 
 

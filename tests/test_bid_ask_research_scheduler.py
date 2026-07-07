@@ -1694,6 +1694,78 @@ class TestAutopilotImportProgress:
         assert report.import_progress_by_coin.get("BTC") is True
         assert report.rows_added_by_coin.get("BTC", 0) > 0
 
+    def test_autopilot_detects_progress_when_unsorted_csv_advances(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=14)
+        _enable_autopilot(state_path)
+        data_root = tmp_path / "data"
+        pre_max_ms = TS_20230917_235958Z
+        post_max_ms = 1695005998691  # 2023-09-18T02:59:58.691Z
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv_at_timestamp(data_root, coin, timestamp_ms=pre_max_ms)
+
+        def fake_auto_backfill(**kwargs: object) -> scheduler.SchedulerReport:
+            coins = list(kwargs.get("coins") or ["BTC", "ETH"])
+            root = kwargs.get("data_root")
+            if isinstance(root, Path):
+                for coin in coins:
+                    _write_historical_rows_at_timestamps(root, coin, [post_max_ms])
+            report = scheduler.SchedulerReport(
+                workflows_run=["auto-backfill-next", "daily-cycle"],
+                historical_date="20230916",
+                historical_hours=["9", "10", "11"],
+                details={
+                    "resample_validate": {"warnings": [], "failures": []},
+                    "historical_backfill": {
+                        "details": {
+                            "orchestrator_batch": {
+                                "download": {
+                                    "file_results": [
+                                        {"download_status": "downloaded"},
+                                    ],
+                                },
+                                "import": [
+                                    {"coin": coin, "import_status": "imported", "rows_written": 100}
+                                    for coin in coins
+                                ],
+                            }
+                        }
+                    },
+                    "scheduler_report_paths": {
+                        "json": "/tmp/auto.json",
+                        "markdown": "/tmp/auto.md",
+                    },
+                },
+            )
+            return report
+
+        monkeypatch.setattr(scheduler, "cmd_auto_backfill_next", fake_auto_backfill)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            coins=["BTC", "ETH"],
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            data_root=data_root,
+            today_override="20230916",
+        )
+
+        assert report.action == "chunk_completed"
+        assert report.csv_summary_method == scheduler.CSV_SUMMARY_METHOD
+        assert report.timestamp_advanced_by_coin["BTC"] is True
+        assert report.timestamp_advanced_by_coin["ETH"] is True
+        assert report.rows_added_by_coin["BTC"] > 0
+        assert report.rows_added_by_coin["ETH"] > 0
+        assert report.pre_max_timestamp_by_coin["BTC"] == pre_max_ms
+        assert report.post_max_timestamp_by_coin["BTC"] == post_max_ms
+        chunk_selection = report.details.get("chunk_selection") or {}
+        coverage_latest = chunk_selection.get("coverage_latest_timestamp_by_coin") or {}
+        assert coverage_latest.get("BTC") == pre_max_ms
+        assert report.post_max_timestamp_by_coin["ETH"] == post_max_ms
+
     def test_no_import_progress_when_csv_unchanged(
         self,
         tmp_path: Path,
@@ -1911,6 +1983,82 @@ class TestImportProgressHelpers:
         assert delta["import_progress_by_coin"]["BTC"] is True
         assert delta["any_import_progress"] is True
 
+    def test_summarize_historical_1s_csv_uses_numeric_max_on_unsorted_csv(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from datetime import datetime, timezone
+
+        data_root = tmp_path / "data"
+        first_row_ms = int(
+            datetime(2023, 9, 16, 10, 0, 1, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        max_row_ms = 1695005998691  # 2023-09-18T02:59:58.691Z
+        last_row_ms = int(
+            datetime(2023, 9, 16, 15, 0, 1, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        _write_historical_rows_at_timestamps(
+            data_root,
+            "BTC",
+            [first_row_ms, max_row_ms, last_row_ms],
+        )
+
+        summary = scheduler._summarize_historical_1s_csv(data_root, "BTC")
+        coverage = scheduler._historical_1s_coverage_by_coin(["BTC"], data_root)["BTC"]
+
+        assert summary["rows_scanned"] == 3
+        assert summary["first_row_timestamp_ms"] == first_row_ms
+        assert summary["last_row_timestamp_ms"] == last_row_ms
+        assert summary["max_timestamp_ms"] == max_row_ms
+        assert summary["latest_timestamp_iso"] == "2023-09-18T02:59:58.691000Z"
+        assert coverage["max_timestamp_ms"] == max_row_ms
+        assert coverage["last_timestamp_ms"] == max_row_ms
+        assert coverage["last_row_timestamp_ms"] == last_row_ms
+        assert coverage["csv_summary_method"] == scheduler.CSV_SUMMARY_METHOD
+
+    def test_get_coin_latest_timestamp_ms_uses_numeric_max(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        from datetime import datetime, timezone
+
+        data_root = tmp_path / "data"
+        max_row_ms = 1695005998691
+        last_row_ms = int(
+            datetime(2023, 9, 16, 15, 0, 1, tzinfo=timezone.utc).timestamp() * 1000
+        )
+        _write_historical_rows_at_timestamps(data_root, "BTC", [max_row_ms, last_row_ms])
+
+        assert scheduler._get_coin_latest_timestamp_ms("BTC", data_root) == max_row_ms
+
+    def test_build_import_progress_report_includes_numeric_max_fields(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        data_root = tmp_path / "data"
+        _write_historical_csv_at_timestamp(data_root, "BTC", timestamp_ms=TS_20230917_235958Z)
+        pre = scheduler._historical_1s_coverage_by_coin(["BTC"], data_root)
+        _write_historical_rows_at_timestamps(
+            data_root,
+            "BTC",
+            [1695005998691],
+        )
+        progress = scheduler._build_import_progress_report(
+            coins=["BTC"],
+            data_root=data_root,
+            pre_coverage=pre,
+            batch_payload={},
+        )
+
+        assert progress["csv_summary_method"] == scheduler.CSV_SUMMARY_METHOD
+        assert progress["pre_max_timestamp_by_coin"]["BTC"] == TS_20230917_235958Z
+        assert progress["post_max_timestamp_by_coin"]["BTC"] == 1695005998691
+        assert progress["pre_rows_by_coin"]["BTC"] == 1
+        assert progress["post_rows_by_coin"]["BTC"] == 2
+        assert progress["rows_added_by_coin"]["BTC"] == 1
+        assert progress["timestamp_advanced_by_coin"]["BTC"] is True
+        assert progress["any_import_progress"] is True
+
     def test_summarize_batch_file_stats_uses_download_status(self) -> None:
         stats = scheduler._summarize_batch_file_stats(
             {
@@ -2096,6 +2244,7 @@ class TestAutoBackfillNext:
             state_path=state_path,
             runs_dir=tmp_path / "runs",
             daily_summary_dir=tmp_path / "daily",
+            data_root=tmp_path / "data",
         )
 
         assert captured[0]["historical_hours"] == [9, 10, 11]
@@ -2121,6 +2270,7 @@ class TestAutoBackfillNext:
             state_path=state_path,
             runs_dir=tmp_path / "runs",
             daily_summary_dir=tmp_path / "daily",
+            data_root=tmp_path / "data",
         )
 
         assert captured[0]["historical_hours"] == [12, 13, 14]
@@ -2257,6 +2407,46 @@ class TestAutoBackfillNext:
         saved = json.loads(Path(state.last_report_path).read_text(encoding="utf-8"))
         assert saved["paper_only"] is True
         assert saved["execution_enabled"] is False
+
+
+def _write_historical_rows_at_timestamps(
+    data_root: Path,
+    coin: str,
+    timestamps_ms: list[int],
+) -> Path:
+    from bid_ask_schema import (
+        ASK_SIZE,
+        BEST_ASK,
+        BEST_BID,
+        BID_ASK_CSV_COLUMNS,
+        BID_SIZE,
+        TIMESTAMP_MS,
+    )
+
+    csv_dir = data_root / "historical_1s"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / f"{coin}_1s.csv"
+    import csv
+
+    write_header = not csv_path.is_file()
+    with csv_path.open("a" if csv_path.is_file() else "w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=BID_ASK_CSV_COLUMNS, extrasaction="ignore")
+        if write_header:
+            writer.writeheader()
+        for timestamp_ms in timestamps_ms:
+            writer.writerow(
+                {
+                    TIMESTAMP_MS: str(timestamp_ms),
+                    BEST_BID: "100.0",
+                    BEST_ASK: "100.1",
+                    BID_SIZE: "1.0",
+                    ASK_SIZE: "1.0",
+                    "coin": coin,
+                    "source_session_id": "historical_archive",
+                    "source_channel": "historical_l2Book",
+                }
+            )
+    return csv_path
 
 
 def _write_historical_csv_at_timestamp(
