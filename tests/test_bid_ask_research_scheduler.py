@@ -3163,3 +3163,384 @@ class TestPhaseBackfillAudit:
             candidate_reports_dir=tmp_path / "candidate",
             state_path=tmp_path / "missing-state.json",
         )
+
+
+def _block_network_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:
+    def _blocked(*args: object, **kwargs: object) -> None:
+        raise AssertionError("network/subprocess call attempted")
+
+    monkeypatch.setattr("urllib.request.urlopen", _blocked)
+    monkeypatch.setattr("subprocess.run", _blocked)
+    monkeypatch.setattr("subprocess.Popen", _blocked)
+    monkeypatch.setattr("boto3.client", _blocked)
+
+
+class TestResearchSession:
+    def test_dry_run_produces_plan_without_actions(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        sessions_dir = tmp_path / "sessions"
+        audit_calls: list[str] = []
+        autopilot_calls: list[str] = []
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: audit_calls.append("audit") or {"imported_historical_1s": {}},
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_autopilot_tick",
+            lambda **kwargs: autopilot_calls.append("tick") or scheduler.AutopilotReport(),
+        )
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=8,
+            tick_interval_minutes=60,
+            dry_run=True,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=sessions_dir,
+            data_root=tmp_path / "data",
+            downloads_root=tmp_path / "downloads",
+            candidate_reports_dir=tmp_path / "candidate",
+            scheduler_state_dir=tmp_path / "scheduler_state",
+        )
+
+        assert session["dry_run"] is True
+        assert session["ticks_planned"] == 8
+        assert session["ticks_completed"] == 0
+        assert audit_calls == []
+        assert autopilot_calls == []
+        assert session["planned_tick_actions"]
+        report_json = sessions_dir / f"research_session_{session['session_id']}.json"
+        assert report_json.is_file()
+
+    def test_max_ticks_limits_loop(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        tick_calls: list[int] = []
+
+        def fake_execute_tick(**kwargs: object) -> dict[str, object]:
+            tick_calls.append(int(kwargs["tick_index"]))
+            return {
+                "tick_index": kwargs["tick_index"],
+                "started_at": "2026-07-07T00:00:00Z",
+                "ended_at": "2026-07-07T00:01:00Z",
+                "autopilot_action": "chunk_completed",
+                "files_downloaded_new": 1,
+                "files_skipped_existing": 0,
+                "files_failed": 0,
+                "rows_added_by_coin": {"BTC": 1},
+                "timestamp_advanced_by_coin": {"BTC": True},
+                "btc_latest_timestamp": None,
+                "eth_latest_timestamp": None,
+                "historical_1s_advanced": False,
+                "candidate_trades": None,
+                "candidate_cumulative_net_return_bps": None,
+                "relaxed_trades": None,
+                "relaxed_cumulative_net_return_bps": None,
+                "resample_validate_ran": False,
+                "warnings": [],
+                "failures": [],
+            }
+
+        monkeypatch.setattr(scheduler, "_execute_research_session_tick", fake_execute_tick)
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=8,
+            tick_interval_minutes=60,
+            max_ticks=2,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            sleep_fn=lambda _seconds: None,
+        )
+
+        assert session["ticks_planned"] == 2
+        assert session["ticks_completed"] == 2
+        assert tick_calls == [0, 1]
+
+    def test_session_report_includes_safety_flags(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        sessions_dir = tmp_path / "sessions"
+
+        session = scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            dry_run=True,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=sessions_dir,
+            data_root=tmp_path / "data",
+            scheduler_state_dir=tmp_path / "scheduler_state",
+        )
+
+        assert session["paper_only"] is True
+        assert session["execution_enabled"] is False
+        assert session["real_execution_ready"] is False
+        saved = json.loads(
+            (sessions_dir / f"research_session_{session['session_id']}.json").read_text(
+                encoding="utf-8"
+            )
+        )
+        assert saved["paper_only"] is True
+        assert saved["execution_enabled"] is False
+        assert saved["real_execution_ready"] is False
+
+    def test_session_stops_if_autopilot_paused(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        scheduler.cmd_configure_autopilot(pause_reason="testing", state_path=state_path)
+        execute_calls: list[int] = []
+
+        def fake_execute_tick(**kwargs: object) -> dict[str, object]:
+            execute_calls.append(1)
+            return {}
+
+        monkeypatch.setattr(scheduler, "_execute_research_session_tick", fake_execute_tick)
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=8,
+            tick_interval_minutes=60,
+            max_ticks=3,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            sleep_fn=lambda _seconds: None,
+        )
+
+        assert session["ticks_completed"] == 0
+        assert execute_calls == []
+        assert session["stop_reason"] is not None
+        assert "paused" in session["stop_reason"].lower()
+
+    def test_session_stops_if_failed_runs_in_row_at_threshold(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        state = scheduler.load_state(state_path)
+        state.autopilot.failed_runs_in_row = scheduler.AUTOPILOT_FAILURE_PAUSE_THRESHOLD
+        scheduler.save_state(state, state_path)
+        execute_calls: list[int] = []
+
+        def fake_execute_tick(**kwargs: object) -> dict[str, object]:
+            execute_calls.append(1)
+            return {}
+
+        monkeypatch.setattr(scheduler, "_execute_research_session_tick", fake_execute_tick)
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=8,
+            tick_interval_minutes=60,
+            max_ticks=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            sleep_fn=lambda _seconds: None,
+        )
+
+        assert session["ticks_completed"] == 0
+        assert execute_calls == []
+        assert "failed_runs_in_row" in (session["stop_reason"] or "")
+
+    def test_session_tick_records_autopilot_action_and_data_advancement(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, advance_csv=True, downloaded_files=2)
+        scheduler_state_dir = tmp_path / "scheduler_state"
+        audit_json = scheduler_state_dir / "phase3_audit_latest.json"
+        audit_md = scheduler_state_dir / "phase3_audit_latest.md"
+        audit_calls: list[dict[str, object]] = []
+
+        def fake_audit(**kwargs: object) -> dict[str, object]:
+            audit_calls.append(dict(kwargs))
+            ts_ms = 1_000 if len(audit_calls) <= 1 else 2_000
+            audit_payload = {
+                "imported_historical_1s": {
+                    "BTC": {
+                        "last_timestamp_ms": ts_ms,
+                        "last_timestamp": f"{ts_ms}",
+                    },
+                    "ETH": {
+                        "last_timestamp_ms": ts_ms,
+                        "last_timestamp": f"{ts_ms}",
+                    },
+                }
+            }
+            json_path = kwargs.get("json_path")
+            markdown_path = kwargs.get("markdown_path")
+            if isinstance(json_path, Path):
+                json_path.parent.mkdir(parents=True, exist_ok=True)
+                json_path.write_text(json.dumps(audit_payload), encoding="utf-8")
+            if isinstance(markdown_path, Path):
+                markdown_path.parent.mkdir(parents=True, exist_ok=True)
+                markdown_path.write_text("# audit\n", encoding="utf-8")
+            return audit_payload
+
+        monkeypatch.setattr(scheduler, "cmd_phase_backfill_audit", fake_audit)
+        monkeypatch.setattr(
+            orchestrator,
+            "cmd_resample_validate",
+            lambda **kwargs: orchestrator.OrchestratorReport(workflows_run=["resample-validate"]),
+        )
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "run_candidate_validation",
+            lambda **kwargs: {"filtered_paper_trades": 12, "cumulative_net_return_bps": 4.5},
+        )
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "summarize_candidate_validation_reports",
+            lambda **kwargs: "summary",
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_relaxed_candidate_b_validation",
+            lambda **kwargs: {"filtered_paper_trades": 25, "cumulative_net_return_bps": 6.2},
+        )
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            max_ticks=1,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            scheduler_state_dir=scheduler_state_dir,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        tick = session["per_tick_summaries"][0]
+        assert tick["autopilot_action"] == "chunk_completed"
+        assert tick["files_downloaded_new"] == 2
+        assert tick["timestamp_advanced_by_coin"]["BTC"] is True
+        assert tick["historical_1s_advanced"] is True
+        assert tick["resample_validate_ran"] is True
+        assert tick["candidate_trades"] == 12
+        assert tick["relaxed_trades"] == 25
+        assert audit_calls[0]["json_path"] == audit_json
+        assert audit_calls[0]["markdown_path"] == audit_md
+        assert audit_json.is_file()
+        assert audit_md.is_file()
+
+    def test_dashboard_audit_artifact_paths_are_used(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        scheduler_state_dir = tmp_path / "scheduler_state"
+        expected_json, expected_md = scheduler._dashboard_phase_audit_paths(scheduler_state_dir)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            dry_run=True,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            scheduler_state_dir=scheduler_state_dir,
+        )
+
+        assert session["dashboard_audit_paths"]["json"] == str(expected_json)
+        assert session["dashboard_audit_paths"]["markdown"] == str(expected_md)
+        assert expected_json.name == "phase3_audit_latest.json"
+        assert expected_md.name == "phase3_audit_latest.md"
+
+    def test_no_real_aws_network_or_subprocess_calls(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=2,
+            tick_interval_minutes=60,
+            dry_run=True,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            scheduler_state_dir=tmp_path / "scheduler_state",
+        )
+        assert session["dry_run"] is True
+
+        _block_network_subprocess(monkeypatch)
+        scheduler.cmd_research_session(
+            duration_hours=2,
+            tick_interval_minutes=60,
+            dry_run=True,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            scheduler_state_dir=tmp_path / "scheduler_state",
+        )
+
+
+class TestResearchSessionLaunchdTemplate:
+    def test_writes_two_plists(self, tmp_path: Path) -> None:
+        output_dir = tmp_path / "launchd"
+        morning_plist, evening_plist, setup_path = (
+            scheduler.cmd_write_research_session_launchd_template(
+                output_dir=output_dir,
+                project_dir=tmp_path,
+                python_path="/usr/bin/python3",
+            )
+        )
+
+        assert morning_plist.is_file()
+        assert evening_plist.is_file()
+        assert setup_path.is_file()
+        assert morning_plist.name == scheduler.LAUNCHD_RESEARCH_SESSION_MORNING_PLIST
+        assert evening_plist.name == scheduler.LAUNCHD_RESEARCH_SESSION_EVENING_PLIST
+
+        morning_text = morning_plist.read_text(encoding="utf-8")
+        evening_text = evening_plist.read_text(encoding="utf-8")
+        setup_text = setup_path.read_text(encoding="utf-8")
+
+        assert "research-session" in morning_text
+        assert "research-session" in evening_text
+        assert "com.hyperliquid.research.session.morning" in morning_text
+        assert "com.hyperliquid.research.session.evening" in evening_text
+        assert "launchctl load" in setup_text
+        assert "not installed automatically" in setup_text.lower()

@@ -11,6 +11,7 @@ import csv
 import json
 import logging
 import sys
+import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -99,6 +100,28 @@ CONSERVATIVE_DAILY_CHUNK_LIMIT = 4
 CONSERVATIVE_DAILY_FILE_LIMIT = 24
 CONSERVATIVE_MAX_DAILY_CHUNK_LIMIT = 4
 CONSERVATIVE_MAX_DAILY_FILE_LIMIT = 36
+
+PHASE3_AUDIT_JSON_PATH = DEFAULT_STATE_DIR / "phase3_audit_latest.json"
+PHASE3_AUDIT_MARKDOWN_PATH = DEFAULT_STATE_DIR / "phase3_audit_latest.md"
+DEFAULT_RESEARCH_SESSIONS_DIR = DEFAULT_STATE_DIR / "sessions"
+DEFAULT_RESEARCH_SESSION_LABEL_PREFIX = "com.hyperliquid.research.session"
+LAUNCHD_RESEARCH_SESSION_MORNING_PLIST = "com.hyperliquid.research.session.morning.plist"
+LAUNCHD_RESEARCH_SESSION_EVENING_PLIST = "com.hyperliquid.research.session.evening.plist"
+LAUNCHD_RESEARCH_SESSION_SETUP_MD = "launchd_research_session_setup.md"
+DEFAULT_RESEARCH_SESSION_DURATION_HOURS = 8
+DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES = 60
+DEFAULT_RESEARCH_SESSION_MORNING_HOUR = 8
+DEFAULT_RESEARCH_SESSION_EVENING_HOUR = 16
+DEFAULT_RESEARCH_SESSION_OUTPUT_DIR = Path("launchd")
+RESEARCH_SESSION_RESAMPLE_COINS = ["BTC", "ETH"]
+RELAXED_CANDIDATE_B_NAME = "BTC_DOWN_MICRO_H20_CANDIDATE_B_RELAXED"
+RELAXED_CANDIDATE_B_HORIZON = 20
+RELAXED_CANDIDATE_B_MIN_CONFIDENCE = 0.6
+RELAXED_CANDIDATE_B_MIN_EDGE_BPS = 1.0
+RELAXED_CANDIDATE_B_COST_MULTIPLIER = 1.25
+RELAXED_CANDIDATE_B_MAX_SPREAD_BPS = 8.0
+RELAXED_CANDIDATE_B_FEE_BPS = 2.0
+RELAXED_CANDIDATE_B_SLIPPAGE_BPS = 1.0
 
 
 @dataclass
@@ -3689,6 +3712,680 @@ def cmd_autopilot_tick(
     return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
 
+def _dashboard_phase_audit_paths(
+    state_dir: Path = DEFAULT_STATE_DIR,
+) -> tuple[Path, Path]:
+    return (
+        state_dir / PHASE3_AUDIT_JSON_PATH.name,
+        state_dir / PHASE3_AUDIT_MARKDOWN_PATH.name,
+    )
+
+
+def _resolve_research_session_coins(
+    state_path: Path,
+    coins: list[str] | None,
+) -> list[str]:
+    state = _load_state_optional(state_path)
+    autopilot = state.autopilot if state else AutopilotState()
+    if coins:
+        return orchestrator._normalize_coins(coins)
+    if autopilot.phase_backfill_enabled and autopilot.focused_coins:
+        return orchestrator._normalize_coins(autopilot.focused_coins)
+    return orchestrator._normalize_coins(PHASE_BACKFILL_DEFAULT_COINS)
+
+
+def _compute_research_session_ticks_planned(
+    duration_hours: float,
+    tick_interval_minutes: int,
+    *,
+    max_ticks: int | None = None,
+) -> int:
+    if duration_hours <= 0:
+        raise ValueError("duration-hours must be positive")
+    if tick_interval_minutes < 1:
+        raise ValueError("tick-interval-minutes must be at least 1")
+    planned = max(1, int(duration_hours * 60 // tick_interval_minutes))
+    if max_ticks is not None:
+        if max_ticks < 1:
+            raise ValueError("max-ticks must be at least 1 when set")
+        planned = min(planned, max_ticks)
+    return planned
+
+
+def _research_session_should_stop(state_path: Path) -> tuple[bool, str | None]:
+    state = _load_state_optional(state_path)
+    if state is None:
+        return False, None
+    autopilot = state.autopilot
+    if autopilot.paused:
+        return True, f"Autopilot paused: {autopilot.pause_reason or 'unspecified'}"
+    if autopilot.failed_runs_in_row >= AUTOPILOT_FAILURE_PAUSE_THRESHOLD:
+        return True, (
+            f"Autopilot failed_runs_in_row={autopilot.failed_runs_in_row} "
+            f">= {AUTOPILOT_FAILURE_PAUSE_THRESHOLD}"
+        )
+    return False, None
+
+
+def _historical_1s_coverage_advanced(
+    pre_audit: dict[str, Any],
+    post_audit: dict[str, Any],
+    *,
+    coins: list[str] | None = None,
+) -> bool:
+    pre = pre_audit.get("imported_historical_1s") or {}
+    post = post_audit.get("imported_historical_1s") or {}
+    watch_coins = coins or RESEARCH_SESSION_RESAMPLE_COINS
+    for coin in watch_coins:
+        pre_last = (pre.get(coin) or {}).get("last_timestamp_ms")
+        post_last = (post.get(coin) or {}).get("last_timestamp_ms")
+        if post_last is not None and (pre_last is None or int(post_last) > int(pre_last)):
+            return True
+    return False
+
+
+def _extract_coin_latest_timestamps(
+    audit: dict[str, Any],
+) -> tuple[str | None, str | None]:
+    imported = audit.get("imported_historical_1s") or {}
+    btc = (imported.get("BTC") or {}).get("last_timestamp")
+    eth = (imported.get("ETH") or {}).get("last_timestamp")
+    return btc, eth
+
+
+def _build_research_session_tick_summary(
+    *,
+    tick_index: int,
+    started_at: str,
+    ended_at: str,
+    pre_audit: dict[str, Any],
+    post_audit: dict[str, Any],
+    autopilot_report: AutopilotReport,
+    candidate_report: dict[str, Any] | None = None,
+    relaxed_report: dict[str, Any] | None = None,
+    resample_ran: bool = False,
+    warnings: list[str] | None = None,
+    failures: list[str] | None = None,
+) -> dict[str, Any]:
+    post_btc_ts, post_eth_ts = _extract_coin_latest_timestamps(post_audit)
+    summary: dict[str, Any] = {
+        "tick_index": tick_index,
+        "started_at": started_at,
+        "ended_at": ended_at,
+        "autopilot_action": autopilot_report.action,
+        "files_downloaded_new": autopilot_report.files_downloaded_new,
+        "files_skipped_existing": autopilot_report.files_skipped_existing,
+        "files_failed": autopilot_report.files_failed,
+        "rows_added_by_coin": dict(autopilot_report.rows_added_by_coin),
+        "timestamp_advanced_by_coin": dict(autopilot_report.timestamp_advanced_by_coin),
+        "btc_latest_timestamp": post_btc_ts,
+        "eth_latest_timestamp": post_eth_ts,
+        "historical_1s_advanced": _historical_1s_coverage_advanced(
+            pre_audit,
+            post_audit,
+            coins=RESEARCH_SESSION_RESAMPLE_COINS,
+        ),
+        "candidate_trades": None,
+        "candidate_cumulative_net_return_bps": None,
+        "relaxed_trades": None,
+        "relaxed_cumulative_net_return_bps": None,
+        "resample_validate_ran": resample_ran,
+        "warnings": list(warnings or []),
+        "failures": list(failures or []),
+    }
+    if candidate_report is not None:
+        summary["candidate_trades"] = int(candidate_report.get("filtered_paper_trades") or 0)
+        summary["candidate_cumulative_net_return_bps"] = float(
+            candidate_report.get("cumulative_net_return_bps") or 0.0
+        )
+    if relaxed_report is not None:
+        summary["relaxed_trades"] = int(relaxed_report.get("filtered_paper_trades") or 0)
+        summary["relaxed_cumulative_net_return_bps"] = float(
+            relaxed_report.get("cumulative_net_return_bps") or 0.0
+        )
+    return summary
+
+
+def format_research_session_markdown(session: dict[str, Any]) -> str:
+    lines = [
+        "# Research Session Report",
+        "",
+        f"- session_id: {session.get('session_id')}",
+        f"- started_at: {session.get('started_at')}",
+        f"- ended_at: {session.get('ended_at')}",
+        f"- duration_hours: {session.get('duration_hours')}",
+        f"- tick_interval_minutes: {session.get('tick_interval_minutes')}",
+        f"- ticks_planned: {session.get('ticks_planned')}",
+        f"- ticks_completed: {session.get('ticks_completed')}",
+        f"- coins: {', '.join(session.get('coins') or [])}",
+        f"- source: {session.get('source')}",
+        f"- paper_only: {session.get('paper_only')}",
+        f"- execution_enabled: {session.get('execution_enabled')}",
+        f"- real_execution_ready: {session.get('real_execution_ready')}",
+        f"- dry_run: {session.get('dry_run', False)}",
+        f"- stop_reason: {session.get('stop_reason')}",
+        f"- next_recommended_action: {session.get('next_recommended_action')}",
+        "",
+        "## Per-tick summaries",
+        "",
+    ]
+    for tick in session.get("per_tick_summaries") or []:
+        lines.extend(
+            [
+                f"### Tick {tick.get('tick_index')}",
+                "",
+                f"- started_at: {tick.get('started_at')}",
+                f"- ended_at: {tick.get('ended_at')}",
+                f"- autopilot_action: {tick.get('autopilot_action')}",
+                f"- files_downloaded_new: {tick.get('files_downloaded_new')}",
+                f"- files_skipped_existing: {tick.get('files_skipped_existing')}",
+                f"- files_failed: {tick.get('files_failed')}",
+                f"- historical_1s_advanced: {tick.get('historical_1s_advanced')}",
+                f"- candidate_trades: {tick.get('candidate_trades')}",
+                f"- candidate_cumulative_net_return_bps: {tick.get('candidate_cumulative_net_return_bps')}",
+                f"- relaxed_trades: {tick.get('relaxed_trades')}",
+                f"- relaxed_cumulative_net_return_bps: {tick.get('relaxed_cumulative_net_return_bps')}",
+                "",
+            ]
+        )
+        for warning in tick.get("warnings") or []:
+            lines.append(f"- warning: {warning}")
+        for failure in tick.get("failures") or []:
+            lines.append(f"- failure: {failure}")
+        lines.append("")
+
+    final_summary = session.get("final_summary") or {}
+    if final_summary:
+        lines.extend(["## Final summary", ""])
+        for key, value in final_summary.items():
+            lines.append(f"- {key}: {value}")
+        lines.append("")
+
+    lines.extend(["", session.get("safety_statement", SAFETY_STATEMENT), ""])
+    return "\n".join(lines)
+
+
+def write_research_session_report(
+    session: dict[str, Any],
+    *,
+    sessions_dir: Path = DEFAULT_RESEARCH_SESSIONS_DIR,
+) -> tuple[Path, Path]:
+    sessions_dir.mkdir(parents=True, exist_ok=True)
+    session_id = str(session["session_id"])
+    json_path = sessions_dir / f"research_session_{session_id}.json"
+    md_path = sessions_dir / f"research_session_{session_id}.md"
+    json_path.write_text(json.dumps(session, indent=2), encoding="utf-8")
+    md_path.write_text(format_research_session_markdown(session), encoding="utf-8")
+    session["session_report_paths"] = {"json": str(json_path), "markdown": str(md_path)}
+    return json_path, md_path
+
+
+def _run_relaxed_candidate_b_validation(
+    *,
+    source: str,
+    data_root: Path,
+    walk_forward_reports_dir: Path,
+    validation_reports_dir: Path,
+    walk_forward_runner: Any | None = None,
+) -> dict[str, Any]:
+    return candidate_validator.run_candidate_validation(
+        coin="BTC",
+        interval="15s",
+        horizon=RELAXED_CANDIDATE_B_HORIZON,
+        min_confidence=RELAXED_CANDIDATE_B_MIN_CONFIDENCE,
+        min_edge_bps=RELAXED_CANDIDATE_B_MIN_EDGE_BPS,
+        cost_multiplier=RELAXED_CANDIDATE_B_COST_MULTIPLIER,
+        max_spread_bps=RELAXED_CANDIDATE_B_MAX_SPREAD_BPS,
+        min_trades_required=candidate_validator.DEFAULT_MIN_TRADES_REQUIRED,
+        require_positive=False,
+        candidate_name=RELAXED_CANDIDATE_B_NAME,
+        source=source,
+        data_root=data_root,
+        walk_forward_reports_dir=walk_forward_reports_dir,
+        validation_reports_dir=validation_reports_dir,
+        walk_forward_runner=walk_forward_runner,
+    )
+
+
+def _execute_research_session_tick(
+    *,
+    tick_index: int,
+    coins: list[str],
+    source: str,
+    aws_profile: str,
+    requester_pays: bool,
+    run_candidate_tests: bool,
+    run_relaxed_candidate_test: bool,
+    update_dashboard_artifacts: bool,
+    state_path: Path,
+    runs_dir: Path,
+    data_root: Path,
+    downloads_root: Path,
+    candidate_reports_dir: Path,
+    orchestrator_report_dir: Path,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+    audit_json_path: Path | None = None,
+    audit_markdown_path: Path | None = None,
+) -> dict[str, Any]:
+    started_at = _utc_now_iso()
+    tick_warnings: list[str] = []
+    tick_failures: list[str] = []
+
+    json_path = audit_json_path if update_dashboard_artifacts else None
+    markdown_path = audit_markdown_path if update_dashboard_artifacts else None
+
+    pre_audit = cmd_phase_backfill_audit(
+        coins=coins,
+        source=source,
+        reports_dir=runs_dir,
+        data_root=data_root,
+        downloads_root=downloads_root,
+        candidate_reports_dir=candidate_reports_dir,
+        state_path=state_path,
+        json_path=json_path,
+        markdown_path=markdown_path,
+        chunk_size_hours=chunk_size_hours,
+    )
+
+    autopilot_report = cmd_autopilot_tick(
+        coins=coins,
+        chunk_size_hours=chunk_size_hours,
+        aws_profile=aws_profile,
+        requester_pays=requester_pays,
+        data_root=data_root,
+        orchestrator_report_dir=orchestrator_report_dir,
+        state_path=state_path,
+        runs_dir=runs_dir,
+    )
+
+    post_audit = cmd_phase_backfill_audit(
+        coins=coins,
+        source=source,
+        reports_dir=runs_dir,
+        data_root=data_root,
+        downloads_root=downloads_root,
+        candidate_reports_dir=candidate_reports_dir,
+        state_path=state_path,
+        json_path=json_path,
+        markdown_path=markdown_path,
+        chunk_size_hours=chunk_size_hours,
+    )
+
+    resample_ran = False
+    if _historical_1s_coverage_advanced(pre_audit, post_audit, coins=RESEARCH_SESSION_RESAMPLE_COINS):
+        resample_report = orchestrator.cmd_resample_validate(
+            coins=RESEARCH_SESSION_RESAMPLE_COINS,
+            source=source,
+            data_root=data_root,
+            report_dir=orchestrator_report_dir,
+        )
+        resample_ran = True
+        tick_warnings.extend(resample_report.warnings)
+        tick_failures.extend(resample_report.failures)
+
+    candidate_report: dict[str, Any] | None = None
+    if run_candidate_tests:
+        try:
+            candidate_report = candidate_validator.run_candidate_validation(
+                source=source,
+                data_root=data_root,
+                validation_reports_dir=candidate_reports_dir,
+            )
+            candidate_validator.summarize_candidate_validation_reports(
+                reports_dir=candidate_reports_dir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            tick_failures.append(f"candidate validation failed: {exc}")
+
+    relaxed_report: dict[str, Any] | None = None
+    if run_relaxed_candidate_test:
+        try:
+            relaxed_report = _run_relaxed_candidate_b_validation(
+                source=source,
+                data_root=data_root,
+                walk_forward_reports_dir=orchestrator_report_dir,
+                validation_reports_dir=candidate_reports_dir,
+            )
+        except Exception as exc:  # noqa: BLE001
+            tick_failures.append(f"relaxed candidate validation failed: {exc}")
+
+    ended_at = _utc_now_iso()
+    return _build_research_session_tick_summary(
+        tick_index=tick_index,
+        started_at=started_at,
+        ended_at=ended_at,
+        pre_audit=pre_audit,
+        post_audit=post_audit,
+        autopilot_report=autopilot_report,
+        candidate_report=candidate_report,
+        relaxed_report=relaxed_report,
+        resample_ran=resample_ran,
+        warnings=tick_warnings,
+        failures=tick_failures,
+    )
+
+
+def cmd_research_session(
+    *,
+    duration_hours: float = DEFAULT_RESEARCH_SESSION_DURATION_HOURS,
+    tick_interval_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
+    coins: list[str] | None = None,
+    source: str = "historical",
+    aws_profile: str | None = None,
+    requester_pays: bool = DEFAULT_REQUESTER_PAYS,
+    run_candidate_tests: bool = True,
+    run_relaxed_candidate_test: bool = True,
+    update_dashboard_artifacts: bool = True,
+    max_ticks: int | None = None,
+    dry_run: bool = False,
+    state_path: Path = DEFAULT_STATE_PATH,
+    runs_dir: Path = DEFAULT_RUNS_DIR,
+    sessions_dir: Path = DEFAULT_RESEARCH_SESSIONS_DIR,
+    data_root: Path = orchestrator.DEFAULT_DATA_ROOT,
+    downloads_root: Path = DEFAULT_DOWNLOADS_ROOT,
+    candidate_reports_dir: Path = DEFAULT_CANDIDATE_VALIDATION_REPORTS_DIR,
+    orchestrator_report_dir: Path = orchestrator.DEFAULT_REPORT_DIR,
+    scheduler_state_dir: Path = DEFAULT_STATE_DIR,
+    chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
+    sleep_fn: Any | None = None,
+    now_fn: Any | None = None,
+) -> dict[str, Any]:
+    """Run a bounded paper-only research session with periodic safe research ticks."""
+    normalized_coins = _resolve_research_session_coins(state_path, coins)
+    normalized_source = normalize_source(source)
+    ticks_planned = _compute_research_session_ticks_planned(
+        duration_hours,
+        tick_interval_minutes,
+        max_ticks=max_ticks,
+    )
+    started_at = _utc_now_iso()
+    session_id = started_at.replace(":", "").replace("-", "").replace(".", "")[:15]
+
+    state = _load_state_optional(state_path)
+    autopilot = state.autopilot if state else AutopilotState()
+    resolved_aws_profile, resolved_requester_pays = _resolve_aws_access_settings(
+        autopilot,
+        aws_profile=aws_profile,
+        requester_pays=requester_pays,
+    )
+    audit_json_path, audit_markdown_path = _dashboard_phase_audit_paths(scheduler_state_dir)
+
+    session: dict[str, Any] = {
+        "session_id": session_id,
+        "started_at": started_at,
+        "ended_at": None,
+        "duration_hours": duration_hours,
+        "tick_interval_minutes": tick_interval_minutes,
+        "ticks_planned": ticks_planned,
+        "ticks_completed": 0,
+        "coins": normalized_coins,
+        "source": normalized_source,
+        "paper_only": True,
+        "execution_enabled": False,
+        "real_execution_ready": False,
+        "safety_statement": SAFETY_STATEMENT,
+        "dry_run": dry_run,
+        "update_dashboard_artifacts": update_dashboard_artifacts,
+        "dashboard_audit_paths": {
+            "json": str(audit_json_path),
+            "markdown": str(audit_markdown_path),
+        },
+        "aws_profile": resolved_aws_profile,
+        "requester_pays": resolved_requester_pays,
+        "run_candidate_tests": run_candidate_tests,
+        "run_relaxed_candidate_test": run_relaxed_candidate_test,
+        "per_tick_summaries": [],
+        "stop_reason": None,
+        "final_summary": {},
+        "next_recommended_action": "continue research-session on schedule",
+    }
+
+    if dry_run:
+        session["ended_at"] = _utc_now_iso()
+        session["planned_tick_actions"] = [
+            "phase-backfill-audit -> dashboard artifacts",
+            "autopilot-tick",
+            "phase-backfill-audit -> dashboard artifacts",
+            "conditional resample/validate BTC ETH historical 1s/15s",
+            "conditional candidate validation run + summarize",
+            "conditional relaxed Candidate B validation",
+        ]
+        session["final_summary"] = {
+            "mode": "dry_run",
+            "ticks_planned": ticks_planned,
+            "actions_executed": 0,
+        }
+        session["next_recommended_action"] = (
+            "Remove --dry-run to execute the planned research session ticks"
+        )
+        write_research_session_report(session, sessions_dir=sessions_dir)
+        return session
+
+    sleep = sleep_fn or time.sleep
+    now = now_fn or (lambda: datetime.now(timezone.utc))
+    end_at = now() + timedelta(hours=duration_hours)
+    per_tick_summaries: list[dict[str, Any]] = []
+    stop_reason: str | None = None
+
+    for tick_index in range(ticks_planned):
+        if now() >= end_at:
+            stop_reason = "Session duration elapsed"
+            break
+
+        should_stop, stop_message = _research_session_should_stop(state_path)
+        if should_stop:
+            stop_reason = stop_message
+            break
+
+        tick_summary = _execute_research_session_tick(
+            tick_index=tick_index,
+            coins=normalized_coins,
+            source=normalized_source,
+            aws_profile=resolved_aws_profile,
+            requester_pays=resolved_requester_pays,
+            run_candidate_tests=run_candidate_tests,
+            run_relaxed_candidate_test=run_relaxed_candidate_test,
+            update_dashboard_artifacts=update_dashboard_artifacts,
+            state_path=state_path,
+            runs_dir=runs_dir,
+            data_root=data_root,
+            downloads_root=downloads_root,
+            candidate_reports_dir=candidate_reports_dir,
+            orchestrator_report_dir=orchestrator_report_dir,
+            chunk_size_hours=chunk_size_hours,
+            audit_json_path=audit_json_path,
+            audit_markdown_path=audit_markdown_path,
+        )
+        per_tick_summaries.append(tick_summary)
+
+        should_stop, stop_message = _research_session_should_stop(state_path)
+        if should_stop:
+            stop_reason = stop_message
+            break
+
+        if tick_index < ticks_planned - 1 and now() < end_at:
+            remaining = (end_at - now()).total_seconds()
+            sleep_seconds = min(tick_interval_minutes * 60, remaining)
+            if sleep_seconds > 0:
+                sleep(sleep_seconds)
+
+    session["ticks_completed"] = len(per_tick_summaries)
+    session["per_tick_summaries"] = per_tick_summaries
+    session["ended_at"] = _utc_now_iso()
+    session["stop_reason"] = stop_reason
+
+    if stop_reason:
+        session["next_recommended_action"] = (
+            "Review stop_reason and autopilot status; "
+            "configure-autopilot --resume if needed before next session"
+        )
+    elif session["ticks_completed"] < ticks_planned:
+        session["next_recommended_action"] = "Session ended early; rerun research-session if needed"
+    else:
+        session["next_recommended_action"] = "Review session report and schedule next session"
+
+    last_tick = per_tick_summaries[-1] if per_tick_summaries else {}
+    session["final_summary"] = {
+        "ticks_completed": session["ticks_completed"],
+        "last_autopilot_action": last_tick.get("autopilot_action"),
+        "last_btc_latest_timestamp": last_tick.get("btc_latest_timestamp"),
+        "last_eth_latest_timestamp": last_tick.get("eth_latest_timestamp"),
+        "total_warnings": sum(len(t.get("warnings") or []) for t in per_tick_summaries),
+        "total_failures": sum(len(t.get("failures") or []) for t in per_tick_summaries),
+    }
+
+    write_research_session_report(session, sessions_dir=sessions_dir)
+    return session
+
+
+def _detect_python_path(python_path: str | None = None) -> str:
+    if python_path:
+        return python_path
+    venv_candidate = Path(sys.prefix) / "bin" / "python3"
+    if venv_candidate.is_file():
+        return str(venv_candidate)
+    return sys.executable
+
+
+def cmd_write_research_session_launchd_template(
+    *,
+    label_prefix: str = DEFAULT_RESEARCH_SESSION_LABEL_PREFIX,
+    morning_hour: int = DEFAULT_RESEARCH_SESSION_MORNING_HOUR,
+    evening_hour: int = DEFAULT_RESEARCH_SESSION_EVENING_HOUR,
+    duration_hours: float = DEFAULT_RESEARCH_SESSION_DURATION_HOURS,
+    tick_interval_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
+    output_dir: Path = DEFAULT_RESEARCH_SESSION_OUTPUT_DIR,
+    python_path: str | None = None,
+    project_dir: Path | None = None,
+) -> tuple[Path, Path, Path]:
+    """Write morning/evening launchd plist templates for research-session (does not install)."""
+    if not 0 <= morning_hour <= 23:
+        raise ValueError("morning-hour must be between 0 and 23")
+    if not 0 <= evening_hour <= 23:
+        raise ValueError("evening-hour must be between 0 and 23")
+    if duration_hours <= 0:
+        raise ValueError("duration-hours must be positive")
+    if tick_interval_minutes < 1:
+        raise ValueError("tick-interval-minutes must be at least 1")
+
+    root = Path(project_dir or Path.cwd()).resolve()
+    resolved_python = _detect_python_path(python_path)
+    scheduler_script = root / "bid_ask_research_scheduler.py"
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cmd_parts = [
+        resolved_python,
+        str(scheduler_script),
+        "research-session",
+        "--duration-hours",
+        str(duration_hours),
+        "--tick-interval-minutes",
+        str(tick_interval_minutes),
+        "--requester-pays",
+        "true",
+        "--run-candidate-tests",
+        "true",
+        "--run-relaxed-candidate-test",
+        "true",
+        "--update-dashboard-artifacts",
+        "true",
+    ]
+
+    stdout_log = DEFAULT_STATE_DIR / "research_session_launchd.out.log"
+    stderr_log = DEFAULT_STATE_DIR / "research_session_launchd.err.log"
+
+    def write_plist(label: str, hour: int, filename: str) -> Path:
+        plist_path = output_dir / filename
+        plist_content = f"""<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>{label}</string>
+    <key>ProgramArguments</key>
+    <array>
+{''.join(f'        <string>{part}</string>\n' for part in cmd_parts)}    </array>
+    <key>WorkingDirectory</key>
+    <string>{root}</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>{hour}</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>{stdout_log}</string>
+    <key>StandardErrorPath</key>
+    <string>{stderr_log}</string>
+</dict>
+</plist>
+"""
+        plist_path.write_text(plist_content, encoding="utf-8")
+        return plist_path
+
+    morning_label = f"{label_prefix}.morning"
+    evening_label = f"{label_prefix}.evening"
+    morning_plist = write_plist(morning_label, morning_hour, LAUNCHD_RESEARCH_SESSION_MORNING_PLIST)
+    evening_plist = write_plist(evening_label, evening_hour, LAUNCHD_RESEARCH_SESSION_EVENING_PLIST)
+
+    setup_md = output_dir / LAUNCHD_RESEARCH_SESSION_SETUP_MD
+    setup_lines = [
+        "# macOS launchd Setup for Paper-Only Research Sessions",
+        "",
+        "These templates run `research-session` once per schedule tick. "
+        "Each invocation executes a **bounded paper-only research loop** and exits. "
+        "They are **not installed automatically**.",
+        "",
+        "Research-only, paper-only; no orders, wallets, or execution endpoints.",
+        "",
+        "## Files",
+        "",
+        f"- Morning plist: `{morning_plist}`",
+        f"- Evening plist: `{evening_plist}`",
+        f"- Session reports: `{DEFAULT_RESEARCH_SESSIONS_DIR}/`",
+        f"- Dashboard audit JSON: `{PHASE3_AUDIT_JSON_PATH}`",
+        "",
+        "## Install morning session",
+        "",
+        "```bash",
+        f"cp {morning_plist} ~/Library/LaunchAgents/",
+        f"launchctl unload ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_MORNING_PLIST} 2>/dev/null || true",
+        f"launchctl load ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_MORNING_PLIST}",
+        "```",
+        "",
+        "## Install evening session",
+        "",
+        "```bash",
+        f"cp {evening_plist} ~/Library/LaunchAgents/",
+        f"launchctl unload ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_EVENING_PLIST} 2>/dev/null || true",
+        f"launchctl load ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_EVENING_PLIST}",
+        "```",
+        "",
+        "## Check status",
+        "",
+        "```bash",
+        "launchctl list | grep hyperliquid.research.session",
+        "python3 bid_ask_research_scheduler.py autopilot-status",
+        "```",
+        "",
+        "## Uninstall",
+        "",
+        "```bash",
+        f"launchctl unload ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_MORNING_PLIST}",
+        f"launchctl unload ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_EVENING_PLIST}",
+        f"rm ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_MORNING_PLIST}",
+        f"rm ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_EVENING_PLIST}",
+        "```",
+        "",
+        f"Morning schedule: **{morning_hour:02d}:00** local time (`{morning_label}`).",
+        f"Evening schedule: **{evening_hour:02d}:00** local time (`{evening_label}`).",
+        f"Session duration: **{duration_hours}** hours; tick interval: **{tick_interval_minutes}** minutes.",
+    ]
+    setup_md.write_text("\n".join(setup_lines) + "\n", encoding="utf-8")
+    return morning_plist, evening_plist, setup_md
+
+
 def _resolve_project_root(project_root: Path | None = None) -> Path:
     """Resolve repository root from explicit path or this module's location."""
     if project_root is not None:
@@ -4472,6 +5169,125 @@ def build_parser() -> argparse.ArgumentParser:
         default=bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
     )
 
+    research_session = subparsers.add_parser(
+        "research-session",
+        help="Run a bounded paper-only research session with periodic ticks",
+    )
+    research_session.add_argument(
+        "--duration-hours",
+        type=float,
+        default=DEFAULT_RESEARCH_SESSION_DURATION_HOURS,
+    )
+    research_session.add_argument(
+        "--tick-interval-minutes",
+        type=int,
+        default=DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
+    )
+    research_session.add_argument("--coins", nargs="+", default=None)
+    research_session.add_argument("--source", default="historical")
+    research_session.add_argument("--aws-profile", default=None)
+    research_session_requester_pays = research_session.add_mutually_exclusive_group()
+    research_session_requester_pays.add_argument(
+        "--requester-pays",
+        action="store_true",
+        default=None,
+    )
+    research_session_requester_pays.add_argument(
+        "--no-requester-pays",
+        action="store_true",
+        default=None,
+    )
+    research_session.add_argument(
+        "--run-candidate-tests",
+        type=_parse_bool_arg,
+        default=True,
+    )
+    research_session.add_argument(
+        "--run-relaxed-candidate-test",
+        type=_parse_bool_arg,
+        default=True,
+    )
+    research_session.add_argument(
+        "--update-dashboard-artifacts",
+        type=_parse_bool_arg,
+        default=True,
+    )
+    research_session.add_argument("--max-ticks", type=int, default=None)
+    research_session.add_argument("--dry-run", action="store_true")
+    research_session.add_argument("--state-path", type=Path, default=DEFAULT_STATE_PATH)
+    research_session.add_argument("--runs-dir", type=Path, default=DEFAULT_RUNS_DIR)
+    research_session.add_argument(
+        "--sessions-dir",
+        type=Path,
+        default=DEFAULT_RESEARCH_SESSIONS_DIR,
+    )
+    research_session.add_argument("--data-root", type=Path, default=orchestrator.DEFAULT_DATA_ROOT)
+    research_session.add_argument(
+        "--downloads-root",
+        type=Path,
+        default=DEFAULT_DOWNLOADS_ROOT,
+    )
+    research_session.add_argument(
+        "--candidate-reports-dir",
+        type=Path,
+        default=DEFAULT_CANDIDATE_VALIDATION_REPORTS_DIR,
+    )
+    research_session.add_argument(
+        "--report-dir",
+        type=Path,
+        default=orchestrator.DEFAULT_REPORT_DIR,
+    )
+    research_session.add_argument(
+        "--scheduler-state-dir",
+        type=Path,
+        default=DEFAULT_STATE_DIR,
+    )
+    research_session.add_argument(
+        "--chunk-size-hours",
+        type=int,
+        default=DEFAULT_CHUNK_SIZE_HOURS,
+    )
+
+    write_research_session_launchd = subparsers.add_parser(
+        "write-research-session-launchd-template",
+        help="Write morning/evening launchd plist templates for research-session",
+    )
+    write_research_session_launchd.add_argument(
+        "--label-prefix",
+        default=DEFAULT_RESEARCH_SESSION_LABEL_PREFIX,
+    )
+    write_research_session_launchd.add_argument(
+        "--morning-hour",
+        type=int,
+        default=DEFAULT_RESEARCH_SESSION_MORNING_HOUR,
+    )
+    write_research_session_launchd.add_argument(
+        "--evening-hour",
+        type=int,
+        default=DEFAULT_RESEARCH_SESSION_EVENING_HOUR,
+    )
+    write_research_session_launchd.add_argument(
+        "--duration-hours",
+        type=float,
+        default=DEFAULT_RESEARCH_SESSION_DURATION_HOURS,
+    )
+    write_research_session_launchd.add_argument(
+        "--tick-interval-minutes",
+        type=int,
+        default=DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
+    )
+    write_research_session_launchd.add_argument(
+        "--output-dir",
+        type=Path,
+        default=DEFAULT_RESEARCH_SESSION_OUTPUT_DIR,
+    )
+    write_research_session_launchd.add_argument("--python-path", default=None)
+    write_research_session_launchd.add_argument(
+        "--project-dir",
+        type=Path,
+        default=None,
+    )
+
     return parser
 
 
@@ -4833,6 +5649,68 @@ def main(argv: list[str] | None = None) -> int:
                     print(f"  failure: {failure}")
             if report.next_recommended_action:
                 print(f"Next: {report.next_recommended_action}")
+        elif args.command == "research-session":
+            requester_pays = _parse_cli_requester_pays(args)
+            if requester_pays is None:
+                requester_pays = DEFAULT_REQUESTER_PAYS
+            session = cmd_research_session(
+                duration_hours=args.duration_hours,
+                tick_interval_minutes=args.tick_interval_minutes,
+                coins=args.coins,
+                source=args.source,
+                aws_profile=args.aws_profile,
+                requester_pays=requester_pays,
+                run_candidate_tests=args.run_candidate_tests,
+                run_relaxed_candidate_test=args.run_relaxed_candidate_test,
+                update_dashboard_artifacts=args.update_dashboard_artifacts,
+                max_ticks=args.max_ticks,
+                dry_run=args.dry_run,
+                state_path=args.state_path,
+                runs_dir=args.runs_dir,
+                sessions_dir=args.sessions_dir,
+                data_root=args.data_root,
+                downloads_root=args.downloads_root,
+                candidate_reports_dir=args.candidate_reports_dir,
+                orchestrator_report_dir=args.report_dir,
+                scheduler_state_dir=args.scheduler_state_dir,
+                chunk_size_hours=args.chunk_size_hours,
+            )
+            print(
+                "Research session "
+                f"{'plan' if session.get('dry_run') else 'complete'}: "
+                f"ticks_completed={session.get('ticks_completed')}/"
+                f"{session.get('ticks_planned')}"
+            )
+            if session.get("stop_reason"):
+                print(f"  stop_reason: {session['stop_reason']}")
+            report_paths = session.get("session_report_paths") or {}
+            if report_paths.get("json"):
+                print(f"  session report: {report_paths['json']}")
+            if session.get("next_recommended_action"):
+                print(f"Next: {session['next_recommended_action']}")
+        elif args.command == "write-research-session-launchd-template":
+            morning_plist, evening_plist, setup_path = cmd_write_research_session_launchd_template(
+                label_prefix=args.label_prefix,
+                morning_hour=args.morning_hour,
+                evening_hour=args.evening_hour,
+                duration_hours=args.duration_hours,
+                tick_interval_minutes=args.tick_interval_minutes,
+                output_dir=args.output_dir,
+                python_path=args.python_path,
+                project_dir=args.project_dir,
+            )
+            print(f"Wrote morning launchd template: {morning_plist}")
+            print(f"Wrote evening launchd template: {evening_plist}")
+            print(f"Wrote setup instructions: {setup_path}")
+            print("Not installed automatically.")
+            print(
+                f"Install morning: cp {morning_plist} ~/Library/LaunchAgents/ && "
+                f"launchctl load ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_MORNING_PLIST}"
+            )
+            print(
+                f"Install evening: cp {evening_plist} ~/Library/LaunchAgents/ && "
+                f"launchctl load ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_EVENING_PLIST}"
+            )
         else:
             parser.error(f"unknown command: {args.command}")
     except (ValueError, FileExistsError, FileNotFoundError) as exc:
