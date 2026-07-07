@@ -3525,6 +3525,7 @@ class TestResearchSessionLaunchdTemplate:
                 output_dir=output_dir,
                 project_dir=tmp_path,
                 python_path="/usr/bin/python3",
+                use_caffeinate=False,
             )
         )
 
@@ -3544,3 +3545,93 @@ class TestResearchSessionLaunchdTemplate:
         assert "com.hyperliquid.research.session.evening" in evening_text
         assert "launchctl load" in setup_text
         assert "not installed automatically" in setup_text.lower()
+
+    def test_darwin_defaults_to_caffeinate(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(scheduler.platform, "system", lambda: "Darwin")
+        output_dir = tmp_path / "launchd"
+        morning_plist, _, setup_path = scheduler.cmd_write_research_session_launchd_template(
+            output_dir=output_dir,
+            project_dir=tmp_path,
+            python_path="/usr/bin/python3",
+        )
+
+        morning_text = morning_plist.read_text(encoding="utf-8")
+        setup_text = setup_path.read_text(encoding="utf-8")
+
+        assert scheduler.DEFAULT_CAFFEINATE_PATH in morning_text
+        assert "<string>-d</string>" in morning_text
+        assert "<string>-i</string>" in morning_text
+        assert "<string>-m</string>" in morning_text
+        assert "<string>-s</string>" in morning_text
+        assert "<string>-u</string>" in morning_text
+        assert "caffeinate keeps the Mac awake" in setup_text
+        assert "Manual caffeinated session" in setup_text
+
+    def test_no_caffeinate_omits_caffeinate(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        monkeypatch.setattr(scheduler.platform, "system", lambda: "Darwin")
+        output_dir = tmp_path / "launchd"
+        morning_plist, _, setup_path = scheduler.cmd_write_research_session_launchd_template(
+            output_dir=output_dir,
+            project_dir=tmp_path,
+            python_path="/usr/bin/python3",
+            use_caffeinate=False,
+        )
+
+        morning_text = morning_plist.read_text(encoding="utf-8")
+        setup_text = setup_path.read_text(encoding="utf-8")
+
+        assert scheduler.DEFAULT_CAFFEINATE_PATH not in morning_text
+        assert "<string>/usr/bin/python3</string>" in morning_text
+        assert "Manual caffeinated session" not in setup_text
+
+    def test_caffeinate_flags_split_into_program_arguments(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = tmp_path / "launchd"
+        morning_plist, _, _ = scheduler.cmd_write_research_session_launchd_template(
+            output_dir=output_dir,
+            project_dir=tmp_path,
+            python_path="/usr/bin/python3",
+            use_caffeinate=True,
+            caffeinate_flags="-dimsu",
+        )
+
+        morning_text = morning_plist.read_text(encoding="utf-8")
+        caffeinate_idx = morning_text.index(scheduler.DEFAULT_CAFFEINATE_PATH)
+        research_idx = morning_text.index("research-session")
+        caffeinate_section = morning_text[caffeinate_idx:research_idx]
+
+        assert "<string>-d</string>" in caffeinate_section
+        assert "<string>-i</string>" in caffeinate_section
+        assert "<string>-m</string>" in caffeinate_section
+        assert "<string>-s</string>" in caffeinate_section
+        assert "<string>-u</string>" in caffeinate_section
+        assert "<string>-dimsu</string>" not in morning_text
+
+    def test_split_caffeinate_flags_helper(self) -> None:
+        assert scheduler._split_caffeinate_flags("-dimsu") == ["-d", "-i", "-m", "-s", "-u"]
+        assert scheduler._split_caffeinate_flags("-d -i") == ["-d", "-i"]
+        assert scheduler._split_caffeinate_flags("--help") == ["--help"]
+
+    def test_no_auto_load_behavior(self, tmp_path: Path) -> None:
+        output_dir = tmp_path / "launchd"
+        _, _, setup_path = scheduler.cmd_write_research_session_launchd_template(
+            output_dir=output_dir,
+            project_dir=tmp_path,
+            python_path="/usr/bin/python3",
+            use_caffeinate=False,
+        )
+
+        setup_text = setup_path.read_text(encoding="utf-8").lower()
+        assert "not installed automatically" in setup_text
+        assert "launchctl load" in setup_text
+        assert "launchctl bootstrap" not in setup_text

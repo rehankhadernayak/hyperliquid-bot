@@ -10,6 +10,7 @@ import argparse
 import csv
 import json
 import logging
+import platform
 import sys
 import time
 from dataclasses import dataclass, field
@@ -113,6 +114,8 @@ DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES = 60
 DEFAULT_RESEARCH_SESSION_MORNING_HOUR = 8
 DEFAULT_RESEARCH_SESSION_EVENING_HOUR = 16
 DEFAULT_RESEARCH_SESSION_OUTPUT_DIR = Path("launchd")
+DEFAULT_CAFFEINATE_PATH = "/usr/bin/caffeinate"
+DEFAULT_CAFFEINATE_FLAGS = "-dimsu"
 RESEARCH_SESSION_RESAMPLE_COINS = ["BTC", "ETH"]
 RELAXED_CANDIDATE_B_NAME = "BTC_DOWN_MICRO_H20_CANDIDATE_B_RELAXED"
 RELAXED_CANDIDATE_B_HORIZON = 20
@@ -4247,33 +4250,31 @@ def _detect_python_path(python_path: str | None = None) -> str:
     return sys.executable
 
 
-def cmd_write_research_session_launchd_template(
+def _default_use_caffeinate() -> bool:
+    return platform.system() == "Darwin"
+
+
+def _split_caffeinate_flags(flags: str) -> list[str]:
+    """Split a caffeinate flags string into individual ProgramArguments tokens."""
+    result: list[str] = []
+    for token in flags.split():
+        if token.startswith("-") and not token.startswith("--") and len(token) > 2:
+            result.extend(f"-{char}" for char in token[1:])
+        else:
+            result.append(token)
+    return result
+
+
+def _build_research_session_program_arguments(
     *,
-    label_prefix: str = DEFAULT_RESEARCH_SESSION_LABEL_PREFIX,
-    morning_hour: int = DEFAULT_RESEARCH_SESSION_MORNING_HOUR,
-    evening_hour: int = DEFAULT_RESEARCH_SESSION_EVENING_HOUR,
-    duration_hours: float = DEFAULT_RESEARCH_SESSION_DURATION_HOURS,
-    tick_interval_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
-    output_dir: Path = DEFAULT_RESEARCH_SESSION_OUTPUT_DIR,
-    python_path: str | None = None,
-    project_dir: Path | None = None,
-) -> tuple[Path, Path, Path]:
-    """Write morning/evening launchd plist templates for research-session (does not install)."""
-    if not 0 <= morning_hour <= 23:
-        raise ValueError("morning-hour must be between 0 and 23")
-    if not 0 <= evening_hour <= 23:
-        raise ValueError("evening-hour must be between 0 and 23")
-    if duration_hours <= 0:
-        raise ValueError("duration-hours must be positive")
-    if tick_interval_minutes < 1:
-        raise ValueError("tick-interval-minutes must be at least 1")
-
-    root = Path(project_dir or Path.cwd()).resolve()
-    resolved_python = _detect_python_path(python_path)
-    scheduler_script = root / "bid_ask_research_scheduler.py"
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    cmd_parts = [
+    resolved_python: str,
+    scheduler_script: Path,
+    duration_hours: float,
+    tick_interval_minutes: int,
+    use_caffeinate: bool,
+    caffeinate_flags: str = DEFAULT_CAFFEINATE_FLAGS,
+) -> list[str]:
+    session_args = [
         resolved_python,
         str(scheduler_script),
         "research-session",
@@ -4290,6 +4291,48 @@ def cmd_write_research_session_launchd_template(
         "--update-dashboard-artifacts",
         "true",
     ]
+    if use_caffeinate:
+        return [DEFAULT_CAFFEINATE_PATH, *_split_caffeinate_flags(caffeinate_flags), *session_args]
+    return session_args
+
+
+def cmd_write_research_session_launchd_template(
+    *,
+    label_prefix: str = DEFAULT_RESEARCH_SESSION_LABEL_PREFIX,
+    morning_hour: int = DEFAULT_RESEARCH_SESSION_MORNING_HOUR,
+    evening_hour: int = DEFAULT_RESEARCH_SESSION_EVENING_HOUR,
+    duration_hours: float = DEFAULT_RESEARCH_SESSION_DURATION_HOURS,
+    tick_interval_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
+    output_dir: Path = DEFAULT_RESEARCH_SESSION_OUTPUT_DIR,
+    python_path: str | None = None,
+    project_dir: Path | None = None,
+    use_caffeinate: bool | None = None,
+    caffeinate_flags: str = DEFAULT_CAFFEINATE_FLAGS,
+) -> tuple[Path, Path, Path]:
+    """Write morning/evening launchd plist templates for research-session (does not install)."""
+    if not 0 <= morning_hour <= 23:
+        raise ValueError("morning-hour must be between 0 and 23")
+    if not 0 <= evening_hour <= 23:
+        raise ValueError("evening-hour must be between 0 and 23")
+    if duration_hours <= 0:
+        raise ValueError("duration-hours must be positive")
+    if tick_interval_minutes < 1:
+        raise ValueError("tick-interval-minutes must be at least 1")
+
+    root = Path(project_dir or Path.cwd()).resolve()
+    resolved_python = _detect_python_path(python_path)
+    scheduler_script = root / "bid_ask_research_scheduler.py"
+    output_dir.mkdir(parents=True, exist_ok=True)
+    caffeinate_enabled = _default_use_caffeinate() if use_caffeinate is None else use_caffeinate
+
+    cmd_parts = _build_research_session_program_arguments(
+        resolved_python=resolved_python,
+        scheduler_script=scheduler_script,
+        duration_hours=duration_hours,
+        tick_interval_minutes=tick_interval_minutes,
+        use_caffeinate=caffeinate_enabled,
+        caffeinate_flags=caffeinate_flags,
+    )
 
     stdout_log = DEFAULT_STATE_DIR / "research_session_launchd.out.log"
     stderr_log = DEFAULT_STATE_DIR / "research_session_launchd.err.log"
@@ -4339,6 +4382,10 @@ def cmd_write_research_session_launchd_template(
         "",
         "Research-only, paper-only; no orders, wallets, or execution endpoints.",
         "",
+        "caffeinate keeps the Mac awake while the research session process runs. "
+        "Closing the lid may still sleep some MacBooks unless connected to power/external "
+        "display depending on macOS settings.",
+        "",
         "## Files",
         "",
         f"- Morning plist: `{morning_plist}`",
@@ -4382,6 +4429,18 @@ def cmd_write_research_session_launchd_template(
         f"Evening schedule: **{evening_hour:02d}:00** local time (`{evening_label}`).",
         f"Session duration: **{duration_hours}** hours; tick interval: **{tick_interval_minutes}** minutes.",
     ]
+    if caffeinate_enabled:
+        manual_cmd = " ".join(cmd_parts)
+        setup_lines.extend(
+            [
+                "",
+                "## Manual caffeinated session (without launchd)",
+                "",
+                "```bash",
+                manual_cmd,
+                "```",
+            ]
+        )
     setup_md.write_text("\n".join(setup_lines) + "\n", encoding="utf-8")
     return morning_plist, evening_plist, setup_md
 
@@ -5287,6 +5346,22 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=None,
     )
+    write_research_session_launchd.add_argument(
+        "--use-caffeinate",
+        action="store_true",
+        default=None,
+        help="Wrap research-session with caffeinate (default: enabled on macOS)",
+    )
+    write_research_session_launchd.add_argument(
+        "--no-caffeinate",
+        action="store_true",
+        help="Do not wrap research-session with caffeinate",
+    )
+    write_research_session_launchd.add_argument(
+        "--caffeinate-flags",
+        default=DEFAULT_CAFFEINATE_FLAGS,
+        help="Flags passed to caffeinate (default: -dimsu)",
+    )
 
     return parser
 
@@ -5689,6 +5764,12 @@ def main(argv: list[str] | None = None) -> int:
             if session.get("next_recommended_action"):
                 print(f"Next: {session['next_recommended_action']}")
         elif args.command == "write-research-session-launchd-template":
+            if args.no_caffeinate:
+                use_caffeinate = False
+            elif args.use_caffeinate:
+                use_caffeinate = True
+            else:
+                use_caffeinate = None
             morning_plist, evening_plist, setup_path = cmd_write_research_session_launchd_template(
                 label_prefix=args.label_prefix,
                 morning_hour=args.morning_hour,
@@ -5698,11 +5779,32 @@ def main(argv: list[str] | None = None) -> int:
                 output_dir=args.output_dir,
                 python_path=args.python_path,
                 project_dir=args.project_dir,
+                use_caffeinate=use_caffeinate,
+                caffeinate_flags=args.caffeinate_flags,
             )
             print(f"Wrote morning launchd template: {morning_plist}")
             print(f"Wrote evening launchd template: {evening_plist}")
             print(f"Wrote setup instructions: {setup_path}")
             print("Not installed automatically.")
+            print(
+                "caffeinate keeps the Mac awake while the research session process runs. "
+                "Closing the lid may still sleep some MacBooks unless connected to power/"
+                "external display depending on macOS settings."
+            )
+            if use_caffeinate is not False and (use_caffeinate or _default_use_caffeinate()):
+                resolved_python = _detect_python_path(args.python_path)
+                root = Path(args.project_dir or Path.cwd()).resolve()
+                manual_cmd = " ".join(
+                    _build_research_session_program_arguments(
+                        resolved_python=resolved_python,
+                        scheduler_script=root / "bid_ask_research_scheduler.py",
+                        duration_hours=args.duration_hours,
+                        tick_interval_minutes=args.tick_interval_minutes,
+                        use_caffeinate=True,
+                        caffeinate_flags=args.caffeinate_flags,
+                    )
+                )
+                print(f"Manual caffeinated session: {manual_cmd}")
             print(
                 f"Install morning: cp {morning_plist} ~/Library/LaunchAgents/ && "
                 f"launchctl load ~/Library/LaunchAgents/{LAUNCHD_RESEARCH_SESSION_MORNING_PLIST}"
