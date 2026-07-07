@@ -2206,6 +2206,7 @@ class TestAutoBackfillNext:
             state_path=state_path,
             runs_dir=tmp_path / "runs",
             daily_summary_dir=tmp_path / "daily",
+            data_root=tmp_path / "data",
         )
 
         state = scheduler.load_state(state_path)
@@ -2226,6 +2227,7 @@ class TestAutoBackfillNext:
             state_path=state_path,
             runs_dir=tmp_path / "runs",
             daily_summary_dir=tmp_path / "daily",
+            data_root=tmp_path / "data",
         )
 
         state = scheduler.load_state(state_path)
@@ -2255,6 +2257,296 @@ class TestAutoBackfillNext:
         saved = json.loads(Path(state.last_report_path).read_text(encoding="utf-8"))
         assert saved["paper_only"] is True
         assert saved["execution_enabled"] is False
+
+
+def _write_historical_csv_at_timestamp(
+    data_root: Path,
+    coin: str,
+    *,
+    timestamp_ms: int,
+) -> Path:
+    from bid_ask_schema import (
+        ASK_SIZE,
+        BEST_ASK,
+        BEST_BID,
+        BID_ASK_CSV_COLUMNS,
+        BID_SIZE,
+        TIMESTAMP_MS,
+    )
+
+    csv_dir = data_root / "historical_1s"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / f"{coin}_1s.csv"
+    row = {
+        TIMESTAMP_MS: str(timestamp_ms),
+        BEST_BID: "100.0",
+        BEST_ASK: "100.1",
+        BID_SIZE: "1.0",
+        ASK_SIZE: "1.0",
+        "coin": coin,
+        "source_session_id": "historical_archive",
+        "source_channel": "historical_l2Book",
+    }
+    import csv
+
+    with csv_path.open("w", encoding="utf-8", newline="") as handle:
+        writer = csv.DictWriter(handle, fieldnames=BID_ASK_CSV_COLUMNS, extrasaction="ignore")
+        writer.writeheader()
+        writer.writerow(row)
+    return csv_path
+
+
+def _mark_hours_completed(
+    state_path: Path,
+    date: str,
+    hours: list[int],
+) -> None:
+    state = scheduler.load_state(state_path)
+    state.completed_batches.append(
+        {
+            "date": date,
+            "hours": [str(h) for h in hours],
+            "completed_at": "2026-01-01T00:00:00Z",
+        }
+    )
+    scheduler.save_state(state, state_path)
+
+
+# 2023-09-17T23:59:58.235Z
+TS_20230917_235958Z = 1694995198235
+# 2023-09-17T20:59:58Z — covers hours 0-20 but not 21-23
+TS_20230917_205958Z = 1694984398000
+
+
+class TestCoveredChunkAdvancement:
+    def test_is_planned_chunk_fully_covered_by_latest_timestamp(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv_at_timestamp(
+                data_root,
+                coin,
+                timestamp_ms=TS_20230917_235958Z,
+            )
+
+        assert scheduler.is_planned_chunk_fully_covered_by_historical_1s(
+            coins=["BTC", "ETH"],
+            date="20230917",
+            hours=["21", "22", "23"],
+            data_root=data_root,
+        )
+        assert not scheduler.is_planned_chunk_fully_covered_by_historical_1s(
+            coins=["BTC", "ETH"],
+            date="20230918",
+            hours=["0", "1", "2"],
+            data_root=data_root,
+        )
+
+    def test_one_coin_lagging_prevents_skip(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        data_root = tmp_path / "data"
+        _write_historical_csv_at_timestamp(data_root, "BTC", timestamp_ms=TS_20230917_235958Z)
+        _write_historical_csv_at_timestamp(data_root, "ETH", timestamp_ms=TS_20230917_205958Z)
+
+        assert not scheduler.is_planned_chunk_fully_covered_by_historical_1s(
+            coins=["BTC", "ETH"],
+            date="20230917",
+            hours=["21", "22", "23"],
+            data_root=data_root,
+        )
+
+    def test_auto_backfill_skips_covered_final_chunk_and_advances(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(
+            tmp_path,
+            start="20230917",
+            end="20230930",
+            start_hour=0,
+            end_hour=23,
+        )
+        _mark_hours_completed(state_path, "20230917", list(range(0, 21)))
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv_at_timestamp(
+                data_root,
+                coin,
+                timestamp_ms=TS_20230917_235958Z,
+            )
+        captured = _mock_auto_daily_cycle(monkeypatch)
+
+        report = scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            coins=["BTC", "ETH"],
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+            data_root=data_root,
+        )
+
+        assert captured[0]["date"] == "20230918"
+        assert captured[0]["historical_hours"] == [0, 1, 2]
+        assert report.historical_date == "20230918"
+        assert report.historical_hours == ["0", "1", "2"]
+        selection = report.details["chunk_selection"]
+        assert selection["original_planned_date"] == "20230917"
+        assert selection["original_planned_hours"] == ["21", "22", "23"]
+        assert selection["selected_date"] == "20230918"
+        assert selection["selected_hours"] == ["0", "1", "2"]
+        assert selection["selected_chunk_was_advanced"] is True
+        assert len(selection["skipped_covered_chunks"]) == 1
+        assert selection["reason"] == scheduler.CHUNK_ALREADY_COVERED_REASON
+
+    def test_does_not_skip_uncovered_chunk(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(
+            tmp_path,
+            start="20230917",
+            end="20230930",
+            start_hour=0,
+            end_hour=23,
+        )
+        _mark_hours_completed(state_path, "20230917", list(range(0, 21)))
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv_at_timestamp(
+                data_root,
+                coin,
+                timestamp_ms=TS_20230917_205958Z,
+            )
+        captured = _mock_auto_daily_cycle(monkeypatch)
+
+        report = scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            coins=["BTC", "ETH"],
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+            data_root=data_root,
+        )
+
+        assert captured[0]["date"] == "20230917"
+        assert captured[0]["historical_hours"] == [21, 22, 23]
+        selection = report.details["chunk_selection"]
+        assert selection["selected_chunk_was_advanced"] is False
+        assert selection["skipped_covered_chunks"] == []
+
+    def test_max_skip_loop_returns_no_uncovered_chunk_found(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(
+            tmp_path,
+            start="20230917",
+            end="20230930",
+            start_hour=0,
+            end_hour=23,
+        )
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv_at_timestamp(
+                data_root,
+                coin,
+                timestamp_ms=TS_20230917_235958Z,
+            )
+        monkeypatch.setattr(scheduler, "MAX_COVERED_CHUNK_SKIPS", 2)
+        captured = _mock_auto_daily_cycle(monkeypatch)
+
+        report = scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            coins=["BTC", "ETH"],
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+            data_root=data_root,
+        )
+
+        assert captured == []
+        assert report.details["no_uncovered_chunk_found"] is True
+        selection = report.details["chunk_selection"]
+        assert len(selection["skipped_covered_chunks"]) == 2
+        assert selection["selected_chunk_was_advanced"] is True
+
+    def test_autopilot_tick_reports_skipped_covered_chunks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(
+            tmp_path,
+            start="20230917",
+            end="20230930",
+            start_hour=0,
+            end_hour=23,
+        )
+        _enable_autopilot(state_path)
+        _mark_hours_completed(state_path, "20230917", list(range(0, 21)))
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH", "SOL"]:
+            _write_historical_csv_at_timestamp(
+                data_root,
+                coin,
+                timestamp_ms=TS_20230917_235958Z,
+            )
+        _mock_auto_daily_cycle(monkeypatch, advance_csv=True)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            coins=["BTC", "ETH"],
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            data_root=data_root,
+            today_override="20230917",
+        )
+
+        assert report.details["skipped_covered_chunks"]
+        assert report.details["selected_chunk_was_advanced"] is True
+        assert report.historical_date == "20230918"
+
+    def test_autopilot_tick_no_uncovered_chunk_found_action(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(
+            tmp_path,
+            start="20230917",
+            end="20230930",
+            start_hour=0,
+            end_hour=23,
+        )
+        _enable_autopilot(state_path)
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH", "SOL"]:
+            _write_historical_csv_at_timestamp(
+                data_root,
+                coin,
+                timestamp_ms=TS_20230917_235958Z,
+            )
+        monkeypatch.setattr(scheduler, "MAX_COVERED_CHUNK_SKIPS", 1)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            coins=["BTC", "ETH"],
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            data_root=data_root,
+            today_override="20230917",
+        )
+
+        assert report.action == "no_uncovered_chunk_found"
+        assert scheduler.NO_UNCOVERED_CHUNK_NEXT_ACTION in report.next_recommended_action
+        assert report.details["skipped_covered_chunks"]
 
 
 class TestPhaseBackfillEstimate:

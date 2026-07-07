@@ -60,6 +60,17 @@ NO_IMPORT_PROGRESS_MESSAGE = (
     "Chunk cycle completed but historical_1s CSVs did not advance; "
     "check date/hour planning or importer path."
 )
+CHUNK_HOUR_COVERAGE_TOLERANCE_SECONDS = 5
+MAX_COVERED_CHUNK_SKIPS = 24
+CHUNK_ALREADY_COVERED_REASON = "already_covered_by_historical_1s"
+NO_UNCOVERED_CHUNK_FOUND_MESSAGE = (
+    "All planner chunks checked are already covered by historical_1s; "
+    "no uncovered chunk selected within skip limit."
+)
+NO_UNCOVERED_CHUNK_NEXT_ACTION = (
+    "Expand target date range via init-state or inspect planner state, "
+    "then rerun autopilot-tick"
+)
 LAUNCHD_PLIST_NAME_AUTOPILOT = "com.hyperliquid.research.autopilot.plist"
 LAUNCHD_PLIST_NAME_AUTOPILOT_HOURLY = "com.hyperliquid.research.autopilot.hourly.plist"
 LAUNCHD_SETUP_MD_HOURLY = "launchd_hourly_autopilot_setup.md"
@@ -1499,6 +1510,8 @@ def _recommend_phase_audit_action(
     latest_action = progress.get("latest_action")
     if latest_action == "no_import_progress":
         return "investigate date/hour planning or importer path"
+    if latest_action == "no_uncovered_chunk_found":
+        return NO_UNCOVERED_CHUNK_NEXT_ACTION
     if latest_action == "import_failed":
         return "investigate importer errors in latest autopilot report"
 
@@ -2146,6 +2159,229 @@ def _hour_range_timestamp_bounds(date: str, hours: list[str]) -> tuple[int, int]
     start_dt = base.replace(hour=hour_ints[0], minute=0, second=0, microsecond=0)
     end_dt = base.replace(hour=hour_ints[-1], minute=59, second=59, microsecond=999000)
     return int(start_dt.timestamp() * 1000), int(end_dt.timestamp() * 1000)
+
+
+def _hour_end_timestamp_ms(date: str, hour: int | str) -> int:
+    """Return UTC millisecond timestamp at the end of a calendar hour."""
+    date_norm = validate_date_yyyymmdd(date)
+    hour_int = int(hour)
+    base = datetime.strptime(date_norm, "%Y%m%d").replace(tzinfo=timezone.utc)
+    end_dt = base.replace(hour=hour_int, minute=59, second=59, microsecond=999000)
+    return int(end_dt.timestamp() * 1000)
+
+
+def _read_latest_timestamp_ms_from_csv(csv_path: Path) -> int | None:
+    """Return the latest timestamp_ms from a historical CSV, preferring a tail read."""
+    if not csv_path.is_file():
+        return None
+
+    try:
+        with csv_path.open("rb") as handle:
+            handle.seek(0, 2)
+            file_size = handle.tell()
+            if file_size == 0:
+                return None
+            read_size = min(file_size, 8192)
+            handle.seek(-read_size, 2)
+            raw = handle.read(read_size)
+        text = raw.decode("utf-8", errors="replace")
+        lines = [line.strip() for line in text.splitlines() if line.strip()]
+        for line in reversed(lines):
+            if line.startswith(TIMESTAMP_MS):
+                continue
+            first_field = line.split(",", 1)[0].strip()
+            try:
+                return int(first_field)
+            except ValueError:
+                continue
+    except OSError:
+        pass
+
+    try:
+        return summarize_historical_coverage(csv_path).end_timestamp_ms
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _get_coin_latest_timestamp_ms(coin: str, data_root: Path) -> int | None:
+    csv_path = default_historical_output_path(coin, output_root=data_root)
+    return _read_latest_timestamp_ms_from_csv(csv_path)
+
+
+def _is_hour_covered_by_latest_timestamp(
+    latest_ms: int | None,
+    date: str,
+    hour: int | str,
+) -> bool:
+    if latest_ms is None:
+        return False
+    end_ms = _hour_end_timestamp_ms(date, hour)
+    tolerance_ms = CHUNK_HOUR_COVERAGE_TOLERANCE_SECONDS * 1000
+    return latest_ms >= end_ms - tolerance_ms
+
+
+def is_planned_chunk_fully_covered_by_historical_1s(
+    *,
+    coins: list[str],
+    date: str,
+    hours: list[str],
+    data_root: Path,
+) -> bool:
+    """True when every focused coin's latest timestamp covers every hour in the chunk."""
+    for coin in coins:
+        latest_ms = _get_coin_latest_timestamp_ms(coin, data_root)
+        for hour in hours:
+            if not _is_hour_covered_by_latest_timestamp(latest_ms, date, hour):
+                return False
+    return True
+
+
+def _mark_covered_chunk_completed_in_state(
+    state: SchedulerState,
+    date: str,
+    hours: list[str],
+    *,
+    reason: str = CHUNK_ALREADY_COVERED_REASON,
+) -> None:
+    if _chunk_completed_in_state(state, date, hours):
+        return
+    state.completed_batches.append(
+        {
+            "date": date,
+            "hours": list(hours),
+            "completed_at": _utc_now_iso(),
+            "report_path": None,
+            "skipped_as_already_covered": True,
+            "reason": reason,
+        }
+    )
+    _advance_date_if_complete(state)
+
+
+def _advance_past_covered_chunks(
+    state: SchedulerState,
+    *,
+    coins: list[str],
+    chunk_size_hours: int,
+    data_root: Path,
+    max_skips: int = MAX_COVERED_CHUNK_SKIPS,
+) -> dict[str, Any]:
+    """Skip planner chunks already covered by historical_1s; return selection metadata."""
+    original_date: str | None = None
+    original_hours: list[str] = []
+    skipped_chunks: list[dict[str, Any]] = []
+    skipped_hours: list[str] = []
+    state_changed = False
+
+    for _ in range(max_skips):
+        if state.next_historical_date and _all_hours_completed_for_date(
+            state, state.next_historical_date
+        ):
+            _advance_date_if_complete(state)
+            state_changed = True
+
+        next_chunk = find_next_incomplete_chunk(state, chunk_size_hours)
+        if next_chunk is None:
+            break
+
+        target_date, chunk_hours = next_chunk
+        if original_date is None:
+            original_date = target_date
+            original_hours = list(chunk_hours)
+
+        if not is_planned_chunk_fully_covered_by_historical_1s(
+            coins=coins,
+            date=target_date,
+            hours=chunk_hours,
+            data_root=data_root,
+        ):
+            return {
+                "selected_date": target_date,
+                "selected_hours": chunk_hours,
+                "original_planned_date": original_date,
+                "original_planned_hours": original_hours,
+                "skipped_covered_chunks": skipped_chunks,
+                "skipped_covered_hours": skipped_hours,
+                "selected_chunk_was_advanced": bool(skipped_chunks),
+                "reason": CHUNK_ALREADY_COVERED_REASON if skipped_chunks else None,
+                "no_uncovered_chunk_found": False,
+                "state_changed": state_changed,
+            }
+
+        skipped_chunks.append({"date": target_date, "hours": list(chunk_hours)})
+        skipped_hours.extend(chunk_hours)
+        _mark_covered_chunk_completed_in_state(state, target_date, chunk_hours)
+        state_changed = True
+
+    if state.next_historical_date and _all_hours_completed_for_date(
+        state, state.next_historical_date
+    ):
+        _advance_date_if_complete(state)
+        state_changed = True
+
+    remaining = find_next_incomplete_chunk(state, chunk_size_hours)
+    if remaining is not None and is_planned_chunk_fully_covered_by_historical_1s(
+        coins=coins,
+        date=remaining[0],
+        hours=remaining[1],
+        data_root=data_root,
+    ):
+        return {
+            "selected_date": None,
+            "selected_hours": [],
+            "original_planned_date": original_date,
+            "original_planned_hours": original_hours,
+            "skipped_covered_chunks": skipped_chunks,
+            "skipped_covered_hours": skipped_hours,
+            "selected_chunk_was_advanced": bool(skipped_chunks),
+            "reason": CHUNK_ALREADY_COVERED_REASON if skipped_chunks else None,
+            "no_uncovered_chunk_found": True,
+            "state_changed": state_changed,
+        }
+
+    if remaining is not None:
+        target_date, chunk_hours = remaining
+        if original_date is None:
+            original_date = target_date
+            original_hours = list(chunk_hours)
+        return {
+            "selected_date": target_date,
+            "selected_hours": chunk_hours,
+            "original_planned_date": original_date,
+            "original_planned_hours": original_hours,
+            "skipped_covered_chunks": skipped_chunks,
+            "skipped_covered_hours": skipped_hours,
+            "selected_chunk_was_advanced": bool(skipped_chunks),
+            "reason": CHUNK_ALREADY_COVERED_REASON if skipped_chunks else None,
+            "no_uncovered_chunk_found": False,
+            "state_changed": state_changed,
+        }
+
+    return {
+        "selected_date": None,
+        "selected_hours": [],
+        "original_planned_date": original_date,
+        "original_planned_hours": original_hours,
+        "skipped_covered_chunks": skipped_chunks,
+        "skipped_covered_hours": skipped_hours,
+        "selected_chunk_was_advanced": bool(skipped_chunks),
+        "reason": CHUNK_ALREADY_COVERED_REASON if skipped_chunks else None,
+        "no_uncovered_chunk_found": False,
+        "state_changed": state_changed,
+    }
+
+
+def _chunk_selection_report_fields(selection: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "original_planned_date": selection.get("original_planned_date"),
+        "original_planned_hours": selection.get("original_planned_hours"),
+        "selected_date": selection.get("selected_date"),
+        "selected_hours": selection.get("selected_hours"),
+        "skipped_covered_chunks": selection.get("skipped_covered_chunks") or [],
+        "skipped_covered_hours": selection.get("skipped_covered_hours") or [],
+        "selected_chunk_was_advanced": bool(selection.get("selected_chunk_was_advanced")),
+        "reason": selection.get("reason"),
+    }
 
 
 def _count_rows_in_timestamp_range(csv_path: Path, start_ms: int, end_ms: int) -> int:
@@ -3063,8 +3299,38 @@ def cmd_auto_backfill_next(
     if not resolved_requester_pays:
         report.warnings.append(REQUESTER_PAYS_DISABLED_WARNING)
 
-    next_chunk = find_next_incomplete_chunk(state, chunk_size_hours)
-    if next_chunk is None:
+    chunk_selection = _advance_past_covered_chunks(
+        state,
+        coins=normalized_coins,
+        chunk_size_hours=chunk_size_hours,
+        data_root=data_root,
+        max_skips=MAX_COVERED_CHUNK_SKIPS,
+    )
+    report.details["chunk_selection"] = _chunk_selection_report_fields(chunk_selection)
+    if chunk_selection.get("state_changed"):
+        save_state(state, state_path)
+        state = load_state(state_path)
+
+    if chunk_selection.get("no_uncovered_chunk_found"):
+        report.warnings.append(NO_UNCOVERED_CHUNK_FOUND_MESSAGE)
+        report.details["no_uncovered_chunk_found"] = True
+        report.next_recommended_action = NO_UNCOVERED_CHUNK_NEXT_ACTION
+        auto_json_path, auto_md_path = write_scheduler_report(
+            report, runs_dir=runs_dir, label="auto_backfill_no_uncovered"
+        )
+        state.next_recommended_action = report.next_recommended_action
+        state.last_report_path = str(auto_json_path)
+        state.last_run_at = _utc_now_iso()
+        save_state(state, state_path)
+        report.details["scheduler_report_paths"] = {
+            "json": str(auto_json_path),
+            "markdown": str(auto_md_path),
+        }
+        return report
+
+    selected_date = chunk_selection.get("selected_date")
+    selected_hours = chunk_selection.get("selected_hours") or []
+    if not selected_date:
         report.warnings.append(AUTO_BACKFILL_COMPLETE_MESSAGE)
         report.next_recommended_action = "python3 bid_ask_research_scheduler.py status"
         json_path, md_path = write_scheduler_report(
@@ -3077,7 +3343,8 @@ def cmd_auto_backfill_next(
         report.details["scheduler_report_paths"] = {"json": str(json_path), "markdown": str(md_path)}
         return report
 
-    target_date, chunk_hours = next_chunk
+    target_date = selected_date
+    chunk_hours = selected_hours
     report.historical_date = target_date
     report.historical_hours = chunk_hours
 
@@ -3600,6 +3867,16 @@ def cmd_autopilot_tick(
     report.download_error_type = backfill_report.download_error_type
     report.files_failed = backfill_report.files_failed
     report.details["auto_backfill"] = backfill_report.to_dict()
+    chunk_selection = (backfill_report.details or {}).get("chunk_selection")
+    if isinstance(chunk_selection, dict):
+        report.details.update(_chunk_selection_report_fields(chunk_selection))
+
+    if (backfill_report.details or {}).get("no_uncovered_chunk_found"):
+        report.action = "no_uncovered_chunk_found"
+        report.warnings.append(NO_UNCOVERED_CHUNK_FOUND_MESSAGE)
+        report.next_recommended_action = NO_UNCOVERED_CHUNK_NEXT_ACTION
+        state.autopilot = autopilot
+        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
     stored_progress = (backfill_report.details or {}).get("import_progress")
     batch_payload = _orchestrator_batch_from_scheduler_report(backfill_report)
