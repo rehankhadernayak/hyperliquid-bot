@@ -2316,6 +2316,8 @@ def _mark_hours_completed(
 TS_20230917_235958Z = 1694995198235
 # 2023-09-17T20:59:58Z — covers hours 0-20 but not 21-23
 TS_20230917_205958Z = 1694984398000
+# 2023-09-17T22:30:00Z — covers hour 21 but not 22-23
+TS_20230917_223000Z = 1694989800000
 
 
 class TestCoveredChunkAdvancement:
@@ -2547,6 +2549,112 @@ class TestCoveredChunkAdvancement:
         assert report.action == "no_uncovered_chunk_found"
         assert scheduler.NO_UNCOVERED_CHUNK_NEXT_ACTION in report.next_recommended_action
         assert report.details["skipped_covered_chunks"]
+
+    def test_autopilot_tick_cli_path_advances_covered_chunk(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(
+            tmp_path,
+            start="20230917",
+            end="20230930",
+            start_hour=0,
+            end_hour=23,
+        )
+        _enable_autopilot(state_path)
+        _mark_hours_completed(state_path, "20230917", list(range(0, 21)))
+        data_root = tmp_path / "data"
+        for coin in ["BTC", "ETH"]:
+            _write_historical_csv_at_timestamp(
+                data_root,
+                coin,
+                timestamp_ms=TS_20230917_235958Z,
+            )
+        captured = _mock_auto_daily_cycle(monkeypatch, advance_csv=True)
+
+        exit_code = scheduler.main(
+            [
+                "autopilot-tick",
+                "--coins",
+                "BTC",
+                "ETH",
+                "--chunk-size-hours",
+                "3",
+                "--state-path",
+                str(state_path),
+                "--data-root",
+                str(data_root),
+                "--runs-dir",
+                str(tmp_path / "runs"),
+                "--daily-summary-dir",
+                str(tmp_path / "daily"),
+            ]
+        )
+
+        assert exit_code == 0
+        assert captured
+        assert captured[0]["date"] == "20230918"
+        assert captured[0]["historical_hours"] == [0, 1, 2]
+        report_path = scheduler.load_state(state_path).autopilot.last_autopilot_report_path
+        assert report_path
+        report_payload = json.loads(Path(report_path).read_text(encoding="utf-8"))
+        assert report_payload["details"]["selected_chunk_was_advanced"] is True
+        assert report_payload["details"]["selected_date"] == "20230918"
+        assert report_payload["details"]["selected_hours"] == ["0", "1", "2"]
+        assert report_payload["details"]["coverage_check_enabled"] is True
+        assert report_payload["details"]["coverage_source"] == "historical"
+
+    def test_autopilot_tick_does_not_advance_when_eth_lags(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(
+            tmp_path,
+            start="20230917",
+            end="20230930",
+            start_hour=0,
+            end_hour=23,
+        )
+        _enable_autopilot(state_path)
+        _mark_hours_completed(state_path, "20230917", list(range(0, 21)))
+        data_root = tmp_path / "data"
+        _write_historical_csv_at_timestamp(
+            data_root,
+            "BTC",
+            timestamp_ms=TS_20230917_235958Z,
+        )
+        _write_historical_csv_at_timestamp(
+            data_root,
+            "ETH",
+            timestamp_ms=TS_20230917_223000Z,
+        )
+        captured = _mock_auto_daily_cycle(monkeypatch)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            coins=["BTC", "ETH"],
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            data_root=data_root,
+            today_override="20230917",
+        )
+
+        assert captured
+        assert captured[0]["date"] == "20230917"
+        assert captured[0]["historical_hours"] == [21, 22, 23]
+        assert report.details["selected_chunk_was_advanced"] is False
+        assert report.details["selected_date"] == "20230917"
+        assert report.details["selected_hours"] == ["21", "22", "23"]
+        assert report.details["skipped_covered_chunks"] == []
+        eth_hour_results = [
+            entry
+            for entry in report.details["coverage_hour_results"]
+            if entry["coin"] == "ETH"
+        ]
+        assert any(entry["hour"] == "22" and entry["covered"] is False for entry in eth_hour_results)
+        assert any(entry["hour"] == "23" and entry["covered"] is False for entry in eth_hour_results)
 
 
 class TestPhaseBackfillEstimate:
