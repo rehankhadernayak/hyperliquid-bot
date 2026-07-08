@@ -1098,6 +1098,201 @@ def _parse_timestamp_iso(value: object) -> datetime | None:
         return None
 
 
+REGIME_OVERFIT_WARNING = (
+    "Regime filters are exploratory post-signal filters and may overfit. "
+    "They are hypotheses, not proof."
+)
+
+
+def parse_hours_list(raw: str | None) -> list[int] | None:
+    """Parse comma-separated UTC hour integers like '3,5' for regime filters."""
+    if raw is None:
+        return None
+    text = str(raw).strip()
+    if not text:
+        return None
+    hours: list[int] = []
+    for part in text.split(","):
+        token = part.strip()
+        if not token:
+            continue
+        hour = int(token)
+        if hour < 0 or hour > 23:
+            raise ValueError(f"Invalid UTC hour: {hour}")
+        hours.append(hour)
+    return hours or None
+
+
+def _trade_record_utc_hour(record: dict[str, Any]) -> int | None:
+    """Return UTC hour for an accepted trade record."""
+    parsed = _parse_timestamp_iso(record.get("timestamp_iso"))
+    if parsed is not None:
+        return parsed.hour
+
+    timestamp_ms = record.get("timestamp_ms")
+    if timestamp_ms is None or timestamp_ms == "":
+        return None
+    try:
+        ms = int(float(timestamp_ms))
+        return datetime.fromtimestamp(ms / 1000.0, tz=timezone.utc).hour
+    except (TypeError, ValueError, OSError):
+        return None
+
+
+def regime_filters_enabled(
+    *,
+    exclude_hours: list[int] | None = None,
+    include_hours: list[int] | None = None,
+    max_cost_bps: float | None = None,
+    min_cost_bps: float | None = None,
+) -> bool:
+    """Return True when any exploratory post-signal regime filter is active."""
+    return bool(
+        exclude_hours
+        or include_hours
+        or max_cost_bps is not None
+        or min_cost_bps is not None
+    )
+
+
+def filter_accepted_trades_by_regime(
+    accepted_trade_records: list[dict[str, Any]],
+    *,
+    exclude_hours: list[int] | None = None,
+    include_hours: list[int] | None = None,
+    max_cost_bps: float | None = None,
+    min_cost_bps: float | None = None,
+) -> list[dict[str, Any]]:
+    """Apply exploratory post-signal regime filters to accepted paper trades."""
+    filtered = list(accepted_trade_records)
+
+    if include_hours:
+        include_set = set(include_hours)
+        filtered = [
+            record
+            for record in filtered
+            if (hour := _trade_record_utc_hour(record)) is not None
+            and hour in include_set
+        ]
+
+    if exclude_hours:
+        exclude_set = set(exclude_hours)
+        filtered = [
+            record
+            for record in filtered
+            if (hour := _trade_record_utc_hour(record)) is not None
+            and hour not in exclude_set
+        ]
+
+    if max_cost_bps is not None:
+        filtered = [
+            record
+            for record in filtered
+            if float(record.get("cost_bps", 0.0)) <= max_cost_bps
+        ]
+
+    if min_cost_bps is not None:
+        filtered = [
+            record
+            for record in filtered
+            if float(record.get("cost_bps", 0.0)) >= min_cost_bps
+        ]
+
+    return filtered
+
+
+def apply_regime_filter_metrics(
+    report: dict[str, Any],
+    *,
+    exclude_hours: list[int] | None = None,
+    include_hours: list[int] | None = None,
+    max_cost_bps: float | None = None,
+    min_cost_bps: float | None = None,
+) -> dict[str, Any]:
+    """Attach before/after regime filter metrics and update accepted trade payloads."""
+    active = regime_filters_enabled(
+        exclude_hours=exclude_hours,
+        include_hours=include_hours,
+        max_cost_bps=max_cost_bps,
+        min_cost_bps=min_cost_bps,
+    )
+
+    before_records = list(report.get("accepted_trade_records", []))
+    before_returns = [float(record["net_return_bps"]) for record in before_records]
+    before_metrics = aggregate_accepted_trade_metrics(before_returns)
+
+    after_records = (
+        filter_accepted_trades_by_regime(
+            before_records,
+            exclude_hours=exclude_hours,
+            include_hours=include_hours,
+            max_cost_bps=max_cost_bps,
+            min_cost_bps=min_cost_bps,
+        )
+        if active
+        else before_records
+    )
+    after_returns = [float(record["net_return_bps"]) for record in after_records]
+    after_metrics = aggregate_accepted_trade_metrics(after_returns)
+
+    report["regime_filters_enabled"] = active
+    report["exploratory_overfit_warning"] = active
+    report["exclude_hours"] = list(exclude_hours) if exclude_hours else None
+    report["include_hours"] = list(include_hours) if include_hours else None
+    report["max_cost_bps"] = max_cost_bps
+    report["min_cost_bps"] = min_cost_bps
+    report["trades_before_regime_filters"] = before_metrics["filtered_paper_trades"]
+    report["trades_after_regime_filters"] = after_metrics["filtered_paper_trades"]
+    report["trades_removed_by_regime_filters"] = (
+        report["trades_before_regime_filters"] - report["trades_after_regime_filters"]
+    )
+    report["cumulative_net_return_before_regime_filters"] = before_metrics[
+        "cumulative_net_return_bps"
+    ]
+    report["cumulative_net_return_after_regime_filters"] = after_metrics[
+        "cumulative_net_return_bps"
+    ]
+    report["average_net_return_before_regime_filters"] = before_metrics["average_net_return_bps"]
+    report["average_net_return_after_regime_filters"] = after_metrics["average_net_return_bps"]
+    report["win_rate_before_regime_filters"] = before_metrics["win_rate_after_costs"]
+    report["win_rate_after_regime_filters"] = after_metrics["win_rate_after_costs"]
+
+    if active:
+        report["accepted_trade_records"] = after_records
+        report["accepted_trade_net_returns_bps"] = after_returns
+        report["class_trade_diagnostics"] = aggregate_class_trade_diagnostics(after_records)
+        report["coin_class_trade_diagnostics"] = aggregate_coin_class_trade_diagnostics(
+            after_records,
+            coins=list(report.get("coins", [])),
+        )
+        if report.get("stability_report_enabled"):
+            stability_min_trades_per_bucket = int(
+                report.get(
+                    "stability_min_trades_per_bucket",
+                    DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
+                )
+            )
+            stability_diagnostics = compute_stability_diagnostics(
+                after_records,
+                coins=list(report.get("coins", [])),
+            )
+            stability_summary = compute_stability_summary(
+                stability_diagnostics,
+                min_trades_per_bucket=stability_min_trades_per_bucket,
+            )
+            report["stability_diagnostics"] = stability_diagnostics
+            report["stability_summary"] = stability_summary
+            report["stability_warnings"] = build_stability_warnings(
+                stability_summary,
+                min_trades_per_bucket=stability_min_trades_per_bucket,
+            )
+            readiness = report.get("readiness") or {}
+            report["readiness"] = apply_stability_readiness(readiness, stability_summary)
+            report.update(report["readiness"])
+
+    return report
+
+
 def _stability_group_records(
     accepted_trade_records: list[dict[str, Any]],
     *,
@@ -1329,6 +1524,44 @@ def _format_stability_bucket_lines(
     return lines
 
 
+def _format_regime_filter_section(report: dict[str, Any]) -> list[str]:
+    """Format exploratory regime filter metrics for Markdown reports."""
+    lines = [
+        "## Regime Filters",
+        "",
+        f"- regime_filters_enabled: {str(report.get('regime_filters_enabled', False)).lower()}",
+        f"- exploratory_overfit_warning: {str(report.get('exploratory_overfit_warning', False)).lower()}",
+        f"- exclude_hours: {report.get('exclude_hours') or 'none'}",
+        f"- include_hours: {report.get('include_hours') or 'none'}",
+        f"- max_cost_bps: {report.get('max_cost_bps') if report.get('max_cost_bps') is not None else 'none'}",
+        f"- min_cost_bps: {report.get('min_cost_bps') if report.get('min_cost_bps') is not None else 'none'}",
+        f"- trades_before_regime_filters: {report.get('trades_before_regime_filters', 0)}",
+        f"- trades_after_regime_filters: {report.get('trades_after_regime_filters', 0)}",
+        f"- trades_removed_by_regime_filters: {report.get('trades_removed_by_regime_filters', 0)}",
+        f"- cumulative_net_return_before_regime_filters: "
+        f"{report.get('cumulative_net_return_before_regime_filters', 0.0):.4f}",
+        f"- cumulative_net_return_after_regime_filters: "
+        f"{report.get('cumulative_net_return_after_regime_filters', 0.0):.4f}",
+        f"- average_net_return_before_regime_filters: "
+        f"{report.get('average_net_return_before_regime_filters', 0.0):.4f}",
+        f"- average_net_return_after_regime_filters: "
+        f"{report.get('average_net_return_after_regime_filters', 0.0):.4f}",
+        f"- win_rate_before_regime_filters: "
+        f"{report.get('win_rate_before_regime_filters', 0.0):.4f}",
+        f"- win_rate_after_regime_filters: "
+        f"{report.get('win_rate_after_regime_filters', 0.0):.4f}",
+        "",
+    ]
+    if report.get("regime_filters_enabled"):
+        lines.extend(
+            [
+                REGIME_OVERFIT_WARNING,
+                "",
+            ]
+        )
+    return lines
+
+
 def simulate_paper_signal_returns(
     test_df: pd.DataFrame,
     predictions: list[str],
@@ -1422,6 +1655,15 @@ def simulate_paper_signal_returns(
                     str(row["timestamp_iso"])
                     if "timestamp_iso" in row.index and pd.notna(row["timestamp_iso"])
                     else ""
+                ),
+                "timestamp_ms": (
+                    int(row["start_timestamp_ms"])
+                    if "start_timestamp_ms" in row.index and pd.notna(row["start_timestamp_ms"])
+                    else (
+                        int(row["end_timestamp_ms"])
+                        if "end_timestamp_ms" in row.index and pd.notna(row["end_timestamp_ms"])
+                        else None
+                    )
                 ),
                 "predicted_class": predicted_class,
                 "actual_label": actual_label,
@@ -1719,12 +1961,7 @@ def finalize_accepted_trades_csv(
     accepted_trades_limit: int = DEFAULT_ACCEPTED_TRADES_LIMIT,
 ) -> None:
     """Persist accepted filtered paper trades CSV and report metadata."""
-    filtered_paper_trades = int(report.get("filtered_paper_trades", 0))
-    if (
-        save_accepted_trades
-        and filtered_paper_trades > 0
-        and accepted_trade_records
-    ):
+    if save_accepted_trades and accepted_trade_records:
         write_accepted_trades_csv(
             accepted_trade_records,
             reports_dir=reports_dir,
@@ -2620,6 +2857,13 @@ def write_walk_forward_markdown(
             f"- win_rate_after_costs: {report.get('win_rate_after_costs', 0.0):.4f}",
             f"- longest_losing_streak: {report.get('longest_losing_streak', 0)}",
             "",
+        ]
+    )
+
+    lines.extend(_format_regime_filter_section(report))
+
+    lines.extend(
+        [
             "## Readiness",
             "",
             f"- beats_baseline_accuracy: {beats_baseline}",
@@ -2840,6 +3084,10 @@ def run_walk_forward_evaluation(
     accepted_trades_limit: int = DEFAULT_ACCEPTED_TRADES_LIMIT,
     stability_report_enabled: bool = False,
     stability_min_trades_per_bucket: int = DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
+    exclude_hours: list[int] | None = None,
+    include_hours: list[int] | None = None,
+    max_cost_bps: float | None = None,
+    min_cost_bps: float | None = None,
 ) -> dict[str, Any]:
     """Run walk-forward evaluation for one or more coins and write reports."""
     trade_filter = build_trade_filter(
@@ -2929,6 +3177,14 @@ def run_walk_forward_evaluation(
         feature_warning=aggregate_feature_warning,
         stability_report_enabled=stability_report_enabled,
         stability_min_trades_per_bucket=stability_min_trades_per_bucket,
+    )
+
+    report = apply_regime_filter_metrics(
+        report,
+        exclude_hours=exclude_hours,
+        include_hours=include_hours,
+        max_cost_bps=max_cost_bps,
+        min_cost_bps=min_cost_bps,
     )
 
     all_accepted_trade_records = list(report.get("accepted_trade_records", []))
@@ -3188,6 +3444,28 @@ def _build_arg_parser() -> argparse.ArgumentParser:
             f"(default: {DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET})"
         ),
     )
+    parser.add_argument(
+        "--exclude-hours",
+        default=None,
+        help="Optional comma-separated UTC hours to exclude after signal gates, e.g. 3,5",
+    )
+    parser.add_argument(
+        "--include-hours",
+        default=None,
+        help="Optional comma-separated UTC hours to keep after signal gates",
+    )
+    parser.add_argument(
+        "--max-cost-bps",
+        type=float,
+        default=None,
+        help="Optional maximum cost_bps for accepted trades after signal gates",
+    )
+    parser.add_argument(
+        "--min-cost-bps",
+        type=float,
+        default=None,
+        help="Optional minimum cost_bps for accepted trades after signal gates",
+    )
     return parser
 
 
@@ -3232,6 +3510,10 @@ def main(argv: list[str] | None = None) -> int:
         accepted_trades_limit=args.accepted_trades_limit,
         stability_report_enabled=args.stability_report,
         stability_min_trades_per_bucket=args.stability_min_trades_per_bucket,
+        exclude_hours=parse_hours_list(args.exclude_hours),
+        include_hours=parse_hours_list(args.include_hours),
+        max_cost_bps=args.max_cost_bps,
+        min_cost_bps=args.min_cost_bps,
     )
 
     readiness = report["readiness"]

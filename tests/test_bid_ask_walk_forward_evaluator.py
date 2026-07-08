@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+from datetime import datetime
 from pathlib import Path
 
 import pandas as pd
@@ -25,6 +26,7 @@ from bid_ask_walk_forward_evaluator import (
     DEFAULT_REPORTS_DIR,
     DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
     MICROSTRUCTURE_EXTRA_COLUMNS,
+    REGIME_OVERFIT_WARNING,
     SAFETY_NOTE,
     TradeFilterConfig,
     _build_arg_parser,
@@ -33,6 +35,7 @@ from bid_ask_walk_forward_evaluator import (
     aggregate_coin_class_trade_diagnostics,
     aggregate_stability_bucket_metrics,
     apply_diagnostics_detail,
+    apply_regime_filter_metrics,
     apply_stability_readiness,
     build_feature_metadata,
     build_stability_warnings,
@@ -48,6 +51,7 @@ from bid_ask_walk_forward_evaluator import (
     create_walk_forward_labels,
     evaluate_coin_walk_forward,
     evaluate_trade_filter,
+    filter_accepted_trades_by_regime,
     finalize_accepted_trades_csv,
     generate_walk_forward_windows,
     get_walk_forward_feature_columns,
@@ -55,8 +59,10 @@ from bid_ask_walk_forward_evaluator import (
     main,
     max_drawdown_bps,
     parse_feature_set,
+    parse_hours_list,
     parse_label_mode,
     parse_trade_classes,
+    regime_filters_enabled,
     resolve_coins,
     run_walk_forward_evaluation,
     simulate_paper_signal_returns,
@@ -64,6 +70,7 @@ from bid_ask_walk_forward_evaluator import (
     walk_forward_feature_matrix,
     write_walk_forward_json,
     write_walk_forward_markdown,
+    _trade_record_utc_hour,
 )
 
 EVALUATOR_FILE = Path(__file__).resolve().parent.parent / "bid_ask_walk_forward_evaluator.py"
@@ -2073,6 +2080,7 @@ def _synthetic_accepted_trade(
     cost_bps: float = 2.0,
     confidence: float = 0.9,
     timestamp_iso: str = "2024-06-10T06:00:00Z",
+    timestamp_ms: int | None = None,
     window_index: int | None = 0,
 ) -> dict:
     return {
@@ -2080,6 +2088,7 @@ def _synthetic_accepted_trade(
         "window_index": window_index,
         "row_index": 0,
         "timestamp_iso": timestamp_iso,
+        "timestamp_ms": timestamp_ms,
         "predicted_class": predicted_class,
         "actual_label": predicted_class,
         "confidence": confidence,
@@ -2089,6 +2098,288 @@ def _synthetic_accepted_trade(
         "net_return_bps": net_return_bps,
         "spread_bps": 2.0,
     }
+
+
+class TestRegimeFilters:
+    def test_no_regime_filters_preserves_existing_behavior(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["regime_filters_enabled"] is False
+        assert report["exploratory_overfit_warning"] is False
+        assert report["trades_before_regime_filters"] == report["filtered_paper_trades"]
+        assert report["trades_after_regime_filters"] == report["filtered_paper_trades"]
+        assert report["trades_removed_by_regime_filters"] == 0
+        assert report["cumulative_net_return_before_regime_filters"] == pytest.approx(
+            report["cumulative_net_return_bps"]
+        )
+        assert report["cumulative_net_return_after_regime_filters"] == pytest.approx(
+            report["cumulative_net_return_bps"]
+        )
+
+    def test_exclude_hours_removes_expected_trades(self) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z", net_return_bps=5.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z", net_return_bps=4.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T07:00:00Z", net_return_bps=3.0),
+        ]
+        filtered = filter_accepted_trades_by_regime(records, exclude_hours=[5])
+
+        assert len(filtered) == 2
+        assert all(_trade_record_utc_hour(record) != 5 for record in filtered)
+
+    def test_include_hours_keeps_expected_trades(self) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z", net_return_bps=5.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z", net_return_bps=4.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T07:00:00Z", net_return_bps=3.0),
+        ]
+        filtered = filter_accepted_trades_by_regime(records, include_hours=[6, 7])
+
+        assert len(filtered) == 2
+        assert {_trade_record_utc_hour(record) for record in filtered} == {6, 7}
+
+    def test_include_then_exclude_order_works(self) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z", net_return_bps=5.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z", net_return_bps=4.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T07:00:00Z", net_return_bps=3.0),
+        ]
+        filtered = filter_accepted_trades_by_regime(
+            records,
+            include_hours=[5, 6, 7],
+            exclude_hours=[5],
+        )
+
+        assert len(filtered) == 2
+        assert {_trade_record_utc_hour(record) for record in filtered} == {6, 7}
+
+    def test_max_cost_bps_removes_high_cost_trades(self) -> None:
+        records = [
+            _synthetic_accepted_trade(cost_bps=3.0, net_return_bps=5.0),
+            _synthetic_accepted_trade(cost_bps=7.0, net_return_bps=4.0),
+            _synthetic_accepted_trade(cost_bps=5.0, net_return_bps=3.0),
+        ]
+        filtered = filter_accepted_trades_by_regime(records, max_cost_bps=5.0)
+
+        assert len(filtered) == 2
+        assert all(float(record["cost_bps"]) <= 5.0 for record in filtered)
+
+    def test_min_cost_bps_removes_low_cost_trades(self) -> None:
+        records = [
+            _synthetic_accepted_trade(cost_bps=3.0, net_return_bps=5.0),
+            _synthetic_accepted_trade(cost_bps=7.0, net_return_bps=4.0),
+            _synthetic_accepted_trade(cost_bps=5.0, net_return_bps=3.0),
+        ]
+        filtered = filter_accepted_trades_by_regime(records, min_cost_bps=5.0)
+
+        assert len(filtered) == 2
+        assert all(float(record["cost_bps"]) >= 5.0 for record in filtered)
+
+    def test_missing_timestamp_iso_falls_back_to_timestamp_ms(self) -> None:
+        ms_at_hour_5 = int(datetime.fromisoformat("2024-06-10T05:30:00+00:00").timestamp() * 1000)
+        record = _synthetic_accepted_trade(
+            timestamp_iso="",
+            timestamp_ms=ms_at_hour_5,
+            net_return_bps=2.0,
+        )
+        assert _trade_record_utc_hour(record) == 5
+
+        filtered = filter_accepted_trades_by_regime([record], exclude_hours=[5])
+        assert filtered == []
+
+    def test_accepted_trades_csv_contains_post_filter_trades(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        rows = _make_resampled_rows(count=80, mid_step=2.0)
+        for index, row in enumerate(rows):
+            row["timestamp_iso"] = f"2024-06-10T{index % 24:02d}:00:{index % 60:02d}Z"
+        _write_resampled_csv(path, rows)
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+            exclude_hours=[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23],
+        )
+
+        assert report["trades_after_regime_filters"] == 0
+        assert report["accepted_trades_csv_path"] is None
+        assert report["accepted_trades_count"] == 0
+
+        report_keep = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+            include_hours=[6],
+        )
+        if report_keep["trades_after_regime_filters"] > 0:
+            csv_path = Path(report_keep["accepted_trades_csv_path"])
+            saved = pd.read_csv(csv_path)
+            assert len(saved) == report_keep["trades_after_regime_filters"]
+            assert len(saved) <= report_keep["trades_before_regime_filters"]
+
+    def test_json_includes_before_after_metrics(
+        self, data_root: Path, reports_dir: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=True,
+            min_windows=1,
+            min_trades=1,
+            exclude_hours=[5],
+        )
+        loaded = json.loads(Path(report["json_report_path"]).read_text(encoding="utf-8"))
+
+        for field in (
+            "regime_filters_enabled",
+            "exploratory_overfit_warning",
+            "exclude_hours",
+            "include_hours",
+            "max_cost_bps",
+            "min_cost_bps",
+            "trades_before_regime_filters",
+            "trades_after_regime_filters",
+            "trades_removed_by_regime_filters",
+            "cumulative_net_return_before_regime_filters",
+            "cumulative_net_return_after_regime_filters",
+            "average_net_return_before_regime_filters",
+            "average_net_return_after_regime_filters",
+            "win_rate_before_regime_filters",
+            "win_rate_after_regime_filters",
+        ):
+            assert field in loaded
+
+    def test_overfit_warning_true_when_any_regime_filter_active(self) -> None:
+        report = apply_regime_filter_metrics(
+            {
+                "coins": ["BTC"],
+                "accepted_trade_records": [
+                    _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z"),
+                    _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z"),
+                ],
+            },
+            exclude_hours=[5],
+        )
+        assert report["regime_filters_enabled"] is True
+        assert report["exploratory_overfit_warning"] is True
+
+    def test_no_overfit_warning_when_inactive(self) -> None:
+        report = apply_regime_filter_metrics(
+            {
+                "coins": ["BTC"],
+                "accepted_trade_records": [
+                    _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z"),
+                ],
+            },
+        )
+        assert report["regime_filters_enabled"] is False
+        assert report["exploratory_overfit_warning"] is False
+
+    def test_markdown_includes_overfit_warning(self, reports_dir: Path) -> None:
+        report = apply_regime_filter_metrics(
+            {
+                "generated_at": "2024-06-10T00:00:00+00:00",
+                "coins": ["BTC"],
+                "accepted_trade_records": [
+                    _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z"),
+                    _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z"),
+                ],
+            },
+            exclude_hours=[5],
+        )
+        md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "## Regime Filters" in md_text
+        assert REGIME_OVERFIT_WARNING in md_text
+
+    def test_cli_parses_regime_filter_options(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--exclude-hours",
+                "3,5",
+                "--include-hours",
+                "6,7",
+                "--max-cost-bps",
+                "6.0",
+                "--min-cost-bps",
+                "2.0",
+            ]
+        )
+        assert args.exclude_hours == "3,5"
+        assert args.include_hours == "6,7"
+        assert args.max_cost_bps == 6.0
+        assert args.min_cost_bps == 2.0
+
+    def test_parse_hours_list(self) -> None:
+        assert parse_hours_list("3,5") == [3, 5]
+        assert parse_hours_list("") is None
+        assert parse_hours_list(None) is None
+        with pytest.raises(ValueError):
+            parse_hours_list("25")
+
+    def test_regime_filters_enabled(self) -> None:
+        assert regime_filters_enabled(exclude_hours=[5]) is True
+        assert regime_filters_enabled(max_cost_bps=5.0) is True
+        assert regime_filters_enabled(min_cost_bps=2.0) is True
+        assert regime_filters_enabled() is False
 
 
 class TestStabilityValidation:
