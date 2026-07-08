@@ -4328,6 +4328,7 @@ def _build_research_session_tick_summary(
         "candidate_cumulative_net_return_bps": None,
         "relaxed_trades": None,
         "relaxed_cumulative_net_return_bps": None,
+        "relaxed_accepted_trades_csv_path": None,
         "resample_validate_ran": resample_ran,
         "warnings": list(warnings or []),
         "failures": list(failures or []),
@@ -4342,6 +4343,9 @@ def _build_research_session_tick_summary(
         summary["relaxed_cumulative_net_return_bps"] = float(
             relaxed_report.get("cumulative_net_return_bps") or 0.0
         )
+        accepted_trades_csv = relaxed_report.get("accepted_trades_csv_path")
+        if accepted_trades_csv:
+            summary["relaxed_accepted_trades_csv_path"] = str(accepted_trades_csv)
     return summary
 
 
@@ -4384,6 +4388,7 @@ def format_research_session_markdown(session: dict[str, Any]) -> str:
                 f"- candidate_cumulative_net_return_bps: {tick.get('candidate_cumulative_net_return_bps')}",
                 f"- relaxed_trades: {tick.get('relaxed_trades')}",
                 f"- relaxed_cumulative_net_return_bps: {tick.get('relaxed_cumulative_net_return_bps')}",
+                f"- relaxed_accepted_trades_csv_path: {tick.get('relaxed_accepted_trades_csv_path')}",
                 "",
             ]
         )
@@ -4427,23 +4432,25 @@ def _run_relaxed_candidate_b_validation(
     validation_reports_dir: Path,
     walk_forward_runner: Any | None = None,
 ) -> dict[str, Any]:
-    return candidate_validator.run_candidate_validation(
-        coin="BTC",
-        interval="15s",
-        horizon=RELAXED_CANDIDATE_B_HORIZON,
-        min_confidence=RELAXED_CANDIDATE_B_MIN_CONFIDENCE,
-        min_edge_bps=RELAXED_CANDIDATE_B_MIN_EDGE_BPS,
-        cost_multiplier=RELAXED_CANDIDATE_B_COST_MULTIPLIER,
-        max_spread_bps=RELAXED_CANDIDATE_B_MAX_SPREAD_BPS,
-        min_trades_required=candidate_validator.DEFAULT_MIN_TRADES_REQUIRED,
-        require_positive=False,
-        candidate_name=RELAXED_CANDIDATE_B_NAME,
-        source=source,
-        data_root=data_root,
-        walk_forward_reports_dir=walk_forward_reports_dir,
-        validation_reports_dir=validation_reports_dir,
-        walk_forward_runner=walk_forward_runner,
-    )
+    validation_kwargs: dict[str, Any] = {
+        "coin": "BTC",
+        "interval": "15s",
+        "horizon": RELAXED_CANDIDATE_B_HORIZON,
+        "min_confidence": RELAXED_CANDIDATE_B_MIN_CONFIDENCE,
+        "min_edge_bps": RELAXED_CANDIDATE_B_MIN_EDGE_BPS,
+        "cost_multiplier": RELAXED_CANDIDATE_B_COST_MULTIPLIER,
+        "max_spread_bps": RELAXED_CANDIDATE_B_MAX_SPREAD_BPS,
+        "min_trades_required": candidate_validator.DEFAULT_MIN_TRADES_REQUIRED,
+        "require_positive": False,
+        "candidate_name": RELAXED_CANDIDATE_B_NAME,
+        "source": source,
+        "data_root": data_root,
+        "walk_forward_reports_dir": walk_forward_reports_dir,
+        "validation_reports_dir": validation_reports_dir,
+    }
+    if walk_forward_runner is not None:
+        validation_kwargs["walk_forward_runner"] = walk_forward_runner
+    return candidate_validator.run_candidate_validation(**validation_kwargs)
 
 
 def _execute_research_session_tick(
@@ -4761,6 +4768,29 @@ def _split_caffeinate_flags(flags: str) -> list[str]:
     return result
 
 
+def _append_research_session_bool_flags(
+    args: list[str],
+    *,
+    requester_pays: bool = True,
+    run_candidate_tests: bool = True,
+    run_relaxed_candidate_test: bool = True,
+    update_dashboard_artifacts: bool = True,
+) -> None:
+    """Append research-session boolean CLI flags using each option's valid syntax."""
+    if requester_pays:
+        args.append("--requester-pays")
+    else:
+        args.append("--no-requester-pays")
+
+    # These options use _parse_bool_arg and default to True; omit when enabled.
+    if not run_candidate_tests:
+        args.extend(["--run-candidate-tests", "false"])
+    if not run_relaxed_candidate_test:
+        args.extend(["--run-relaxed-candidate-test", "false"])
+    if not update_dashboard_artifacts:
+        args.extend(["--update-dashboard-artifacts", "false"])
+
+
 def _build_research_session_program_arguments(
     *,
     resolved_python: str,
@@ -4778,15 +4808,8 @@ def _build_research_session_program_arguments(
         str(duration_hours),
         "--tick-interval-minutes",
         str(tick_interval_minutes),
-        "--requester-pays",
-        "true",
-        "--run-candidate-tests",
-        "true",
-        "--run-relaxed-candidate-test",
-        "true",
-        "--update-dashboard-artifacts",
-        "true",
     ]
+    _append_research_session_bool_flags(session_args)
     if use_caffeinate:
         return [DEFAULT_CAFFEINATE_PATH, *_split_caffeinate_flags(caffeinate_flags), *session_args]
     return session_args

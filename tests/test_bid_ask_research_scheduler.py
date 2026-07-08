@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import ast
 import json
+import xml.etree.ElementTree as ET
 from pathlib import Path
 
 import pytest
@@ -13,6 +14,23 @@ import bid_ask_research_orchestrator as orchestrator
 from bid_ask_schema import FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS
 
 SCHEDULER_FILE = Path(__file__).resolve().parent.parent / "bid_ask_research_scheduler.py"
+
+
+def _extract_plist_program_arguments(plist_path: Path) -> list[str]:
+    root = ET.parse(plist_path).getroot()
+    dict_elem = root.find("dict")
+    assert dict_elem is not None, f"dict root missing in {plist_path}"
+    children = list(dict_elem)
+    for index, child in enumerate(children):
+        if child.tag == "key" and child.text == "ProgramArguments":
+            array_elem = children[index + 1]
+            assert array_elem.tag == "array", f"ProgramArguments array missing in {plist_path}"
+            return [
+                string_elem.text
+                for string_elem in array_elem.findall("string")
+                if string_elem.text is not None
+            ]
+    raise AssertionError(f"ProgramArguments missing in {plist_path}")
 
 
 def _init_state(
@@ -4051,6 +4069,169 @@ class TestResearchSession:
         assert audit_json.is_file()
         assert audit_md.is_file()
 
+    def test_run_relaxed_candidate_b_validation_uses_known_config_and_default_runner(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        captured: dict[str, object] = {}
+
+        def fake_run_candidate_validation(**kwargs: object) -> dict[str, object]:
+            captured.update(kwargs)
+            return {
+                "filtered_paper_trades": 25,
+                "cumulative_net_return_bps": 6.2,
+                "accepted_trades_csv_path": str(tmp_path / "relaxed_trades.csv"),
+            }
+
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "run_candidate_validation",
+            fake_run_candidate_validation,
+        )
+
+        report = scheduler._run_relaxed_candidate_b_validation(
+            source="historical",
+            data_root=tmp_path / "data",
+            walk_forward_reports_dir=tmp_path / "walk_forward",
+            validation_reports_dir=tmp_path / "candidate",
+        )
+
+        assert "walk_forward_runner" not in captured
+        assert captured["coin"] == "BTC"
+        assert captured["interval"] == "15s"
+        assert captured["source"] == "historical"
+        assert captured["horizon"] == scheduler.RELAXED_CANDIDATE_B_HORIZON
+        assert captured["min_confidence"] == scheduler.RELAXED_CANDIDATE_B_MIN_CONFIDENCE
+        assert captured["min_edge_bps"] == scheduler.RELAXED_CANDIDATE_B_MIN_EDGE_BPS
+        assert captured["cost_multiplier"] == scheduler.RELAXED_CANDIDATE_B_COST_MULTIPLIER
+        assert captured["max_spread_bps"] == scheduler.RELAXED_CANDIDATE_B_MAX_SPREAD_BPS
+        assert captured["candidate_name"] == scheduler.RELAXED_CANDIDATE_B_NAME
+        assert captured["require_positive"] is False
+        assert report["filtered_paper_trades"] == 25
+        assert report["cumulative_net_return_bps"] == 6.2
+
+    def test_execute_tick_relaxed_candidate_success_populates_summary(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        audit_payload = {"imported_historical_1s": {}}
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: audit_payload,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_autopilot_tick",
+            lambda **kwargs: scheduler.AutopilotReport(action="chunk_completed"),
+        )
+
+        def fake_run_candidate_validation(**kwargs: object) -> dict[str, object]:
+            if kwargs.get("candidate_name") == scheduler.RELAXED_CANDIDATE_B_NAME:
+                return {
+                    "filtered_paper_trades": 25,
+                    "cumulative_net_return_bps": -12.5,
+                    "accepted_trades_csv_path": str(tmp_path / "relaxed_accepted.csv"),
+                }
+            return {"filtered_paper_trades": 5, "cumulative_net_return_bps": 3.0}
+
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "run_candidate_validation",
+            fake_run_candidate_validation,
+        )
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "summarize_candidate_validation_reports",
+            lambda **kwargs: "summary",
+        )
+
+        tick = scheduler._execute_research_session_tick(
+            tick_index=0,
+            coins=["BTC", "ETH"],
+            source="historical",
+            aws_profile="test-profile",
+            requester_pays=True,
+            run_candidate_tests=True,
+            run_relaxed_candidate_test=True,
+            update_dashboard_artifacts=False,
+            state_path=tmp_path / "state.json",
+            runs_dir=tmp_path / "runs",
+            data_root=tmp_path / "data",
+            downloads_root=tmp_path / "downloads",
+            candidate_reports_dir=tmp_path / "candidate",
+            orchestrator_report_dir=tmp_path / "orchestrator",
+        )
+
+        assert tick["relaxed_trades"] == 25
+        assert tick["relaxed_cumulative_net_return_bps"] == -12.5
+        assert tick["relaxed_accepted_trades_csv_path"] == str(tmp_path / "relaxed_accepted.csv")
+        assert tick["failures"] == []
+
+    def test_execute_tick_relaxed_candidate_failure_is_captured_without_crashing(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        audit_payload = {"imported_historical_1s": {}}
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: audit_payload,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_autopilot_tick",
+            lambda **kwargs: scheduler.AutopilotReport(action="chunk_completed"),
+        )
+
+        def fake_run_candidate_validation(**kwargs: object) -> dict[str, object]:
+            if kwargs.get("candidate_name") == scheduler.RELAXED_CANDIDATE_B_NAME:
+                raise RuntimeError("walk-forward evaluator unavailable")
+            return {"filtered_paper_trades": 5, "cumulative_net_return_bps": 3.0}
+
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "run_candidate_validation",
+            fake_run_candidate_validation,
+        )
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "summarize_candidate_validation_reports",
+            lambda **kwargs: "summary",
+        )
+
+        tick = scheduler._execute_research_session_tick(
+            tick_index=0,
+            coins=["BTC", "ETH"],
+            source="historical",
+            aws_profile="test-profile",
+            requester_pays=True,
+            run_candidate_tests=True,
+            run_relaxed_candidate_test=True,
+            update_dashboard_artifacts=False,
+            state_path=tmp_path / "state.json",
+            runs_dir=tmp_path / "runs",
+            data_root=tmp_path / "data",
+            downloads_root=tmp_path / "downloads",
+            candidate_reports_dir=tmp_path / "candidate",
+            orchestrator_report_dir=tmp_path / "orchestrator",
+        )
+
+        assert tick["relaxed_trades"] is None
+        assert tick["relaxed_cumulative_net_return_bps"] is None
+        assert tick["relaxed_accepted_trades_csv_path"] is None
+        assert tick["autopilot_action"] == "chunk_completed"
+        assert any(
+            "relaxed candidate validation failed" in failure
+            and "walk-forward evaluator unavailable" in failure
+            for failure in tick["failures"]
+        )
+
     def test_dashboard_audit_artifact_paths_are_used(
         self,
         tmp_path: Path,
@@ -4225,3 +4406,65 @@ class TestResearchSessionLaunchdTemplate:
         assert "not installed automatically" in setup_text
         assert "launchctl load" in setup_text
         assert "launchctl bootstrap" not in setup_text
+
+    def test_program_arguments_have_no_stray_boolean_tokens(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = tmp_path / "launchd"
+        morning_plist, _, setup_path = scheduler.cmd_write_research_session_launchd_template(
+            output_dir=output_dir,
+            project_dir=tmp_path,
+            python_path="/usr/bin/python3",
+            use_caffeinate=False,
+        )
+
+        program_args = _extract_plist_program_arguments(morning_plist)
+        store_true_flags = {
+            "--requester-pays",
+            "--no-requester-pays",
+            "--dry-run",
+        }
+        for index, token in enumerate(program_args):
+            if token in store_true_flags and index + 1 < len(program_args):
+                next_token = program_args[index + 1].lower()
+                assert next_token not in {"true", "false"}, (
+                    f"{token} must not be followed by {next_token!r} in {program_args}"
+                )
+
+        assert "--requester-pays" in program_args
+        assert "true" not in program_args
+        assert "false" not in program_args
+
+        setup_text = setup_path.read_text(encoding="utf-8")
+        if "Manual caffeinated session" in setup_text:
+            manual_section = setup_text.split("## Manual caffeinated session", 1)[1]
+            assert " true" not in manual_section
+            assert " false" not in manual_section
+
+    def test_generated_plist_command_parses_with_research_session_parser(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = tmp_path / "launchd"
+        morning_plist, _, _ = scheduler.cmd_write_research_session_launchd_template(
+            output_dir=output_dir,
+            project_dir=tmp_path,
+            python_path="/usr/bin/python3",
+            use_caffeinate=False,
+        )
+
+        program_args = _extract_plist_program_arguments(morning_plist)
+        scheduler_script = program_args[1]
+        research_session_args = program_args[2:]
+
+        assert program_args[0] == "/usr/bin/python3"
+        assert Path(scheduler_script).name == "bid_ask_research_scheduler.py"
+        assert research_session_args[0] == "research-session"
+
+        parsed = scheduler.build_parser().parse_args(research_session_args)
+        assert parsed.command == "research-session"
+        assert parsed.requester_pays is True
+        assert parsed.run_candidate_tests is True
+        assert parsed.run_relaxed_candidate_test is True
+        assert parsed.update_dashboard_artifacts is True
