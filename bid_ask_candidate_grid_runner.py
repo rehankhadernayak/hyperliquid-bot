@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import inspect
 import itertools
 import json
 import uuid
@@ -42,6 +43,10 @@ DEFAULT_FEE_BPS = 2.0
 DEFAULT_SLIPPAGE_BPS = 1.0
 DEFAULT_TOP_N = 20
 DEFAULT_MIN_TRADES_REQUIRED = 20
+DEFAULT_EXCLUDE_HOURS_VALUES = ("none",)
+DEFAULT_INCLUDE_HOURS_VALUES = ("none",)
+DEFAULT_MAX_COST_BPS_VALUES = ("none",)
+DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER = 5
 
 PAPER_SCORE_POSITIVE_AFTER_COSTS_BONUS = 1_000.0
 PAPER_SCORE_BEATS_BASELINE_BONUS = 500.0
@@ -49,6 +54,7 @@ PAPER_SCORE_TRADE_COUNT_WEIGHT = 10.0
 PAPER_SCORE_AVERAGE_NET_RETURN_WEIGHT = 100.0
 PAPER_SCORE_STABILITY_WARNING_PENALTY = 150.0
 PAPER_SCORE_INSUFFICIENT_TRADES_PENALTY = 500.0
+PAPER_SCORE_INSUFFICIENT_REGIME_TRADES_PENALTY = 500.0
 
 WalkForwardRunner = Callable[..., dict[str, Any]]
 
@@ -68,14 +74,35 @@ class CandidateGridConfig:
     fee_bps: float
     slippage_bps: float
     source: str
+    exclude_hours: tuple[int, ...] | None = None
+    include_hours: tuple[int, ...] | None = None
+    max_cost_bps: float | None = None
 
     @property
     def config_id(self) -> str:
         trade = self.trade_class.upper()
-        return (
+        base = (
             f"{self.coin}_{trade}_H{self.horizon}_"
             f"C{self.min_confidence:.2f}_E{self.min_edge_bps:.0f}_"
             f"M{self.cost_multiplier:.2f}_S{self.max_spread_bps:.0f}"
+        )
+        suffix_parts: list[str] = []
+        if self.exclude_hours:
+            suffix_parts.append(f"EX{format_hours_label(self.exclude_hours)}")
+        if self.include_hours:
+            suffix_parts.append(f"IN{format_hours_label(self.include_hours)}")
+        if self.max_cost_bps is not None:
+            suffix_parts.append(f"MC{self.max_cost_bps:g}")
+        if suffix_parts:
+            return f"{base}_{'_'.join(suffix_parts)}"
+        return base
+
+    @property
+    def regime_filter_active(self) -> bool:
+        return (
+            self.exclude_hours is not None
+            or self.include_hours is not None
+            or self.max_cost_bps is not None
         )
 
 
@@ -103,6 +130,67 @@ def parse_csv_values(raw: str, *, value_type: type = str) -> tuple[Any, ...]:
     raise TypeError(f"Unsupported value_type: {value_type}")
 
 
+def parse_regime_filter_csv_values(raw: str) -> tuple[str, ...]:
+    """Parse comma-separated regime filter dimension values."""
+    parts = [item.strip() for item in str(raw).split(",") if item.strip()]
+    if not parts:
+        return DEFAULT_EXCLUDE_HOURS_VALUES
+    return tuple(parts)
+
+
+def parse_hours_value(raw: str) -> tuple[int, ...] | None:
+    """Parse hour filter token: 'none' -> None, '3+5' -> (3, 5)."""
+    text = str(raw).strip().lower()
+    if not text or text == "none":
+        return None
+    hours: list[int] = []
+    for part in text.split("+"):
+        token = part.strip()
+        if not token:
+            continue
+        hour = int(token)
+        if hour < 0 or hour > 23:
+            raise ValueError(f"Invalid hour token: {token}")
+        hours.append(hour)
+    if not hours:
+        return None
+    return tuple(hours)
+
+
+def parse_max_cost_bps_value(raw: str) -> float | None:
+    """Parse max cost bps token: 'none' -> None, '5' -> 5.0."""
+    text = str(raw).strip().lower()
+    if not text or text == "none":
+        return None
+    return float(text)
+
+
+def format_hours_label(hours: tuple[int, ...] | None) -> str:
+    """Format hour tuple for config_id and output columns."""
+    if not hours:
+        return ""
+    return "+".join(str(hour) for hour in hours)
+
+
+def _filter_runner_kwargs(
+    runner: WalkForwardRunner,
+    kwargs: dict[str, Any],
+) -> dict[str, Any]:
+    """Pass regime filter kwargs only when the runner signature supports them."""
+    regime_keys = ("exclude_hours", "include_hours", "max_cost_bps")
+    try:
+        params = inspect.signature(runner).parameters
+    except (TypeError, ValueError):
+        return kwargs
+    if any(param.kind == inspect.Parameter.VAR_KEYWORD for param in params.values()):
+        return kwargs
+    filtered = dict(kwargs)
+    for key in regime_keys:
+        if key in filtered and key not in params:
+            del filtered[key]
+    return filtered
+
+
 def build_grid_combinations(
     *,
     coins: tuple[str, ...] = DEFAULT_COINS,
@@ -115,6 +203,9 @@ def build_grid_combinations(
     min_edge_bps_values: tuple[float, ...] = DEFAULT_MIN_EDGE_BPS_VALUES,
     cost_multipliers: tuple[float, ...] = DEFAULT_COST_MULTIPLIERS,
     max_spread_bps_values: tuple[float, ...] = DEFAULT_MAX_SPREAD_BPS_VALUES,
+    exclude_hours_values: tuple[str, ...] = DEFAULT_EXCLUDE_HOURS_VALUES,
+    include_hours_values: tuple[str, ...] = DEFAULT_INCLUDE_HOURS_VALUES,
+    max_cost_bps_values: tuple[str, ...] = DEFAULT_MAX_COST_BPS_VALUES,
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     source: str = DEFAULT_SOURCE,
@@ -131,6 +222,9 @@ def build_grid_combinations(
         min_edge_bps,
         cost_multiplier,
         max_spread_bps,
+        exclude_hours_raw,
+        include_hours_raw,
+        max_cost_bps_raw,
     ) in itertools.product(
         coins,
         horizons,
@@ -141,6 +235,9 @@ def build_grid_combinations(
         min_edge_bps_values,
         cost_multipliers,
         max_spread_bps_values,
+        exclude_hours_values,
+        include_hours_values,
+        max_cost_bps_values,
     ):
         configs.append(
             CandidateGridConfig(
@@ -157,6 +254,9 @@ def build_grid_combinations(
                 fee_bps=float(fee_bps),
                 slippage_bps=float(slippage_bps),
                 source=source,
+                exclude_hours=parse_hours_value(exclude_hours_raw),
+                include_hours=parse_hours_value(include_hours_raw),
+                max_cost_bps=parse_max_cost_bps_value(max_cost_bps_raw),
             )
         )
     return configs
@@ -166,6 +266,7 @@ def compute_paper_score(
     metrics: dict[str, Any],
     *,
     min_trades_required: int = DEFAULT_MIN_TRADES_REQUIRED,
+    min_trades_after_regime_filter: int = DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
 ) -> dict[str, Any]:
     """Compute paper-only ranking score with explicit bonuses and penalties."""
     positive_after_costs = bool(metrics.get("positive_after_costs", False))
@@ -174,11 +275,25 @@ def compute_paper_score(
     average_net_return_bps = float(metrics.get("average_net_return_bps", 0.0))
     stability_summary = metrics.get("stability_summary") or {}
     stability_warnings = list(metrics.get("stability_warnings") or [])
+    regime_filters_enabled = bool(metrics.get("regime_filters_enabled", False))
+    trades_after_regime_filters = metrics.get("trades_after_regime_filters")
 
     insufficient_trades = filtered_paper_trades < min_trades_required
     has_concentration_warning = bool(stability_summary.get("concentration_warning"))
     has_sparse_warning = bool(stability_summary.get("sparse_stability_warning"))
     warning_count = len(stability_warnings) + int(has_concentration_warning) + int(has_sparse_warning)
+
+    insufficient_regime_trades = False
+    insufficient_regime_trades_penalty = 0.0
+    if regime_filters_enabled and trades_after_regime_filters is not None:
+        insufficient_regime_trades = (
+            int(trades_after_regime_filters) < min_trades_after_regime_filter
+        )
+        insufficient_regime_trades_penalty = (
+            PAPER_SCORE_INSUFFICIENT_REGIME_TRADES_PENALTY
+            if insufficient_regime_trades
+            else 0.0
+        )
 
     positive_bonus = PAPER_SCORE_POSITIVE_AFTER_COSTS_BONUS if positive_after_costs else 0.0
     baseline_bonus = PAPER_SCORE_BEATS_BASELINE_BONUS if beats_baseline else 0.0
@@ -196,6 +311,7 @@ def compute_paper_score(
         + average_return_bonus
         - stability_penalty
         - insufficient_trades_penalty
+        - insufficient_regime_trades_penalty
     )
 
     return {
@@ -206,7 +322,9 @@ def compute_paper_score(
         "average_net_return_bonus": average_return_bonus,
         "stability_warnings_penalty": stability_penalty,
         "insufficient_trades_penalty": insufficient_trades_penalty,
+        "insufficient_regime_trades_penalty": insufficient_regime_trades_penalty,
         "insufficient_trades": insufficient_trades,
+        "insufficient_regime_trades": insufficient_regime_trades,
         "stability_warning_count": warning_count,
         "real_execution_ready": False,
     }
@@ -239,6 +357,18 @@ def extract_metrics_from_walk_forward(walk_forward_report: dict[str, Any]) -> di
         ),
         "stability_summary": dict(walk_forward_report.get("stability_summary") or {}),
         "stability_warnings": list(walk_forward_report.get("stability_warnings") or []),
+        "regime_filters_enabled": bool(walk_forward_report.get("regime_filters_enabled", False)),
+        "trades_before_regime_filters": walk_forward_report.get("trades_before_regime_filters"),
+        "trades_after_regime_filters": walk_forward_report.get("trades_after_regime_filters"),
+        "trades_removed_by_regime_filters": walk_forward_report.get(
+            "trades_removed_by_regime_filters"
+        ),
+        "cumulative_net_return_before_regime_filters": walk_forward_report.get(
+            "cumulative_net_return_before_regime_filters"
+        ),
+        "cumulative_net_return_after_regime_filters": walk_forward_report.get(
+            "cumulative_net_return_after_regime_filters"
+        ),
     }
 
 
@@ -247,34 +377,52 @@ def evaluate_grid_config(
     *,
     data_root: Path = DEFAULT_DATA_ROOT,
     min_trades_required: int = DEFAULT_MIN_TRADES_REQUIRED,
+    min_trades_after_regime_filter: int = DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
     walk_forward_runner: WalkForwardRunner | None = None,
 ) -> dict[str, Any]:
     """Evaluate one grid configuration via walk-forward evaluation."""
     runner = walk_forward_runner or run_walk_forward_evaluation
-    walk_forward_report = runner(
-        coins=[config.coin],
-        interval=config.interval,
-        source=config.source,
-        horizon=config.horizon,
-        feature_set=config.feature_set,
-        label_mode=config.label_mode,
-        trade_classes=frozenset({config.trade_class}),
-        min_confidence=config.min_confidence,
-        min_edge_bps=config.min_edge_bps,
-        cost_multiplier=config.cost_multiplier,
-        max_spread_bps=config.max_spread_bps,
-        fee_bps=config.fee_bps,
-        slippage_bps=config.slippage_bps,
-        data_root=data_root,
-        save_reports=False,
-        save_accepted_trades=False,
-        stability_report_enabled=True,
+    runner_kwargs = _filter_runner_kwargs(
+        runner,
+        {
+            "coins": [config.coin],
+            "interval": config.interval,
+            "source": config.source,
+            "horizon": config.horizon,
+            "feature_set": config.feature_set,
+            "label_mode": config.label_mode,
+            "trade_classes": frozenset({config.trade_class}),
+            "min_confidence": config.min_confidence,
+            "min_edge_bps": config.min_edge_bps,
+            "cost_multiplier": config.cost_multiplier,
+            "max_spread_bps": config.max_spread_bps,
+            "fee_bps": config.fee_bps,
+            "slippage_bps": config.slippage_bps,
+            "data_root": data_root,
+            "save_reports": False,
+            "save_accepted_trades": False,
+            "stability_report_enabled": True,
+            "exclude_hours": list(config.exclude_hours) if config.exclude_hours else None,
+            "include_hours": list(config.include_hours) if config.include_hours else None,
+            "max_cost_bps": config.max_cost_bps,
+        },
     )
+    walk_forward_report = runner(**runner_kwargs)
     metrics = extract_metrics_from_walk_forward(walk_forward_report)
-    score_details = compute_paper_score(metrics, min_trades_required=min_trades_required)
+    if config.regime_filter_active and not metrics.get("regime_filters_enabled"):
+        metrics["regime_filters_enabled"] = True
+    score_details = compute_paper_score(
+        metrics,
+        min_trades_required=min_trades_required,
+        min_trades_after_regime_filter=min_trades_after_regime_filter,
+    )
     return {
         "config_id": config.config_id,
         "config": asdict(config),
+        "exclude_hours": format_hours_label(config.exclude_hours),
+        "include_hours": format_hours_label(config.include_hours),
+        "max_cost_bps": config.max_cost_bps,
+        "exploratory_overfit_warning": config.regime_filter_active,
         **metrics,
         **score_details,
         "paper_only": PAPER_ONLY,
@@ -301,6 +449,7 @@ def run_candidate_grid(
     *,
     data_root: Path = DEFAULT_DATA_ROOT,
     min_trades_required: int = DEFAULT_MIN_TRADES_REQUIRED,
+    min_trades_after_regime_filter: int = DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
     max_runs: int | None = None,
     dry_run: bool = False,
     walk_forward_runner: WalkForwardRunner | None = None,
@@ -327,6 +476,7 @@ def run_candidate_grid(
                     config,
                     data_root=data_root,
                     min_trades_required=min_trades_required,
+                    min_trades_after_regime_filter=min_trades_after_regime_filter,
                     walk_forward_runner=walk_forward_runner,
                 )
             )
@@ -422,10 +572,18 @@ def write_grid_report_csv(
         "fee_bps",
         "slippage_bps",
         "source",
+        "exclude_hours",
+        "include_hours",
+        "max_cost_bps",
         "paper_score",
         "positive_after_costs",
         "beats_baseline_accuracy",
         "filtered_paper_trades",
+        "trades_before_regime_filters",
+        "trades_after_regime_filters",
+        "trades_removed_by_regime_filters",
+        "regime_filters_enabled",
+        "exploratory_overfit_warning",
         "average_net_return_bps",
         "cumulative_net_return_bps",
         "win_rate_after_costs",
@@ -457,10 +615,18 @@ def write_grid_report_csv(
                     "fee_bps": config.get("fee_bps"),
                     "slippage_bps": config.get("slippage_bps"),
                     "source": config.get("source"),
+                    "exclude_hours": row.get("exclude_hours", ""),
+                    "include_hours": row.get("include_hours", ""),
+                    "max_cost_bps": row.get("max_cost_bps"),
                     "paper_score": row.get("paper_score"),
                     "positive_after_costs": row.get("positive_after_costs"),
                     "beats_baseline_accuracy": row.get("beats_baseline_accuracy"),
                     "filtered_paper_trades": row.get("filtered_paper_trades"),
+                    "trades_before_regime_filters": row.get("trades_before_regime_filters"),
+                    "trades_after_regime_filters": row.get("trades_after_regime_filters"),
+                    "trades_removed_by_regime_filters": row.get("trades_removed_by_regime_filters"),
+                    "regime_filters_enabled": row.get("regime_filters_enabled"),
+                    "exploratory_overfit_warning": row.get("exploratory_overfit_warning"),
                     "average_net_return_bps": row.get("average_net_return_bps"),
                     "cumulative_net_return_bps": row.get("cumulative_net_return_bps"),
                     "win_rate_after_costs": row.get("win_rate_after_costs"),
@@ -508,13 +674,14 @@ def write_grid_report_markdown(
         "",
         "## Top Results",
         "",
-        "| Rank | Config | Paper Score | Trades | Avg Net (bps) | Positive | Beats Baseline |",
-        "| ---: | --- | ---: | ---: | ---: | --- | --- |",
+        "| Rank | Config | Exploratory | Paper Score | Trades | Avg Net (bps) | Positive | Beats Baseline |",
+        "| ---: | --- | --- | ---: | ---: | ---: | --- | --- |",
     ]
 
     for index, row in enumerate(top_n, start=1):
+        exploratory = "yes" if row.get("exploratory_overfit_warning") else "no"
         lines.append(
-            f"| {index} | {row.get('config_id', 'n/a')} | "
+            f"| {index} | {row.get('config_id', 'n/a')} | {exploratory} | "
             f"{float(row.get('paper_score', 0.0)):.2f} | "
             f"{row.get('filtered_paper_trades', 0)} | "
             f"{float(row.get('average_net_return_bps', 0.0)):.4f} | "
@@ -523,7 +690,7 @@ def write_grid_report_markdown(
         )
 
     if not top_n:
-        lines.append("| - | - | - | - | - | - | - |")
+        lines.append("| - | - | - | - | - | - | - | - |")
 
     lines.extend(["", "## Best Result", ""])
     if best is None:
@@ -538,12 +705,26 @@ def write_grid_report_markdown(
                 f"- trade_class: {config.get('trade_class')}",
                 f"- min_confidence: {config.get('min_confidence')}",
                 f"- min_edge_bps: {config.get('min_edge_bps')}",
+                f"- exclude_hours: {best.get('exclude_hours') or 'none'}",
+                f"- include_hours: {best.get('include_hours') or 'none'}",
+                f"- max_cost_bps: {best.get('max_cost_bps') if best.get('max_cost_bps') is not None else 'none'}",
+                f"- exploratory_overfit_warning: {str(best.get('exploratory_overfit_warning', False)).lower()}",
                 f"- paper_score: {float(best.get('paper_score', 0.0)):.2f}",
                 f"- filtered_paper_trades: {best.get('filtered_paper_trades', 0)}",
                 f"- average_net_return_bps: {float(best.get('average_net_return_bps', 0.0)):.4f}",
                 f"- real_execution_ready: false",
             ]
         )
+        if best.get("exploratory_overfit_warning"):
+            lines.extend(
+                [
+                    "",
+                    "**EXPLORATORY REGIME FILTER WARNING:** This configuration uses "
+                    "post-hoc regime filters (hour exclusions, cost caps, etc.). "
+                    "Results are hypothesis-generating only and are overfit-prone. "
+                    "Do not treat as validated walk-forward evidence.",
+                ]
+            )
 
     lines.extend(["", "## Failed Evaluations", ""])
     if not failures:
@@ -560,6 +741,10 @@ def write_grid_report_markdown(
             "Grid results rank paper-only walk-forward configurations on local CSV data. "
             "Higher paper_score suggests stronger simulated performance after costs, "
             "but does not prove live profitability.",
+            "",
+            "Configurations marked **Exploratory** apply regime filters (hour exclusions, "
+            "include-hour whitelists, max-cost caps). These are post-hoc hypotheses and "
+            "carry high overfitting risk. Treat them as research leads, not validated edges.",
             "",
             report.get("safety_statement", SAFETY_STATEMENT),
         ]
@@ -653,6 +838,36 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         help="Comma-separated max spread bps values",
     )
     run_parser.add_argument(
+        "--exclude-hours-values",
+        default=",".join(DEFAULT_EXCLUDE_HOURS_VALUES),
+        help=(
+            "Comma-separated exclude-hour filter values "
+            "(none, single hour like 5, or combined like 3+5)"
+        ),
+    )
+    run_parser.add_argument(
+        "--include-hours-values",
+        default=",".join(DEFAULT_INCLUDE_HOURS_VALUES),
+        help=(
+            "Comma-separated include-hour filter values "
+            "(none, single hour like 5, or combined like 3+5)"
+        ),
+    )
+    run_parser.add_argument(
+        "--max-cost-bps-values",
+        default=",".join(DEFAULT_MAX_COST_BPS_VALUES),
+        help="Comma-separated max cost bps filter values (none or numeric)",
+    )
+    run_parser.add_argument(
+        "--min-trades-after-regime-filter",
+        type=int,
+        default=DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
+        help=(
+            "Minimum trades after regime filter before paper_score penalty "
+            f"(default: {DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER})"
+        ),
+    )
+    run_parser.add_argument(
         "--fee-bps",
         type=float,
         default=DEFAULT_FEE_BPS,
@@ -715,11 +930,15 @@ def _resolve_grid_from_args(args: argparse.Namespace) -> tuple[list[CandidateGri
         "min_edge_bps_values": parse_csv_values(args.min_edge_bps_values, value_type=float),
         "cost_multipliers": parse_csv_values(args.cost_multipliers, value_type=float),
         "max_spread_bps_values": parse_csv_values(args.max_spread_bps_values, value_type=float),
+        "exclude_hours_values": parse_regime_filter_csv_values(args.exclude_hours_values),
+        "include_hours_values": parse_regime_filter_csv_values(args.include_hours_values),
+        "max_cost_bps_values": parse_regime_filter_csv_values(args.max_cost_bps_values),
         "fee_bps": args.fee_bps,
         "slippage_bps": args.slippage_bps,
         "max_runs": args.max_runs,
         "top_n": args.top_n,
         "dry_run": args.dry_run,
+        "min_trades_after_regime_filter": args.min_trades_after_regime_filter,
     }
     configs = build_grid_combinations(
         coins=tuple(str(item).upper() for item in grid_params["coins"]),
@@ -732,6 +951,9 @@ def _resolve_grid_from_args(args: argparse.Namespace) -> tuple[list[CandidateGri
         min_edge_bps_values=tuple(float(item) for item in grid_params["min_edge_bps_values"]),
         cost_multipliers=tuple(float(item) for item in grid_params["cost_multipliers"]),
         max_spread_bps_values=tuple(float(item) for item in grid_params["max_spread_bps_values"]),
+        exclude_hours_values=tuple(str(item) for item in grid_params["exclude_hours_values"]),
+        include_hours_values=tuple(str(item) for item in grid_params["include_hours_values"]),
+        max_cost_bps_values=tuple(str(item) for item in grid_params["max_cost_bps_values"]),
         fee_bps=float(grid_params["fee_bps"]),
         slippage_bps=float(grid_params["slippage_bps"]),
         source=str(grid_params["source"]),
@@ -760,6 +982,7 @@ def main(argv: list[str] | None = None) -> int:
             data_root=args.data_root,
             max_runs=args.max_runs,
             dry_run=args.dry_run,
+            min_trades_after_regime_filter=args.min_trades_after_regime_filter,
             walk_forward_runner=runner,
         )
         report = build_grid_report(

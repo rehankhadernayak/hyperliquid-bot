@@ -14,6 +14,7 @@ from bid_ask_candidate_grid_runner import (
     DEFAULT_COINS,
     DEFAULT_HORIZONS,
     DEFAULT_MIN_CONFIDENCES,
+    DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
     DEFAULT_MIN_TRADES_REQUIRED,
     DEFAULT_OUTPUT_DIR,
     DEFAULT_TRADE_CLASSES,
@@ -23,8 +24,12 @@ from bid_ask_candidate_grid_runner import (
     build_grid_report,
     compute_paper_score,
     evaluate_grid_config,
+    format_hours_label,
     format_top_n_summary,
     main,
+    parse_hours_value,
+    parse_max_cost_bps_value,
+    parse_regime_filter_csv_values,
     rank_grid_results,
     run_candidate_grid,
     write_grid_report_csv,
@@ -435,6 +440,10 @@ class TestCLI:
         assert args.interval == "15s"
         assert args.output_dir == DEFAULT_OUTPUT_DIR
         assert args.dry_run is False
+        assert args.exclude_hours_values == "none"
+        assert args.include_hours_values == "none"
+        assert args.max_cost_bps_values == "none"
+        assert args.min_trades_after_regime_filter == DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER
 
     def test_format_top_n_summary(self) -> None:
         config = _sample_config()
@@ -445,3 +454,166 @@ class TestCLI:
         summary = format_top_n_summary(ranked, top_n=2)
         assert "Top 2 configs" in summary
         assert config.config_id in summary
+
+
+class TestRegimeFilterParsing:
+    def test_parse_none(self) -> None:
+        assert parse_hours_value("none") is None
+        assert parse_max_cost_bps_value("none") is None
+        assert parse_regime_filter_csv_values("none") == ("none",)
+
+    def test_parse_3_plus_5(self) -> None:
+        assert parse_hours_value("3+5") == (3, 5)
+        assert format_hours_label((3, 5)) == "3+5"
+
+    def test_parse_3_plus_5_plus_22(self) -> None:
+        assert parse_hours_value("3+5+22") == (3, 5, 22)
+
+
+class TestRegimeFilterGrid:
+    def test_grid_count_expands_with_regime_filters(self) -> None:
+        configs = build_grid_combinations(
+            coins=("BTC",),
+            horizons=(10,),
+            trade_classes=("DOWN",),
+            min_confidences=(0.55,),
+            min_edge_bps_values=(0.0,),
+            cost_multipliers=(1.0,),
+            max_spread_bps_values=(8.0,),
+            exclude_hours_values=("none", "5", "3+5"),
+            include_hours_values=("none",),
+            max_cost_bps_values=("none",),
+        )
+        assert len(configs) == 3
+        exclude_sets = {config.exclude_hours for config in configs}
+        assert exclude_sets == {None, (5,), (3, 5)}
+
+    def test_evaluator_receives_exclude_hours(self) -> None:
+        config = _sample_config(exclude_hours=(3, 5))
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report(
+            regime_filters_enabled=True,
+            trades_before_regime_filters=12,
+            trades_after_regime_filters=6,
+            trades_removed_by_regime_filters=6,
+        ))
+
+        def runner_with_regime_filters(**kwargs: Any) -> dict[str, Any]:
+            return mock_runner(**kwargs)
+
+        evaluate_grid_config(config, walk_forward_runner=runner_with_regime_filters)
+        assert mock_runner.call_args.kwargs["exclude_hours"] == [3, 5]
+        assert mock_runner.call_args.kwargs["include_hours"] is None
+        assert mock_runner.call_args.kwargs["max_cost_bps"] is None
+
+    def test_evaluator_receives_max_cost_bps(self) -> None:
+        config = _sample_config(max_cost_bps=5.0)
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report(
+            regime_filters_enabled=True,
+            trades_before_regime_filters=10,
+            trades_after_regime_filters=8,
+            trades_removed_by_regime_filters=2,
+        ))
+
+        def runner_with_regime_filters(**kwargs: Any) -> dict[str, Any]:
+            return mock_runner(**kwargs)
+
+        evaluate_grid_config(config, walk_forward_runner=runner_with_regime_filters)
+        assert mock_runner.call_args.kwargs["max_cost_bps"] == 5.0
+
+    def test_output_columns_include_regime_filter_fields(self, tmp_path: Path) -> None:
+        config = _sample_config(exclude_hours=(3, 5), max_cost_bps=5.0)
+        mock_runner = MagicMock(
+            return_value=_mock_walk_forward_report(
+                regime_filters_enabled=True,
+                trades_before_regime_filters=12,
+                trades_after_regime_filters=6,
+                trades_removed_by_regime_filters=6,
+            )
+        )
+
+        def runner_with_regime_filters(**kwargs: Any) -> dict[str, Any]:
+            return mock_runner(**kwargs)
+
+        result = evaluate_grid_config(config, walk_forward_runner=runner_with_regime_filters)
+        grid_output = {
+            "dry_run": False,
+            "planned_count": 1,
+            "total_combinations": 1,
+            "completed_count": 1,
+            "failed_count": 0,
+            "results": [result],
+            "failures": [],
+            "ranked": [result],
+        }
+        report = build_grid_report(
+            grid_output=grid_output,
+            run_timestamp="2026-07-08T08:00:00Z",
+            grid_params={},
+        )
+        csv_path = write_grid_report_csv(report, output_dir=tmp_path)
+        with csv_path.open(encoding="utf-8") as handle:
+            row = next(csv.DictReader(handle))
+        assert row["exclude_hours"] == "3+5"
+        assert row["max_cost_bps"] == "5.0"
+        assert row["trades_before_regime_filters"] == "12"
+        assert row["trades_after_regime_filters"] == "6"
+        assert row["trades_removed_by_regime_filters"] == "6"
+        assert row["regime_filters_enabled"] == "True"
+        assert row["exploratory_overfit_warning"] == "True"
+
+    def test_overfit_warning_true_when_filter_used(self) -> None:
+        config = _sample_config(exclude_hours=(5,))
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        result = evaluate_grid_config(config, walk_forward_runner=mock_runner)
+        assert result["exploratory_overfit_warning"] is True
+        assert result["regime_filters_enabled"] is True
+
+    def test_no_overfit_warning_when_no_filter(self) -> None:
+        config = _sample_config()
+        mock_runner = MagicMock(return_value=_mock_walk_forward_report())
+        result = evaluate_grid_config(config, walk_forward_runner=mock_runner)
+        assert result["exploratory_overfit_warning"] is False
+
+    def test_min_trades_penalty_applies(self) -> None:
+        score = compute_paper_score(
+            {
+                "positive_after_costs": True,
+                "beats_baseline_accuracy": True,
+                "filtered_paper_trades": 25,
+                "average_net_return_bps": 1.0,
+                "stability_summary": {},
+                "stability_warnings": [],
+                "regime_filters_enabled": True,
+                "trades_after_regime_filters": 3,
+            },
+            min_trades_after_regime_filter=DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
+        )
+        assert score["insufficient_regime_trades"] is True
+        assert score["insufficient_regime_trades_penalty"] > 0
+
+    def test_markdown_labels_exploratory_configs(self, tmp_path: Path) -> None:
+        config = _sample_config(exclude_hours=(5,))
+        result = evaluate_grid_config(
+            config,
+            walk_forward_runner=MagicMock(return_value=_mock_walk_forward_report()),
+        )
+        report = build_grid_report(
+            grid_output={
+                "dry_run": False,
+                "planned_count": 1,
+                "total_combinations": 1,
+                "completed_count": 1,
+                "failed_count": 0,
+                "results": [result],
+                "failures": [],
+                "ranked": [result],
+            },
+            run_timestamp="2026-07-08T08:00:00Z",
+            grid_params={},
+            top_n=1,
+        )
+        md_path = write_grid_report_markdown(report, output_dir=tmp_path)
+        markdown = md_path.read_text(encoding="utf-8")
+        assert "Exploratory" in markdown
+        assert "EXPLORATORY REGIME FILTER WARNING" in markdown
+        assert "overfit-prone" in markdown
