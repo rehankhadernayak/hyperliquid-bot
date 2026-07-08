@@ -1155,6 +1155,66 @@ def regime_filters_enabled(
     )
 
 
+TRADE_METRIC_KEYS = (
+    "accepted_trade_net_returns_bps",
+    "filtered_paper_trades",
+    "cumulative_net_return_bps",
+    "average_net_return_bps",
+    "win_rate_after_costs",
+    "max_drawdown_bps",
+    "longest_losing_streak",
+    "positive_after_costs",
+    "expected_average_from_cumulative",
+    "average_net_return_difference_abs",
+    "net_return_consistency_check",
+)
+
+
+def _count_accepted_by_class_from_records(
+    accepted_trade_records: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Count accepted filtered paper trades by predicted class."""
+    counts = empty_class_count()
+    for record in accepted_trade_records:
+        predicted_class = _normalize_predicted_class(record.get("predicted_class", "FLAT"))
+        counts[predicted_class] += 1
+    return counts
+
+
+def _apply_trade_metrics_to_report(
+    report: dict[str, Any],
+    trade_metrics: dict[str, Any],
+) -> None:
+    """Copy aggregated accepted-trade metrics onto top-level report fields."""
+    for key in TRADE_METRIC_KEYS:
+        report[key] = trade_metrics[key]
+    report["total_paper_trades"] = trade_metrics["filtered_paper_trades"]
+
+
+def _update_regime_filter_warnings(
+    report: dict[str, Any],
+    *,
+    filtered_paper_trades: int,
+    cumulative_net_return_bps: float,
+    regime_filters_active: bool,
+) -> None:
+    """Refresh return/trade warnings after exploratory regime filtering."""
+    warnings = list(report.get("warnings", []))
+    warnings = [warning for warning in warnings if warning != "negative_after_costs"]
+    warnings = [
+        warning
+        for warning in warnings
+        if warning != "no_trades_after_regime_filters"
+    ]
+
+    if regime_filters_active and filtered_paper_trades == 0:
+        warnings.append("no_trades_after_regime_filters")
+    elif filtered_paper_trades > 0 and cumulative_net_return_bps <= 0:
+        warnings.append("negative_after_costs")
+
+    report["warnings"] = list(dict.fromkeys(warnings))
+
+
 def filter_accepted_trades_by_regime(
     accepted_trade_records: list[dict[str, Any]],
     *,
@@ -1259,13 +1319,25 @@ def apply_regime_filter_metrics(
 
     if active:
         report["accepted_trade_records"] = after_records
-        report["accepted_trade_net_returns_bps"] = after_returns
+        _apply_trade_metrics_to_report(report, after_metrics)
+        report["accepted_by_class"] = _count_accepted_by_class_from_records(after_records)
         report["class_trade_diagnostics"] = aggregate_class_trade_diagnostics(after_records)
         report["coin_class_trade_diagnostics"] = aggregate_coin_class_trade_diagnostics(
             after_records,
             coins=list(report.get("coins", [])),
         )
+
+        updated_readiness = compute_readiness_flags(
+            accuracy_edge_vs_baseline=float(report.get("accuracy_edge_vs_baseline", 0.0)),
+            cumulative_net_return_bps=after_metrics["cumulative_net_return_bps"],
+            completed_windows=int(report.get("completed_windows", 0)),
+            total_paper_trades=after_metrics["filtered_paper_trades"],
+            min_windows=int(report.get("min_windows", DEFAULT_MIN_WINDOWS)),
+            min_trades=int(report.get("min_trades", DEFAULT_MIN_TRADES)),
+        )
+
         if report.get("stability_report_enabled"):
+            prior_stability_warnings = list(report.get("stability_warnings", []))
             stability_min_trades_per_bucket = int(
                 report.get(
                     "stability_min_trades_per_bucket",
@@ -1286,9 +1358,37 @@ def apply_regime_filter_metrics(
                 stability_summary,
                 min_trades_per_bucket=stability_min_trades_per_bucket,
             )
-            readiness = report.get("readiness") or {}
-            report["readiness"] = apply_stability_readiness(readiness, stability_summary)
-            report.update(report["readiness"])
+            updated_readiness = apply_stability_readiness(
+                updated_readiness,
+                stability_summary,
+            )
+            warnings = [
+                warning
+                for warning in report.get("warnings", [])
+                if warning not in prior_stability_warnings
+            ]
+            warnings.extend(report["stability_warnings"])
+            report["warnings"] = list(dict.fromkeys(warnings))
+
+        report["readiness"] = updated_readiness
+        report.update(updated_readiness)
+
+        _update_regime_filter_warnings(
+            report,
+            filtered_paper_trades=after_metrics["filtered_paper_trades"],
+            cumulative_net_return_bps=after_metrics["cumulative_net_return_bps"],
+            regime_filters_active=True,
+        )
+
+        warnings = list(report.get("warnings", []))
+        warnings = [
+            warning
+            for warning in warnings
+            if warning != "net_return_aggregation_inconsistent"
+        ]
+        if not after_metrics["net_return_consistency_check"]:
+            warnings.append("net_return_aggregation_inconsistent")
+        report["warnings"] = list(dict.fromkeys(warnings))
 
     return report
 
@@ -1535,19 +1635,25 @@ def _format_regime_filter_section(report: dict[str, Any]) -> list[str]:
         f"- include_hours: {report.get('include_hours') or 'none'}",
         f"- max_cost_bps: {report.get('max_cost_bps') if report.get('max_cost_bps') is not None else 'none'}",
         f"- min_cost_bps: {report.get('min_cost_bps') if report.get('min_cost_bps') is not None else 'none'}",
-        f"- trades_before_regime_filters: {report.get('trades_before_regime_filters', 0)}",
-        f"- trades_after_regime_filters: {report.get('trades_after_regime_filters', 0)}",
         f"- trades_removed_by_regime_filters: {report.get('trades_removed_by_regime_filters', 0)}",
+        "",
+        "### Before regime filters",
+        "",
+        f"- trades_before_regime_filters: {report.get('trades_before_regime_filters', 0)}",
         f"- cumulative_net_return_before_regime_filters: "
         f"{report.get('cumulative_net_return_before_regime_filters', 0.0):.4f}",
-        f"- cumulative_net_return_after_regime_filters: "
-        f"{report.get('cumulative_net_return_after_regime_filters', 0.0):.4f}",
         f"- average_net_return_before_regime_filters: "
         f"{report.get('average_net_return_before_regime_filters', 0.0):.4f}",
-        f"- average_net_return_after_regime_filters: "
-        f"{report.get('average_net_return_after_regime_filters', 0.0):.4f}",
         f"- win_rate_before_regime_filters: "
         f"{report.get('win_rate_before_regime_filters', 0.0):.4f}",
+        "",
+        "### After regime filters",
+        "",
+        f"- trades_after_regime_filters: {report.get('trades_after_regime_filters', 0)}",
+        f"- cumulative_net_return_after_regime_filters: "
+        f"{report.get('cumulative_net_return_after_regime_filters', 0.0):.4f}",
+        f"- average_net_return_after_regime_filters: "
+        f"{report.get('average_net_return_after_regime_filters', 0.0):.4f}",
         f"- win_rate_after_regime_filters: "
         f"{report.get('win_rate_after_regime_filters', 0.0):.4f}",
         "",

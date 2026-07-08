@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import MagicMock
 
+import pytest
+
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 from bid_ask_candidate_grid_runner import (
     DEFAULT_COINS,
@@ -617,3 +619,34 @@ class TestRegimeFilterGrid:
         assert "Exploratory" in markdown
         assert "EXPLORATORY REGIME FILTER WARNING" in markdown
         assert "overfit-prone" in markdown
+
+    def test_ranking_uses_post_filter_metrics_when_regime_filters_enabled(self) -> None:
+        baseline_config = _sample_config()
+        filtered_config = _sample_config(exclude_hours=(5,))
+
+        baseline_result = _result_from_metrics(
+            baseline_config,
+            filtered_paper_trades=10,
+            cumulative_net_return_bps=20.0,
+            average_net_return_bps=2.0,
+            positive_after_costs=True,
+            regime_filters_enabled=False,
+        )
+        filtered_result = _result_from_metrics(
+            filtered_config,
+            filtered_paper_trades=8,
+            cumulative_net_return_bps=30.0,
+            average_net_return_bps=3.75,
+            positive_after_costs=True,
+            regime_filters_enabled=True,
+            trades_before_regime_filters=10,
+            trades_after_regime_filters=8,
+            trades_removed_by_regime_filters=2,
+            cumulative_net_return_before_regime_filters=20.0,
+            cumulative_net_return_after_regime_filters=30.0,
+        )
+
+        ranked = rank_grid_results([baseline_result, filtered_result])
+        assert ranked[0]["config_id"] == filtered_config.config_id
+        assert ranked[0]["cumulative_net_return_bps"] == pytest.approx(30.0)
+        assert ranked[0]["filtered_paper_trades"] == 8

@@ -2381,6 +2381,109 @@ class TestRegimeFilters:
         assert regime_filters_enabled(min_cost_bps=2.0) is True
         assert regime_filters_enabled() is False
 
+    def test_regime_filter_recomputes_top_level_metrics(self) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z", net_return_bps=-10.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z", net_return_bps=4.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T07:00:00Z", net_return_bps=3.0),
+        ]
+        report = apply_regime_filter_metrics(
+            {
+                "coins": ["BTC"],
+                "completed_windows": 5,
+                "min_windows": 1,
+                "min_trades": 1,
+                "accuracy_edge_vs_baseline": 0.02,
+                "accepted_trade_records": records,
+                "filtered_paper_trades": 3,
+                "cumulative_net_return_bps": -3.0,
+                "average_net_return_bps": -1.0,
+                "win_rate_after_costs": 2 / 3,
+                "positive_after_costs": False,
+                "warnings": ["negative_after_costs"],
+                "readiness": {
+                    "beats_baseline_accuracy": True,
+                    "positive_after_costs": False,
+                    "enough_windows": True,
+                    "enough_trades": True,
+                    "ready_for_more_research": True,
+                    "real_execution_ready": False,
+                },
+            },
+            exclude_hours=[5],
+        )
+
+        assert report["trades_before_regime_filters"] == 3
+        assert report["trades_after_regime_filters"] == 2
+        assert report["filtered_paper_trades"] == 2
+        assert report["cumulative_net_return_before_regime_filters"] == pytest.approx(-3.0)
+        assert report["cumulative_net_return_after_regime_filters"] == pytest.approx(7.0)
+        assert report["cumulative_net_return_bps"] == pytest.approx(7.0)
+        assert report["average_net_return_bps"] == pytest.approx(3.5)
+        assert report["positive_after_costs"] is True
+        assert report["readiness"]["positive_after_costs"] is True
+        assert "negative_after_costs" not in report["warnings"]
+
+    def test_cumulative_net_return_bps_equals_post_filter_sum(self) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z", net_return_bps=1.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z", net_return_bps=2.0),
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T07:00:00Z", net_return_bps=3.0),
+        ]
+        report = apply_regime_filter_metrics(
+            {"coins": ["BTC"], "accepted_trade_records": records},
+            exclude_hours=[5],
+        )
+        post_filter_sum = sum(
+            float(record["net_return_bps"]) for record in report["accepted_trade_records"]
+        )
+
+        assert report["cumulative_net_return_bps"] == pytest.approx(post_filter_sum)
+        assert report["cumulative_net_return_after_regime_filters"] == pytest.approx(post_filter_sum)
+        assert report["cumulative_net_return_before_regime_filters"] == pytest.approx(6.0)
+
+    def test_no_trades_after_regime_filters_sets_zero_metrics_and_warning(self) -> None:
+        records = [
+            _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z", net_return_bps=-8.0),
+        ]
+        report = apply_regime_filter_metrics(
+            {
+                "coins": ["BTC"],
+                "accepted_trade_records": records,
+                "filtered_paper_trades": 1,
+                "cumulative_net_return_bps": -8.0,
+                "positive_after_costs": False,
+                "warnings": ["negative_after_costs"],
+            },
+            exclude_hours=[5],
+        )
+
+        assert report["trades_after_regime_filters"] == 0
+        assert report["filtered_paper_trades"] == 0
+        assert report["cumulative_net_return_bps"] == 0.0
+        assert report["average_net_return_bps"] == 0.0
+        assert report["win_rate_after_costs"] == 0.0
+        assert report["positive_after_costs"] is False
+        assert "no_trades_after_regime_filters" in report["warnings"]
+        assert "negative_after_costs" not in report["warnings"]
+
+    def test_markdown_shows_before_and_after_regime_sections(self, reports_dir: Path) -> None:
+        report = apply_regime_filter_metrics(
+            {
+                "generated_at": "2024-06-10T00:00:00+00:00",
+                "coins": ["BTC"],
+                "accepted_trade_records": [
+                    _synthetic_accepted_trade(timestamp_iso="2024-06-10T05:00:00Z"),
+                    _synthetic_accepted_trade(timestamp_iso="2024-06-10T06:00:00Z"),
+                ],
+            },
+            exclude_hours=[5],
+        )
+        md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "### Before regime filters" in md_text
+        assert "### After regime filters" in md_text
+
 
 class TestStabilityValidation:
     def test_bucket_metrics_are_correct(self) -> None:
