@@ -76,6 +76,10 @@ STABILITY_CONCENTRATION_FRACTION = 0.70
 CANDIDATE_D_LABEL_MODES = frozenset(
     {"cost_aware_3class", "binary_tradeable_down", "binary_tradeable_up"}
 )
+CANDIDATE_D_DIAGNOSTICS_ONLY_MODES = frozenset({"cost_aware_3class"})
+CANDIDATE_D_BINARY_TRADEABLE_MODES = frozenset(
+    {"binary_tradeable_down", "binary_tradeable_up"}
+)
 CANDIDATE_D_3CLASS_LABELS = ("UP_EDGE", "DOWN_EDGE", "NO_TRADE")
 CANDIDATE_D_BINARY_LABELS = ("0", "1")
 
@@ -136,6 +140,10 @@ ACCEPTED_TRADES_CSV_COLUMNS = (
     "cost_bps",
     "net_return_bps",
     "spread_bps",
+    "label_mode",
+    "predicted_edge_probability",
+    "true_edge_label",
+    "estimated_cost_bps",
 )
 
 MIN_ROWS_WARNING = 50
@@ -227,9 +235,29 @@ def is_candidate_d_label_mode(label_mode: str) -> bool:
     return parse_label_mode(label_mode) in CANDIDATE_D_LABEL_MODES
 
 
+def is_binary_tradeable_label_mode(label_mode: str) -> bool:
+    """Return True when label_mode is a Candidate D binary tradeable-edge mode."""
+    return parse_label_mode(label_mode) in CANDIDATE_D_BINARY_TRADEABLE_MODES
+
+
+def is_candidate_d_diagnostics_only(label_mode: str) -> bool:
+    """Return True when Candidate D mode supports label diagnostics only (no WF training)."""
+    return parse_label_mode(label_mode) in CANDIDATE_D_DIAGNOSTICS_ONLY_MODES
+
+
 def candidate_d_supports_walk_forward_training(label_mode: str) -> bool:
-    """Candidate D label modes are diagnostic-only; walk-forward training is not supported."""
-    return False
+    """Return True when Candidate D label mode supports walk-forward model training."""
+    return is_binary_tradeable_label_mode(label_mode)
+
+
+def binary_tradeable_direction(label_mode: str) -> str:
+    """Return fixed paper-trade direction for a binary tradeable label mode."""
+    mode = parse_label_mode(label_mode)
+    if mode == "binary_tradeable_down":
+        return "DOWN"
+    if mode == "binary_tradeable_up":
+        return "UP"
+    raise ValueError(f"Not a binary tradeable label mode: {label_mode!r}")
 
 
 def resolve_mid_price_column(df: pd.DataFrame) -> str | None:
@@ -926,6 +954,7 @@ def build_candidate_d_label_diagnostics(
         )
 
     false_edge_rate: float | None = None
+    accepted_edge_predictions = 0
     if predictions is not None and len(predictions) == len(labels) and labels:
         false_edges = 0
         predicted_edges = 0
@@ -941,6 +970,7 @@ def build_candidate_d_label_diagnostics(
                 predicted_edges += 1
                 if actual_label == "0":
                     false_edges += 1
+        accepted_edge_predictions = predicted_edges
         if predicted_edges > 0:
             false_edge_rate = false_edges / predicted_edges
 
@@ -955,6 +985,8 @@ def build_candidate_d_label_diagnostics(
         "edge_fraction": edge_fraction,
         "future_return_summary_by_label": future_return_summary_by_label,
         "estimated_cost_summary_by_label": estimated_cost_summary_by_label,
+        "accepted_edge_predictions": accepted_edge_predictions,
+        "false_edge_rate": false_edge_rate,
         "false_edge_rate_if_predictions_available": false_edge_rate,
         "walk_forward_training_supported": candidate_d_supports_walk_forward_training(mode),
     }
@@ -998,6 +1030,9 @@ def _aggregate_candidate_d_label_diagnostics(
     aggregate_false_edge_rate = (
         float(np.mean(false_edge_rates)) if false_edge_rates else None
     )
+    accepted_edge_predictions = sum(
+        int(item.get("accepted_edge_predictions", 0)) for item in per_coin_diagnostics
+    )
 
     template = per_coin_diagnostics[0]
     return {
@@ -1011,8 +1046,10 @@ def _aggregate_candidate_d_label_diagnostics(
         "edge_fraction": edge_fraction,
         "future_return_summary_by_label": template.get("future_return_summary_by_label", {}),
         "estimated_cost_summary_by_label": template.get("estimated_cost_summary_by_label", {}),
+        "accepted_edge_predictions": accepted_edge_predictions,
+        "false_edge_rate": aggregate_false_edge_rate,
         "false_edge_rate_if_predictions_available": aggregate_false_edge_rate,
-        "walk_forward_training_supported": False,
+        "walk_forward_training_supported": candidate_d_supports_walk_forward_training(mode),
         "per_coin": {
             str(index): diagnostics for index, diagnostics in enumerate(per_coin_diagnostics)
         },
@@ -1035,6 +1072,12 @@ def _format_candidate_d_diagnostics_section(report: dict[str, Any]) -> list[str]
         f"- estimated_cost_formula: {diagnostics.get('estimated_cost_formula')}",
         f"- no_trade_fraction: {diagnostics.get('no_trade_fraction', 0.0):.4f}",
         f"- edge_fraction: {diagnostics.get('edge_fraction', 0.0):.4f}",
+        f"- accepted_edge_predictions: {diagnostics.get('accepted_edge_predictions', 0)}",
+        (
+            f"- false_edge_rate: {diagnostics['false_edge_rate']:.4f}"
+            if diagnostics.get("false_edge_rate") is not None
+            else "- false_edge_rate: n/a (no predictions)"
+        ),
         f"- walk_forward_training_supported: "
         f"{str(diagnostics.get('walk_forward_training_supported', False)).lower()}",
         "",
@@ -1163,6 +1206,37 @@ def cost_aware_label_warnings(labels: list[str], *, label_mode: str) -> list[str
     return warnings
 
 
+def binary_tradeable_label_warnings(
+    labels: list[str],
+    *,
+    split_name: str,
+    label_mode: str,
+) -> list[str]:
+    """Return warnings when binary tradeable positive-class labels are sparse."""
+    if not is_binary_tradeable_label_mode(label_mode):
+        return []
+
+    warnings: list[str] = []
+    total = len(labels)
+    if total == 0:
+        return warnings
+
+    positive_count = sum(1 for label in labels if str(label) == "1")
+    if positive_count == 0:
+        warnings.append(
+            f"binary_tradeable_no_positive_class: {split_name} has zero class-1 labels"
+        )
+        return warnings
+
+    positive_fraction = positive_count / total
+    if positive_fraction < MIN_CLASS_FRACTION:
+        warnings.append(
+            f"binary_tradeable_positive_class_sparse: {split_name} class-1 is "
+            f"{positive_fraction:.1%} (under {MIN_CLASS_FRACTION:.0%})"
+        )
+    return warnings
+
+
 def _spread_cost_bps(row: pd.Series, default_spread_bps: float) -> float:
     if "avg_spread_bps" in row.index and pd.notna(row["avg_spread_bps"]):
         return float(row["avg_spread_bps"])
@@ -1269,6 +1343,42 @@ def _prediction_confidence_edges(
     ]
 
 
+def _prediction_edge_probabilities(
+    *,
+    sklearn_result: dict[str, Any],
+    test_df: pd.DataFrame,
+    train_df: pd.DataFrame,
+    model_used: str,
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
+) -> list[float]:
+    """Return P(class 1) for binary tradeable label modes."""
+    model = sklearn_result.get("model")
+    scaler = sklearn_result.get("scaler")
+    if model is not None and scaler is not None and hasattr(model, "predict_proba"):
+        X_test = walk_forward_feature_matrix(test_df, feature_columns)
+        if len(X_test) == 0:
+            return []
+        classes = [str(label) for label in getattr(model, "classes_", ["0", "1"])]
+        edge_index = classes.index("1") if "1" in classes else None
+        probabilities: list[float] = []
+        for proba in model.predict_proba(scaler.transform(X_test)):
+            if edge_index is None:
+                probabilities.append(0.0)
+            else:
+                probabilities.append(float(proba[edge_index]))
+        return probabilities
+
+    confidences = _prediction_confidence(
+        sklearn_result=sklearn_result,
+        model_predictions=["1"] * len(test_df),
+        test_df=test_df,
+        train_df=train_df,
+        model_used=model_used,
+        feature_columns=feature_columns,
+    )
+    return [float(value) for value in confidences]
+
+
 def _expected_edge_proxy_bps(
     confidence_edge: float,
     *,
@@ -1311,6 +1421,60 @@ def evaluate_trade_filter(
         return False, "trade_class", total_cost_bps, required_edge_bps
 
     if confidence < trade_filter.min_confidence:
+        return False, "confidence", total_cost_bps, required_edge_bps
+
+    if trade_filter.max_spread_bps is not None and spread_bps > trade_filter.max_spread_bps:
+        return False, "spread", total_cost_bps, required_edge_bps
+
+    volatility_bps = _volatility_bps(row)
+    if trade_filter.min_volatility_bps is not None:
+        if volatility_bps is None or volatility_bps < trade_filter.min_volatility_bps:
+            return False, "volatility", total_cost_bps, required_edge_bps
+    if trade_filter.max_volatility_bps is not None:
+        if volatility_bps is None or volatility_bps > trade_filter.max_volatility_bps:
+            return False, "volatility", total_cost_bps, required_edge_bps
+
+    if trade_filter.min_absolute_future_label_bps is not None:
+        label_edge = max(expected_edge_proxy_bps, trade_filter.threshold_bps)
+        if label_edge <= trade_filter.min_absolute_future_label_bps:
+            return False, "cost", total_cost_bps, required_edge_bps
+
+    if expected_edge_proxy_bps <= required_edge_bps:
+        return False, "cost", total_cost_bps, required_edge_bps
+
+    return True, "", total_cost_bps, required_edge_bps
+
+
+def evaluate_binary_tradeable_filter(
+    *,
+    prediction: str,
+    edge_probability: float,
+    row: pd.Series,
+    fee_bps: float,
+    slippage_bps: float,
+    default_spread_bps: float,
+    trade_filter: TradeFilterConfig,
+    trade_direction: str,
+) -> tuple[bool, str, float, float]:
+    """Return (allowed, block_reason, total_cost_bps, required_edge_bps) for binary edge trades."""
+    spread_bps = _spread_cost_bps(row, default_spread_bps)
+    total_cost_bps = fee_bps + slippage_bps + spread_bps
+    required_edge_bps = total_cost_bps * trade_filter.cost_multiplier + trade_filter.min_edge_bps
+    confidence_edge = abs(2.0 * edge_probability - 1.0)
+    expected_edge_proxy_bps = _expected_edge_proxy_bps(
+        confidence_edge,
+        horizon_return_scale_bps=trade_filter.horizon_return_scale_bps,
+        threshold_bps=trade_filter.threshold_bps,
+        min_absolute_future_label_bps=trade_filter.min_absolute_future_label_bps,
+    )
+
+    if str(prediction) != "1":
+        return False, "no_edge", total_cost_bps, required_edge_bps
+
+    if trade_direction not in trade_filter.trade_classes:
+        return False, "trade_class", total_cost_bps, required_edge_bps
+
+    if edge_probability < trade_filter.min_confidence:
         return False, "confidence", total_cost_bps, required_edge_bps
 
     if trade_filter.max_spread_bps is not None and spread_bps > trade_filter.max_spread_bps:
@@ -2041,6 +2205,158 @@ def _format_regime_filter_section(report: dict[str, Any]) -> list[str]:
     return lines
 
 
+def simulate_binary_tradeable_paper_returns(
+    test_df: pd.DataFrame,
+    predictions: list[str],
+    edge_probabilities: list[float],
+    *,
+    label_mode: str,
+    fee_bps: float,
+    slippage_bps: float,
+    default_spread_bps: float,
+    trade_filter: TradeFilterConfig,
+    coin: str | None = None,
+    window_index: int | None = None,
+) -> dict[str, Any]:
+    """Simulate paper-only returns for binary tradeable-edge label modes."""
+    mode = parse_label_mode(label_mode)
+    trade_direction = binary_tradeable_direction(mode)
+    gross_returns: list[float] = []
+    net_returns: list[float] = []
+    trade_returns: list[float] = []
+    accepted_trade_records: list[dict[str, Any]] = []
+    raw_predictions = 0
+    filtered_paper_trades = 0
+    blocked_by_confidence = 0
+    blocked_by_cost = 0
+    blocked_by_spread = 0
+    blocked_by_volatility = 0
+    blocked_by_trade_class = 0
+    blocked_by_class = empty_class_count()
+    accepted_by_class = empty_class_count()
+    cost_samples: list[float] = []
+    required_edge_samples: list[float] = []
+
+    for index, (_, row) in enumerate(test_df.iterrows()):
+        prediction = predictions[index] if index < len(predictions) else "0"
+        edge_probability = (
+            float(edge_probabilities[index]) if index < len(edge_probabilities) else 0.0
+        )
+        future_return = float(row["future_return_bps"])
+        spread_bps = _spread_cost_bps(row, default_spread_bps)
+        actual_label = str(row["label"]) if "label" in row.index and pd.notna(row["label"]) else "0"
+        estimated_cost_bps = (
+            float(row["estimated_cost_bps"])
+            if "estimated_cost_bps" in row.index and pd.notna(row["estimated_cost_bps"])
+            else fee_bps + slippage_bps + spread_bps
+        )
+        predicted_class = trade_direction if str(prediction) == "1" else "FLAT"
+
+        allowed, block_reason, total_cost_bps, required_edge_bps = evaluate_binary_tradeable_filter(
+            prediction=prediction,
+            edge_probability=edge_probability,
+            row=row,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            default_spread_bps=default_spread_bps,
+            trade_filter=trade_filter,
+            trade_direction=trade_direction,
+        )
+
+        if str(prediction) == "1":
+            raw_predictions += 1
+            cost_samples.append(total_cost_bps)
+            required_edge_samples.append(required_edge_bps)
+
+        if not allowed:
+            blocked_by_class[predicted_class] += 1
+            if block_reason == "confidence":
+                blocked_by_confidence += 1
+            elif block_reason == "cost":
+                blocked_by_cost += 1
+            elif block_reason == "spread":
+                blocked_by_spread += 1
+            elif block_reason == "volatility":
+                blocked_by_volatility += 1
+            elif block_reason == "trade_class":
+                blocked_by_trade_class += 1
+            gross_returns.append(0.0)
+            net_returns.append(0.0)
+            continue
+
+        if trade_direction == "UP":
+            gross = future_return
+        else:
+            gross = -future_return
+
+        net = gross - total_cost_bps
+        gross_returns.append(gross)
+        net_returns.append(net)
+        filtered_paper_trades += 1
+        trade_returns.append(net)
+        accepted_by_class[predicted_class] += 1
+        accepted_trade_records.append(
+            {
+                "coin": str(coin).upper() if coin else "UNKNOWN",
+                "window_index": window_index,
+                "row_index": index,
+                "timestamp_iso": (
+                    str(row["timestamp_iso"])
+                    if "timestamp_iso" in row.index and pd.notna(row["timestamp_iso"])
+                    else ""
+                ),
+                "timestamp_ms": (
+                    int(row["start_timestamp_ms"])
+                    if "start_timestamp_ms" in row.index and pd.notna(row["start_timestamp_ms"])
+                    else (
+                        int(row["end_timestamp_ms"])
+                        if "end_timestamp_ms" in row.index and pd.notna(row["end_timestamp_ms"])
+                        else None
+                    )
+                ),
+                "predicted_class": predicted_class,
+                "actual_label": actual_label,
+                "confidence": edge_probability,
+                "future_return_bps": future_return,
+                "gross_return_bps": gross,
+                "cost_bps": total_cost_bps,
+                "net_return_bps": net,
+                "spread_bps": spread_bps,
+                "label_mode": mode,
+                "predicted_edge_probability": edge_probability,
+                "true_edge_label": actual_label,
+                "estimated_cost_bps": estimated_cost_bps,
+            }
+        )
+
+    class_trade_diagnostics = aggregate_class_trade_diagnostics(accepted_trade_records)
+
+    return {
+        "gross_returns_bps": gross_returns,
+        "net_returns_bps": net_returns,
+        "accepted_trade_net_returns_bps": trade_returns,
+        "trade_returns_bps": trade_returns,
+        "accepted_trade_records": accepted_trade_records,
+        "class_trade_diagnostics": class_trade_diagnostics,
+        "blocked_by_class": blocked_by_class,
+        "accepted_by_class": accepted_by_class,
+        "raw_predictions": raw_predictions,
+        "filtered_paper_trades": filtered_paper_trades,
+        "blocked_by_confidence": blocked_by_confidence,
+        "blocked_by_cost": blocked_by_cost,
+        "blocked_by_spread": blocked_by_spread,
+        "blocked_by_volatility": blocked_by_volatility,
+        "blocked_by_trade_class": blocked_by_trade_class,
+        "trade_filter_summary": trade_filter_to_summary(trade_filter),
+        "average_cost_bps": float(np.mean(cost_samples)) if cost_samples else 0.0,
+        "average_required_edge_bps": (
+            float(np.mean(required_edge_samples)) if required_edge_samples else 0.0
+        ),
+        "total_paper_signals": raw_predictions,
+        "total_paper_trades": filtered_paper_trades,
+    }
+
+
 def simulate_paper_signal_returns(
     test_df: pd.DataFrame,
     predictions: list[str],
@@ -2491,6 +2807,7 @@ def evaluate_walk_forward_window(
     threshold_bps: float,
     source: str,
     feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
+    label_mode: str = DEFAULT_LABEL_MODE,
 ) -> dict[str, Any]:
     """Train on one chronological window and evaluate on the following test slice."""
     train_start, train_end, test_start, test_end = window
@@ -2545,18 +2862,39 @@ def evaluate_walk_forward_window(
         model_used=model_used,
         feature_columns=feature_columns,
     )
-    paper_simulation = simulate_paper_signal_returns(
-        test_df,
-        model_predictions,
-        confidences,
-        confidence_edges,
-        fee_bps=fee_bps,
-        slippage_bps=slippage_bps,
-        default_spread_bps=default_spread_bps,
-        trade_filter=trade_filter,
-        coin=coin,
-        window_index=window_index,
-    )
+    if is_binary_tradeable_label_mode(label_mode):
+        edge_probabilities = _prediction_edge_probabilities(
+            sklearn_result=sklearn_result,
+            test_df=test_df,
+            train_df=train_df,
+            model_used=model_used,
+            feature_columns=feature_columns,
+        )
+        paper_simulation = simulate_binary_tradeable_paper_returns(
+            test_df,
+            model_predictions,
+            edge_probabilities,
+            label_mode=label_mode,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            default_spread_bps=default_spread_bps,
+            trade_filter=trade_filter,
+            coin=coin,
+            window_index=window_index,
+        )
+    else:
+        paper_simulation = simulate_paper_signal_returns(
+            test_df,
+            model_predictions,
+            confidences,
+            confidence_edges,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+            default_spread_bps=default_spread_bps,
+            trade_filter=trade_filter,
+            coin=coin,
+            window_index=window_index,
+        )
     accepted_trade_net_returns_bps = list(
         paper_simulation["accepted_trade_net_returns_bps"]
     )
@@ -2598,12 +2936,17 @@ def evaluate_walk_forward_window(
         "baseline_accuracy": _accuracy(y_true, baseline_predictions),
         "no_trade_baseline_accuracy": _accuracy(y_true, no_trade_predictions),
         "momentum_baseline_accuracy": _accuracy(y_true, momentum_predictions),
-        "prediction_counts": {
-            label: model_predictions.count(label) for label in LABELS
-        },
-        "baseline_prediction_counts": {
-            label: baseline_predictions.count(label) for label in LABELS
-        },
+        "model_predictions": model_predictions,
+        "prediction_counts": (
+            {label: model_predictions.count(label) for label in CANDIDATE_D_BINARY_LABELS}
+            if is_binary_tradeable_label_mode(label_mode)
+            else {label: model_predictions.count(label) for label in LABELS}
+        ),
+        "baseline_prediction_counts": (
+            {label: baseline_predictions.count(label) for label in CANDIDATE_D_BINARY_LABELS}
+            if is_binary_tradeable_label_mode(label_mode)
+            else {label: baseline_predictions.count(label) for label in LABELS}
+        ),
         "total_paper_signals": paper_simulation["total_paper_signals"],
         "total_paper_trades": paper_simulation["total_paper_trades"],
         "raw_predictions": paper_simulation["raw_predictions"],
@@ -2637,7 +2980,11 @@ def evaluate_walk_forward_window(
         "net_return_consistency_check": trade_metrics["net_return_consistency_check"],
         "trade_returns_bps": accepted_trade_net_returns_bps,
         "model_artifact_path": model_artifact_path,
-        "warnings": _label_imbalance_warnings(y_true, "test"),
+        "warnings": (
+            binary_tradeable_label_warnings(y_true, split_name="test", label_mode=label_mode)
+            if is_binary_tradeable_label_mode(label_mode)
+            else _label_imbalance_warnings(y_true, "test")
+        ),
     }
 
 
@@ -2728,7 +3075,7 @@ def evaluate_coin_walk_forward(
     if len(model_df) < MIN_ROWS_WARNING:
         warnings.append(f"too_few_rows: only {len(model_df)} model-ready rows for {coin}")
 
-    if is_candidate_d_label_mode(label_mode):
+    if is_candidate_d_diagnostics_only(label_mode):
         warnings.extend(label_meta.get("candidate_d_label_warnings", []))
         warnings.append(
             f"candidate_d_diagnostics_only: label_mode={parse_label_mode(label_mode)} "
@@ -2825,6 +3172,7 @@ def evaluate_coin_walk_forward(
             threshold_bps=threshold_bps,
             source=normalized_source,
             feature_columns=feature_columns,
+            label_mode=label_mode,
         )
         window_results.append(result)
 
@@ -2908,10 +3256,33 @@ def evaluate_coin_walk_forward(
         warnings.append("negative_after_costs")
 
     train_labels = model_df["label"].tolist() if not model_df.empty else []
-    warnings.extend(_label_imbalance_warnings(train_labels, "all"))
+    if is_binary_tradeable_label_mode(label_mode):
+        warnings.extend(
+            binary_tradeable_label_warnings(train_labels, split_name="all", label_mode=label_mode)
+        )
+    else:
+        warnings.extend(_label_imbalance_warnings(train_labels, "all"))
     warnings.extend(cost_aware_label_warnings(train_labels, label_mode=label_mode))
+    for window in completed:
+        warnings.extend(window.get("warnings", []))
     if feature_meta.get("feature_warning"):
         warnings.append(str(feature_meta["feature_warning"]))
+
+    candidate_d_label_diagnostics: dict[str, Any] | None = None
+    if is_binary_tradeable_label_mode(label_mode):
+        warnings.extend(label_meta.get("candidate_d_label_warnings", []))
+        all_model_predictions: list[str] = []
+        for window in completed:
+            all_model_predictions.extend(window.get("model_predictions", []))
+        candidate_d_label_diagnostics = build_candidate_d_label_diagnostics(
+            model_df,
+            label_mode=label_mode,
+            horizon_bars=horizon,
+            threshold_bps=threshold_bps,
+            estimated_cost_formula=str(label_meta.get("estimated_cost_formula", "")),
+            predictions=all_model_predictions or None,
+        )
+        candidate_d_label_diagnostics["accepted_edge_predictions"] = filtered_paper_trades
 
     readiness = compute_readiness_flags(
         accuracy_edge_vs_baseline=accuracy_edge_vs_baseline,
@@ -2966,6 +3337,7 @@ def evaluate_coin_walk_forward(
         "readiness": readiness,
         "windows": window_results,
         "warnings": warnings,
+        **({"candidate_d_label_diagnostics": candidate_d_label_diagnostics} if candidate_d_label_diagnostics else {}),
         **label_meta,
         **feature_meta,
     }
@@ -3146,7 +3518,10 @@ def build_walk_forward_report(
         warnings.extend(item.get("warnings", []))
 
     candidate_d_mode = is_candidate_d_label_mode(label_mode)
-    if not candidate_d_mode:
+    apply_training_warnings = (
+        not candidate_d_mode or is_binary_tradeable_label_mode(label_mode)
+    )
+    if apply_training_warnings:
         if total_windows < min_windows:
             warnings.append(
                 f"too_few_windows: aggregate total_windows={total_windows} "
@@ -3342,6 +3717,10 @@ def build_walk_forward_report(
             per_coin_candidate_d,
             label_mode=label_mode,
         )
+        report["accepted_edge_predictions"] = report["candidate_d_label_diagnostics"].get(
+            "accepted_edge_predictions"
+        )
+        report["false_edge_rate"] = report["candidate_d_label_diagnostics"].get("false_edge_rate")
 
     return report
 

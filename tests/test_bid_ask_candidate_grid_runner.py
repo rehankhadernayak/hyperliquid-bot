@@ -138,6 +138,41 @@ class TestGridCount:
         assert len(configs) == 1
 
 
+class TestBinaryTradeableLabelModes:
+    def test_grid_accepts_binary_tradeable_label_modes(self) -> None:
+        down_configs = build_grid_combinations(
+            coins=("BTC",),
+            horizons=(20,),
+            label_modes=("binary_tradeable_down",),
+            trade_classes=("DOWN", "UP"),
+            min_confidences=(0.55,),
+            min_edge_bps_values=(0.0,),
+            cost_multipliers=(1.0,),
+            max_spread_bps_values=(8.0,),
+        )
+        up_configs = build_grid_combinations(
+            coins=("ETH",),
+            horizons=(20,),
+            label_modes=("binary_tradeable_up",),
+            trade_classes=("DOWN", "UP"),
+            min_confidences=(0.55,),
+            min_edge_bps_values=(0.0,),
+            cost_multipliers=(1.0,),
+            max_spread_bps_values=(8.0,),
+        )
+
+        assert len(down_configs) == 1
+        assert down_configs[0].label_mode == "binary_tradeable_down"
+        assert down_configs[0].trade_class == "DOWN"
+        assert len(up_configs) == 1
+        assert up_configs[0].label_mode == "binary_tradeable_up"
+        assert up_configs[0].trade_class == "UP"
+
+    def test_grid_rejects_invalid_label_mode(self) -> None:
+        with pytest.raises(ValueError):
+            build_grid_combinations(label_modes=("not_a_mode",))
+
+
 class TestMaxRunsCap:
     def test_max_runs_caps_evaluation(self) -> None:
         configs = build_grid_combinations(

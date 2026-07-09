@@ -18,7 +18,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT
-from bid_ask_walk_forward_evaluator import DEFAULT_DATA_ROOT, run_walk_forward_evaluation
+from bid_ask_walk_forward_evaluator import (
+    DEFAULT_DATA_ROOT,
+    binary_tradeable_direction,
+    is_binary_tradeable_label_mode,
+    parse_label_mode,
+    run_walk_forward_evaluation,
+)
 
 SAFETY_NOTE = (
     "Candidate grid search is research-only and paper-only. "
@@ -212,6 +218,8 @@ def build_grid_combinations(
 ) -> list[CandidateGridConfig]:
     """Build the cartesian product of candidate grid configurations."""
     configs: list[CandidateGridConfig] = []
+    for label_mode in label_modes:
+        parse_label_mode(str(label_mode))
     for (
         coin,
         horizon,
@@ -239,14 +247,19 @@ def build_grid_combinations(
         include_hours_values,
         max_cost_bps_values,
     ):
+        normalized_label_mode = str(label_mode)
+        normalized_trade_class = str(trade_class).strip().upper()
+        if is_binary_tradeable_label_mode(normalized_label_mode):
+            if normalized_trade_class != binary_tradeable_direction(normalized_label_mode):
+                continue
         configs.append(
             CandidateGridConfig(
                 coin=coin.strip().upper(),
                 interval=interval,
                 horizon=int(horizon),
                 feature_set=str(feature_set),
-                label_mode=str(label_mode),
-                trade_class=str(trade_class).strip().upper(),
+                label_mode=normalized_label_mode,
+                trade_class=normalized_trade_class,
                 min_confidence=float(min_confidence),
                 min_edge_bps=float(min_edge_bps),
                 cost_multiplier=float(cost_multiplier),

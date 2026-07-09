@@ -66,11 +66,17 @@ from bid_ask_walk_forward_evaluator import (
     parse_label_mode,
     parse_trade_classes,
     build_candidate_d_label_diagnostics,
+    candidate_d_supports_walk_forward_training,
     compute_candidate_d_class_distribution,
     compute_candidate_d_estimated_cost_bps,
+    binary_tradeable_direction,
+    binary_tradeable_label_warnings,
+    is_binary_tradeable_label_mode,
+    is_candidate_d_diagnostics_only,
     regime_filters_enabled,
     resolve_coins,
     run_walk_forward_evaluation,
+    simulate_binary_tradeable_paper_returns,
     simulate_paper_signal_returns,
     summarize_label_required_edge_bps,
     walk_forward_feature_matrix,
@@ -927,6 +933,34 @@ class TestCandidateDLabels:
         assert diagnostics["false_edge_rate_if_predictions_available"] is None
         assert diagnostics["walk_forward_training_supported"] is False
 
+    def test_binary_label_diagnostics_support_walk_forward_training(self) -> None:
+        featured = _make_candidate_d_featured(
+            [100.0, 100.08, 99.90, 100.0],
+            spread_bps=self.SPREAD_BPS,
+        )
+        labeled, _ = create_walk_forward_labels(
+            featured,
+            label_mode="binary_tradeable_up",
+            horizon=1,
+            threshold_bps=self.THRESHOLD_BPS,
+            fee_bps=self.FEE_BPS,
+            slippage_bps=self.SLIPPAGE_BPS,
+        )
+        ready = labeled.dropna(subset=["future_return_bps"]).iloc[:-1]
+        diagnostics = build_candidate_d_label_diagnostics(
+            ready,
+            label_mode="binary_tradeable_up",
+            horizon_bars=1,
+            threshold_bps=self.THRESHOLD_BPS,
+            estimated_cost_formula="fee_bps + slippage_bps + spread_bps",
+        )
+        assert diagnostics["walk_forward_training_supported"] is True
+        assert candidate_d_supports_walk_forward_training("binary_tradeable_up") is True
+        assert candidate_d_supports_walk_forward_training("binary_tradeable_down") is True
+        assert candidate_d_supports_walk_forward_training("cost_aware_3class") is False
+        assert is_candidate_d_diagnostics_only("cost_aware_3class") is True
+        assert is_binary_tradeable_label_mode("binary_tradeable_down") is True
+
     def test_run_walk_forward_evaluation_diagnostics_only(self, data_root: Path) -> None:
         path = resampled_csv_path("BTC", "15s", data_root)
         _write_resampled_csv(path, _make_resampled_rows(count=40, mid_step=1.0))
@@ -1032,6 +1066,175 @@ class TestCandidateDLabels:
             args = parser.parse_args(["--label-mode", mode])
             assert args.label_mode == mode
             assert is_candidate_d_label_mode(mode)
+
+
+class TestBinaryTradeableWalkForward:
+    def test_binary_tradeable_down_trains_and_evaluates(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.5))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            label_mode="binary_tradeable_down",
+            trade_classes=frozenset({"DOWN"}),
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["label_mode"] == "binary_tradeable_down"
+        assert report["completed_windows"] >= 1
+        assert "candidate_d_label_diagnostics" in report
+        assert report["candidate_d_label_diagnostics"]["walk_forward_training_supported"] is True
+        assert not any(
+            "candidate_d_diagnostics_only" in warning for warning in report["warnings"]
+        )
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+
+    def test_binary_tradeable_up_trains_and_evaluates(self, data_root: Path) -> None:
+        path = resampled_csv_path("ETH", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=2.5, coin="ETH"))
+
+        report = run_walk_forward_evaluation(
+            coins=["ETH"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            label_mode="binary_tradeable_up",
+            trade_classes=frozenset({"UP"}),
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["label_mode"] == "binary_tradeable_up"
+        assert report["completed_windows"] >= 1
+        assert report["candidate_d_label_diagnostics"]["edge_fraction"] >= 0.0
+        assert report["positive_after_costs"] in (True, False)
+
+    def test_accepted_trade_net_return_formula_down_and_up(self) -> None:
+        row = pd.Series(
+            {
+                "future_return_bps": 10.0,
+                "avg_spread_bps": 2.0,
+                "estimated_cost_bps": 5.0,
+                "label": "1",
+            }
+        )
+
+        down = simulate_binary_tradeable_paper_returns(
+            pd.DataFrame([row]),
+            ["1"],
+            [1.0],
+            label_mode="binary_tradeable_down",
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=TradeFilterConfig(
+                min_confidence=0.0,
+                min_edge_bps=0.0,
+                trade_classes=frozenset({"DOWN"}),
+                cost_multiplier=0.0,
+                horizon_return_scale_bps=1000.0,
+                threshold_bps=0.0,
+            ),
+        )
+        up = simulate_binary_tradeable_paper_returns(
+            pd.DataFrame([row]),
+            ["1"],
+            [1.0],
+            label_mode="binary_tradeable_up",
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=TradeFilterConfig(
+                min_confidence=0.0,
+                min_edge_bps=0.0,
+                trade_classes=frozenset({"UP"}),
+                cost_multiplier=0.0,
+                horizon_return_scale_bps=1000.0,
+                threshold_bps=0.0,
+            ),
+        )
+
+        assert down["net_returns_bps"][0] == pytest.approx(-10.0 - 5.0)
+        assert up["net_returns_bps"][0] == pytest.approx(10.0 - 5.0)
+
+    def test_binary_tradeable_positive_class_sparse_warning(self) -> None:
+        warnings = binary_tradeable_label_warnings(
+            ["0"] * 19 + ["1"],
+            split_name="train",
+            label_mode="binary_tradeable_down",
+        )
+        assert any("binary_tradeable_positive_class_sparse" in warning for warning in warnings)
+
+    def test_accepted_trades_csv_includes_candidate_d_fields(
+        self,
+        data_root: Path,
+        reports_dir: Path,
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=3.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            label_mode="binary_tradeable_down",
+            trade_classes=frozenset({"DOWN"}),
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=False,
+            min_windows=1,
+            min_trades=0,
+        )
+        finalize_accepted_trades_csv(
+            report,
+            list(report.get("accepted_trade_records", [])),
+            reports_dir=reports_dir,
+            save_accepted_trades=True,
+        )
+        csv_path = report.get("accepted_trades_csv_path")
+        if csv_path is None:
+            pytest.skip("no accepted trades in synthetic run")
+        saved = pd.read_csv(csv_path)
+        for column in (
+            "label_mode",
+            "predicted_edge_probability",
+            "true_edge_label",
+            "estimated_cost_bps",
+            "future_return_bps",
+            "net_return_bps",
+        ):
+            assert column in saved.columns
+        if not saved.empty:
+            assert saved["label_mode"].iloc[0] == "binary_tradeable_down"
 
 
 class TestComputeReadinessFlags:
