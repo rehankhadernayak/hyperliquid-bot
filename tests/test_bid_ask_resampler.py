@@ -10,7 +10,9 @@ import pandas as pd
 import pytest
 
 from bid_ask_schema import (
+    ASK_SIZE,
     BID_ASK_CSV_COLUMNS,
+    BID_SIZE,
     FORBIDDEN_MODULE_NAMES,
     FORBIDDEN_SOURCE_PATTERNS,
     TIMESTAMP_MS,
@@ -46,6 +48,8 @@ def _make_rows(
     count: int,
     step_ms: int = 1000,
     bid_offset: float = 0.0,
+    bid_size: float | None = 2.0,
+    ask_size: float | None = 1.0,
 ) -> list[dict]:
     rows: list[dict] = []
     for index in range(count):
@@ -57,8 +61,8 @@ def _make_rows(
                 coin=coin,
                 best_bid=best_bid,
                 best_ask=best_ask,
-                bid_size=2.0,
-                ask_size=1.0,
+                bid_size=bid_size if bid_size is not None else None,
+                ask_size=ask_size if ask_size is not None else None,
                 source_session_id="test-session",
                 source_channel="bbo",
             )
@@ -123,6 +127,73 @@ class TestResample15s:
         assert first["avg_ask"] == pytest.approx(expected_avg_bid + 1.0)
         assert first["avg_spread"] == pytest.approx(1.0)
         assert first["avg_spread_bps"] == pytest.approx(expected_avg_spread_bps)
+        assert first["avg_bbo_imbalance"] == pytest.approx(1.0 / 3.0)
+
+
+class TestTopOfBookSizes:
+    def test_preserves_last_valid_sizes_in_15s(self, data_root: Path) -> None:
+        path = bid_ask_1s_path("BTC", data_root)
+        rows = _make_rows(count=15)
+        for index, row in enumerate(rows):
+            row[BID_SIZE] = 1.0 + index * 0.1
+            row[ASK_SIZE] = 2.0 + index * 0.05
+        _write_1s_csv(path, rows)
+
+        first = resample_bid_ask(load_1s_csv("BTC", data_root), "15s").iloc[0]
+        assert first[BID_SIZE] == pytest.approx(1.0 + 14 * 0.1)
+        assert first[ASK_SIZE] == pytest.approx(2.0 + 14 * 0.05)
+
+    def test_last_valid_skips_null_sizes(self, data_root: Path) -> None:
+        path = bid_ask_1s_path("BTC", data_root)
+        rows = _make_rows(count=15)
+        rows[13][BID_SIZE] = None
+        rows[13][ASK_SIZE] = None
+        rows[14][BID_SIZE] = 9.9
+        rows[14][ASK_SIZE] = 8.8
+        _write_1s_csv(path, rows)
+
+        first = resample_bid_ask(load_1s_csv("BTC", data_root), "15s").iloc[0]
+        assert first[BID_SIZE] == pytest.approx(9.9)
+        assert first[ASK_SIZE] == pytest.approx(8.8)
+
+    def test_all_null_sizes_in_bucket(self, data_root: Path) -> None:
+        path = bid_ask_1s_path("BTC", data_root)
+        rows = _make_rows(count=15, bid_size=None, ask_size=None)
+        _write_1s_csv(path, rows)
+
+        first = resample_bid_ask(load_1s_csv("BTC", data_root), "15s").iloc[0]
+        assert pd.isna(first[BID_SIZE])
+        assert pd.isna(first[ASK_SIZE])
+
+    def test_sizes_carried_to_1m_bars(self, data_root: Path) -> None:
+        path = bid_ask_1s_path("BTC", data_root)
+        rows = _make_rows(count=60)
+        for index, row in enumerate(rows):
+            row[BID_SIZE] = float(index)
+            row[ASK_SIZE] = float(60 - index)
+        _write_1s_csv(path, rows)
+
+        first = resample_bid_ask(load_1s_csv("BTC", data_root), "1m").iloc[0]
+        assert first[BID_SIZE] == pytest.approx(59.0)
+        assert first[ASK_SIZE] == pytest.approx(1.0)
+
+    def test_no_future_leakage_sizes_use_in_bucket_only(self, data_root: Path) -> None:
+        """Each bar's sizes must come from ticks inside that bar, not the next bucket."""
+        path = bid_ask_1s_path("BTC", data_root)
+        rows = _make_rows(count=30)
+        for index, row in enumerate(rows):
+            bucket = index // 15
+            row[BID_SIZE] = 100.0 + bucket * 1000.0 + index
+            row[ASK_SIZE] = 200.0 + bucket * 1000.0 + index
+        _write_1s_csv(path, rows)
+
+        resampled = resample_bid_ask(load_1s_csv("BTC", data_root), "15s")
+        assert resampled.iloc[0][BID_SIZE] == pytest.approx(100.0 + 14)
+        assert resampled.iloc[1][BID_SIZE] == pytest.approx(1100.0 + 29)
+
+    def test_avg_bbo_imbalance_preserved(self, data_root: Path, btc_1s_path: Path) -> None:
+        df = load_1s_csv("BTC", data_root)
+        first = resample_bid_ask(df, "15s").iloc[0]
         assert first["avg_bbo_imbalance"] == pytest.approx(1.0 / 3.0)
 
 

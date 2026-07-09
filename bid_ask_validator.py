@@ -14,13 +14,16 @@ import pandas as pd
 
 from bid_ask_resampler import (
     DEFAULT_DATA_ROOT,
+    REQUIRED_RESAMPLED_COLUMNS,
     normalize_source,
     resolve_bid_ask_data_dir,
 )
 from bid_ask_schema import (
+    ASK_SIZE,
     BID_ASK_CSV_COLUMNS,
     BEST_ASK,
     BEST_BID,
+    BID_SIZE,
     COIN,
     PAPER_ONLY,
     SAFETY_STATEMENT,
@@ -32,25 +35,6 @@ from bid_ask_schema import (
 SUPPORTED_INTERVALS = frozenset({"1s", "15s", "1m"})
 SUPPORTED_SOURCES = frozenset({"local", "historical", "combined"})
 INTERVAL_SECONDS = {"1s": 1, "15s": 15, "1m": 60}
-
-RESAMPLED_COLUMNS = (
-    "start_timestamp_ms",
-    "end_timestamp_ms",
-    "timestamp_iso",
-    COIN,
-    "open_mid",
-    "high_mid",
-    "low_mid",
-    "close_mid",
-    "avg_bid",
-    "avg_ask",
-    "avg_mid",
-    "avg_spread",
-    "avg_spread_bps",
-    "avg_bbo_imbalance",
-    "row_count",
-    "missing_seconds",
-)
 
 EXTREME_SPREAD_BPS_THRESHOLD = 100.0
 
@@ -122,7 +106,7 @@ def load_bid_ask_csv_for_validation(
     if interval == "1s":
         required = list(BID_ASK_CSV_COLUMNS)
     else:
-        required = list(RESAMPLED_COLUMNS)
+        required = list(REQUIRED_RESAMPLED_COLUMNS)
 
     missing = [column for column in required if column not in df.columns]
     if missing:
@@ -337,6 +321,17 @@ def _validate_resampled_dataframe(
     missing_periods_count = _count_missing_resampled_bars(df, interval)
     if missing_periods_count:
         warnings.append(f"{missing_periods_count} missing or incomplete bar(s) detected")
+
+    negative_bid_size = 0
+    negative_ask_size = 0
+    if BID_SIZE in df.columns:
+        negative_bid_size = int((df[BID_SIZE] < 0).sum())
+        if negative_bid_size:
+            warnings.append(f"{negative_bid_size} bar(s) have negative {BID_SIZE}")
+    if ASK_SIZE in df.columns:
+        negative_ask_size = int((df[ASK_SIZE] < 0).sum())
+        if negative_ask_size:
+            warnings.append(f"{negative_ask_size} bar(s) have negative {ASK_SIZE}")
 
     return ValidationReport(
         coin=coin,

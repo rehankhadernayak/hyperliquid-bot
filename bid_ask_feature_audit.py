@@ -19,6 +19,7 @@ import pandas as pd
 
 from bid_ask_resampler import (
     INTERVAL_SECONDS,
+    REQUIRED_RESAMPLED_COLUMNS,
     RESAMPLED_COLUMNS,
     normalize_source,
     resampled_csv_path,
@@ -123,7 +124,7 @@ def load_resampled_csv(
         raise FileNotFoundError(f"Resampled CSV not found: {path}")
 
     df = pd.read_csv(path)
-    missing = [column for column in RESAMPLED_COLUMNS if column not in df.columns]
+    missing = [column for column in REQUIRED_RESAMPLED_COLUMNS if column not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns in {path}: {missing}")
 

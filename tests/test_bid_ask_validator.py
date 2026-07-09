@@ -11,9 +11,11 @@ import pandas as pd
 import pytest
 
 from bid_ask_schema import (
+    ASK_SIZE,
     BID_ASK_CSV_COLUMNS,
     BEST_ASK,
     BEST_BID,
+    BID_SIZE,
     FORBIDDEN_MODULE_NAMES,
     FORBIDDEN_SOURCE_PATTERNS,
     SPREAD,
@@ -207,6 +209,10 @@ class TestResampledValidation:
         assert report.passed is True
         assert report.row_count == 2
         assert list(df.columns) == list(RESAMPLED_COLUMNS)
+        assert BID_SIZE in df.columns
+        assert ASK_SIZE in df.columns
+        assert df.iloc[0][BID_SIZE] == pytest.approx(2.0)
+        assert df.iloc[0][ASK_SIZE] == pytest.approx(1.0)
 
     def test_valid_1m_csv_passes(self, data_root: Path) -> None:
         self._write_resampled_from_1s(data_root, "1m", count=60)
@@ -228,6 +234,26 @@ class TestResampledValidation:
         assert report.passed is False
         assert report.invalid_bid_ask_count >= 1
         assert any("high_mid < low_mid" in warning for warning in report.warnings)
+
+    def test_legacy_resampled_csv_without_sizes_still_loads(self, data_root: Path) -> None:
+        resampled = self._write_resampled_from_1s(data_root, "15s")
+        legacy = resampled.drop(columns=[BID_SIZE, ASK_SIZE])
+        _write_resampled_csv(bid_ask_csv_path("BTC", "15s", data_root), legacy)
+
+        df = load_bid_ask_csv_for_validation("BTC", "15s", data_root)
+        report = validate_bid_ask_dataframe(df, "15s", coin="BTC")
+        assert report.passed is True
+        assert BID_SIZE not in df.columns
+        assert ASK_SIZE not in df.columns
+
+    def test_negative_size_warning(self, data_root: Path) -> None:
+        resampled = self._write_resampled_from_1s(data_root, "15s")
+        resampled.loc[0, BID_SIZE] = -1.0
+        _write_resampled_csv(bid_ask_csv_path("BTC", "15s", data_root), resampled)
+
+        df = load_bid_ask_csv_for_validation("BTC", "15s", data_root)
+        report = validate_bid_ask_dataframe(df, "15s", coin="BTC")
+        assert any("negative bid_size" in warning for warning in report.warnings)
 
 
 class TestReportPersistence:

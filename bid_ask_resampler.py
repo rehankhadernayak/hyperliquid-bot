@@ -12,10 +12,12 @@ from typing import Any
 import pandas as pd
 
 from bid_ask_schema import (
+    ASK_SIZE,
     BEST_ASK,
     BEST_BID,
     BBO_IMBALANCE,
     BID_ASK_CSV_COLUMNS,
+    BID_SIZE,
     COIN,
     MID_PRICE,
     PAPER_ONLY,
@@ -36,7 +38,7 @@ INTERVAL_SECONDS = {"15s": 15, "1m": 60}
 DEFAULT_DATA_ROOT = Path("data/bid_ask_csv")
 HISTORICAL_SOURCE_ALIASES = frozenset({"historical", "exchange", "all-time", "alltime"})
 
-RESAMPLED_COLUMNS = (
+REQUIRED_RESAMPLED_COLUMNS = (
     "start_timestamp_ms",
     "end_timestamp_ms",
     TIMESTAMP_ISO,
@@ -54,6 +56,19 @@ RESAMPLED_COLUMNS = (
     "row_count",
     "missing_seconds",
 )
+
+# Top-of-book sizes use last-valid 1s tick within each bar (close-of-bar snapshot).
+OPTIONAL_RESAMPLED_COLUMNS = (BID_SIZE, ASK_SIZE)
+
+RESAMPLED_COLUMNS = REQUIRED_RESAMPLED_COLUMNS + OPTIONAL_RESAMPLED_COLUMNS
+
+
+def _last_valid_value(series: pd.Series) -> float | None:
+    """Return the last non-null value in a series, or None when all values are null."""
+    valid = series.dropna()
+    if valid.empty:
+        return None
+    return float(valid.iloc[-1])
 
 
 def _validate_interval(interval: str) -> int:
@@ -157,26 +172,29 @@ def resample_bid_ask(df: pd.DataFrame, interval: str) -> pd.DataFrame:
             float(imbalance.mean(skipna=True)) if imbalance.notna().any() else None
         )
 
-        rows.append(
-            {
-                "start_timestamp_ms": start_ms,
-                "end_timestamp_ms": end_ms,
-                TIMESTAMP_ISO: timestamp_ms_to_iso(start_ms),
-                COIN: str(group[COIN].iloc[0]),
-                "open_mid": float(group[MID_PRICE].iloc[0]),
-                "high_mid": float(group[MID_PRICE].max()),
-                "low_mid": float(group[MID_PRICE].min()),
-                "close_mid": float(group[MID_PRICE].iloc[-1]),
-                "avg_bid": float(group[BEST_BID].mean()),
-                "avg_ask": float(group[BEST_ASK].mean()),
-                "avg_mid": float(group[MID_PRICE].mean()),
-                "avg_spread": float(group[SPREAD].mean()),
-                "avg_spread_bps": float(group[SPREAD_BPS].mean()),
-                "avg_bbo_imbalance": avg_imbalance,
-                "row_count": row_count,
-                "missing_seconds": interval_seconds - row_count,
-            }
-        )
+        row: dict[str, Any] = {
+            "start_timestamp_ms": start_ms,
+            "end_timestamp_ms": end_ms,
+            TIMESTAMP_ISO: timestamp_ms_to_iso(start_ms),
+            COIN: str(group[COIN].iloc[0]),
+            "open_mid": float(group[MID_PRICE].iloc[0]),
+            "high_mid": float(group[MID_PRICE].max()),
+            "low_mid": float(group[MID_PRICE].min()),
+            "close_mid": float(group[MID_PRICE].iloc[-1]),
+            "avg_bid": float(group[BEST_BID].mean()),
+            "avg_ask": float(group[BEST_ASK].mean()),
+            "avg_mid": float(group[MID_PRICE].mean()),
+            "avg_spread": float(group[SPREAD].mean()),
+            "avg_spread_bps": float(group[SPREAD_BPS].mean()),
+            "avg_bbo_imbalance": avg_imbalance,
+            "row_count": row_count,
+            "missing_seconds": interval_seconds - row_count,
+        }
+        if BID_SIZE in group.columns:
+            row[BID_SIZE] = _last_valid_value(group[BID_SIZE])
+        if ASK_SIZE in group.columns:
+            row[ASK_SIZE] = _last_valid_value(group[ASK_SIZE])
+        rows.append(row)
 
     return pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
 

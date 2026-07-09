@@ -10,7 +10,7 @@ import pandas as pd
 import pytest
 
 import bid_ask_feature_audit as audit
-from bid_ask_resampler import RESAMPLED_COLUMNS
+from bid_ask_resampler import REQUIRED_RESAMPLED_COLUMNS, RESAMPLED_COLUMNS
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 
 AUDIT_FILE = Path(__file__).resolve().parent.parent / "bid_ask_feature_audit.py"
@@ -55,7 +55,10 @@ def _write_resampled_csv(
             row["ask_size"] = 1.2 + index * 0.01
         records.append(row)
 
-    pd.DataFrame(records, columns=list(RESAMPLED_COLUMNS)).to_csv(path, index=False)
+    columns = list(REQUIRED_RESAMPLED_COLUMNS)
+    if include_sizes:
+        columns.extend(["bid_size", "ask_size"])
+    pd.DataFrame(records, columns=columns).to_csv(path, index=False)
 
 
 def _write_accepted_trades_csv(path: Path) -> None:
@@ -170,6 +173,46 @@ class TestSyntheticAudit:
         assert "total_top_size" in featured.columns
         assert "microprice" not in skipped
         assert "bid_size" not in skipped
+
+    def test_resampled_sizes_enable_full_microprice_family(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "bid_ask_csv"
+        csv_path = data_root / "historical_15s" / "BTC_15s.csv"
+        _write_resampled_csv(csv_path, include_sizes=True)
+
+        report = audit.build_feature_audit_report(
+            coin="BTC",
+            interval="15s",
+            source="historical",
+            data_root=data_root,
+            reports_root=tmp_path / "reports",
+            generated_at="2026-07-09T10:00:00Z",
+        )
+        assert "microprice" not in report["skipped_features"]
+        assert "bid_size" not in report["skipped_features"]
+        assert "total_top_size" not in report["skipped_features"]
+        assert "microprice_mid_deviation_bps" in report["feature_stats"]
+        assert "size_imbalance" in report["feature_stats"]
+
+    def test_microprice_formula(self, tmp_path: Path) -> None:
+        data_root = tmp_path / "bid_ask_csv"
+        csv_path = data_root / "historical_15s" / "BTC_15s.csv"
+        _write_resampled_csv(csv_path, rows=5, include_sizes=True)
+
+        df, _ = audit.load_resampled_csv("BTC", "15s", data_root, source="historical")
+        df["bid_size"] = 2.0
+        df["ask_size"] = 1.0
+        df["avg_bid"] = 99.0
+        df["avg_ask"] = 101.0
+        df["close_mid"] = 100.0
+        featured, _ = audit.compute_candidate_features(df, interval="15s")
+
+        # microprice = (101*2 + 99*1) / 3 = 301/3
+        expected_microprice = (101.0 * 2.0 + 99.0 * 1.0) / 3.0
+        assert featured.iloc[0]["microprice"] == pytest.approx(expected_microprice)
+        expected_dev_bps = (expected_microprice - 100.0) / 100.0 * 10_000.0
+        assert featured.iloc[0]["microprice_mid_deviation_bps"] == pytest.approx(expected_dev_bps)
+        assert featured.iloc[0]["total_top_size"] == pytest.approx(3.0)
+        assert featured.iloc[0]["size_imbalance"] == pytest.approx(1.0 / 3.0)
 
     def test_output_json_and_markdown_written(self, workspace: dict[str, Path]) -> None:
         report = audit.run_feature_audit(
