@@ -230,3 +230,40 @@ Also blocked on **more historical data** (~48h imported vs 14-day sprint target)
 ---
 
 *Reminder: this is a student research log. Real execution is disabled. Nothing here is investment advice.*
+
+## 2026-07-09 — Candidate B threshold/regime tuning rejected for now
+
+After additional historical backfill to 2023-09-19T20:59:59Z, the BTC DOWN-only Candidate B family weakened further. A 12-run regime-aware grid over BTC H10/H20, edge thresholds 1/2, and exclude-hour filters none/5/3+5 found no positive post-cost configuration.
+
+Key observations:
+- BTC H20 edge 1 produced 39 trades but averaged about -5.71 bps per trade.
+- BTC H10 edge 1 produced 17 trades but averaged about -2.17 bps per trade.
+- BTC H20 edge 2 produced 9 trades but averaged about -5.26 bps per trade.
+- BTC H10 edge 2 produced only 4 trades and still averaged about -0.81 bps per trade.
+- Excluding UTC hour 05 or 03+05 did not rescue the candidate family.
+
+Interpretation:
+The earlier small positive BTC H10 result was fragile and did not survive incremental data expansion. Further threshold or hour-filter tuning risks post-hoc overfitting. Candidate B remains useful as a diagnostic baseline, but it is not a scalable paper candidate.
+
+Next direction:
+Shift from threshold/regime filtering to feature engineering and regime-aware model inputs. Focus on features that let the model learn when not to accept weak DOWN signals, rather than manually blocking hours after the fact.
+
+Safety:
+Research-only and paper-only. No execution, wallets, orders, leverage, deposits, withdrawals, or real trading.
+
+## 2026-07-09 — Candidate C tested; moving to cost-aware labels (Candidate D)
+
+Candidate C core (`candidate_c_core` feature set) was implemented and walk-forward grid tested on expanded historical data.
+
+Results:
+- **BTC/ETH DOWN grid** (`candidate_grid_20260709T124717`): no positive post-cost configs. Best BTC DOWN H20 (~103 trades) averaged about −6.99 bps per trade.
+- **ETH UP/DOWN grid** (`candidate_grid_20260709T125740`): no positive post-cost configs. ETH DOWN H20 (~157 trades) averaged about −2.79 bps; ETH UP H20 (~96 trades) averaged about −5.15 bps — DOWN less bad than UP, but both negative after costs.
+
+Interpretation:
+Feature engineering alone did not fix the cost problem. Direction labels still accept moves too small to cover fees, slippage, and spread. Further threshold or regime grid search on direction labels risks overfitting (same failure mode as Candidate B).
+
+Next direction:
+Candidate D — cost-aware labels and abstention (`UP_EDGE` / `DOWN_EDGE` / `NO_TRADE`, plus binary tradeable modes). Research plan: `reports/research_notes/candidate_d_cost_aware_labeling_plan.md`. No model training changes until label diagnostics pass.
+
+Safety:
+Research-only and paper-only. No execution, wallets, orders, leverage, deposits, withdrawals, or real trading.
