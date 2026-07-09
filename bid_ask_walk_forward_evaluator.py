@@ -16,6 +16,13 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from bid_ask_features import (
+    CANDIDATE_C_CORE_COLUMNS,
+    MIN_CANDIDATE_C_CORE_FEATURE_COUNT,
+    SUPPORTED_FEATURE_SETS,
+    create_candidate_c_core_features,
+    parse_feature_set,
+)
 from bid_ask_model_io import build_artifact_payload, save_model_artifact
 from bid_ask_resampler import normalize_source, resolve_bid_ask_data_dir, resampled_csv_path
 from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT
@@ -67,7 +74,6 @@ DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET = 3
 STABILITY_CONCENTRATION_FRACTION = 0.70
 
 SUPPORTED_LABEL_MODES = frozenset({"direction", "cost_aware"})
-SUPPORTED_FEATURE_SETS = frozenset({"basic", "microstructure"})
 DEFAULT_FEATURE_SET = "basic"
 
 MICROSTRUCTURE_EXTRA_COLUMNS = (
@@ -210,15 +216,6 @@ def parse_label_mode(value: str) -> str:
     return mode
 
 
-def parse_feature_set(value: str) -> str:
-    """Parse feature set: basic (default) or microstructure."""
-    feature_set = str(value).strip().lower()
-    if feature_set not in SUPPORTED_FEATURE_SETS:
-        supported = ", ".join(sorted(SUPPORTED_FEATURE_SETS))
-        raise ValueError(f"Unsupported feature_set {value!r}; use one of: {supported}")
-    return feature_set
-
-
 def resolve_mid_price_column(df: pd.DataFrame) -> str | None:
     """Return the best available mid-price column name."""
     for column in ("close_mid", "avg_mid_price", "avg_mid"):
@@ -248,6 +245,8 @@ def get_walk_forward_feature_columns(feature_set: str) -> tuple[str, ...]:
     mode = parse_feature_set(feature_set)
     if mode == "basic":
         return FEATURE_COLUMNS
+    if mode == "candidate_c_core":
+        return CANDIDATE_C_CORE_COLUMNS
     return FEATURE_COLUMNS + MICROSTRUCTURE_EXTRA_COLUMNS
 
 
@@ -476,22 +475,30 @@ def build_feature_metadata(
     feature_set: str,
     feature_columns: tuple[str, ...],
     skipped_microstructure_features: list[str] | None = None,
+    skipped_candidate_c_core_features: list[str] | None = None,
 ) -> dict[str, Any]:
     """Build report metadata for the active feature set."""
     mode = parse_feature_set(feature_set)
     columns = list(feature_columns)
-    skipped = list(skipped_microstructure_features or [])
+    micro_skipped = list(skipped_microstructure_features or [])
+    core_skipped = list(skipped_candidate_c_core_features or [])
     metadata: dict[str, Any] = {
         "feature_set": mode,
         "feature_columns": columns,
         "feature_count": len(columns),
-        "skipped_microstructure_features": skipped,
+        "skipped_microstructure_features": micro_skipped,
+        "skipped_candidate_c_core_features": core_skipped,
         "feature_warning": None,
     }
     if mode == "microstructure" and len(columns) < MIN_MICROSTRUCTURE_FEATURE_COUNT:
         metadata["feature_warning"] = (
             f"too_few_features: only {len(columns)} columns available "
             f"(expected at least {MIN_MICROSTRUCTURE_FEATURE_COUNT})"
+        )
+    elif mode == "candidate_c_core" and len(columns) < MIN_CANDIDATE_C_CORE_FEATURE_COUNT:
+        metadata["feature_warning"] = (
+            f"too_few_features: only {len(columns)} columns available "
+            f"(expected at least {MIN_CANDIDATE_C_CORE_FEATURE_COUNT})"
         )
     return metadata
 
@@ -533,12 +540,32 @@ def create_walk_forward_features(
     df: pd.DataFrame,
     *,
     feature_set: str = DEFAULT_FEATURE_SET,
+    interval: str = "15s",
 ) -> tuple[pd.DataFrame, dict[str, Any]]:
     """Create model features for walk-forward evaluation."""
     mode = parse_feature_set(feature_set)
     prepared_df, missing_sources = _prepare_source_columns_for_basic_features(df)
-    featured_df = create_features(prepared_df)
     skipped: list[str] = sorted(_basic_features_blocked_by_missing_sources(missing_sources))
+
+    if mode == "candidate_c_core":
+        featured_df, core_skipped = create_candidate_c_core_features(
+            prepared_df,
+            interval=interval,
+        )
+        skipped = sorted(set(skipped) | set(core_skipped))
+        feature_columns = tuple(
+            column
+            for column in CANDIDATE_C_CORE_COLUMNS
+            if column in featured_df.columns and column not in core_skipped
+        )
+        metadata = build_feature_metadata(
+            feature_set=mode,
+            feature_columns=feature_columns,
+            skipped_candidate_c_core_features=skipped,
+        )
+        return featured_df, metadata
+
+    featured_df = create_features(prepared_df)
 
     if mode == "microstructure":
         featured_df, micro_skipped = _add_microstructure_features(
@@ -2080,6 +2107,27 @@ def finalize_accepted_trades_csv(
     report["accepted_trades_count"] = 0
 
 
+def _momentum_baseline_predictions(
+    test_df: pd.DataFrame,
+    feature_columns: tuple[str, ...],
+) -> list[str]:
+    """Rule-style momentum baseline using the best available return column."""
+    if "mid_return_1" in feature_columns and "mid_return_1" in test_df.columns:
+        return RuleBaseline().predict(test_df)
+    for column in ("return_1", "return_15s_bps"):
+        if column in test_df.columns:
+            predictions: list[str] = []
+            for value in test_df[column]:
+                if value > 0:
+                    predictions.append("UP")
+                elif value < 0:
+                    predictions.append("DOWN")
+                else:
+                    predictions.append("FLAT")
+            return predictions
+    return ["FLAT"] * len(test_df)
+
+
 def evaluate_walk_forward_window(
     model_df: pd.DataFrame,
     window: tuple[int, int, int, int],
@@ -2118,10 +2166,9 @@ def evaluate_walk_forward_window(
     sklearn_result = train_walk_forward_sklearn_model(train_df, feature_columns)
 
     majority_model: MajorityClassBaseline = baseline["majority_model"]
-    rule_model: RuleBaseline = baseline["rule_model"]
     baseline_predictions = majority_model.predict(test_df)
     no_trade_predictions = _no_trade_predictions(len(test_df))
-    momentum_predictions = rule_model.predict(walk_forward_feature_matrix(test_df, feature_columns))
+    momentum_predictions = _momentum_baseline_predictions(test_df, feature_columns)
     sklearn_predictions = predict_walk_forward_sklearn(
         sklearn_result,
         test_df,
@@ -2316,6 +2363,7 @@ def evaluate_coin_walk_forward(
     featured_df, feature_meta = create_walk_forward_features(
         raw_df,
         feature_set=feature_set,
+        interval=interval,
     )
     feature_columns = tuple(feature_meta["feature_columns"])
     labeled_df, label_meta = create_walk_forward_labels(
@@ -2580,6 +2628,7 @@ def build_walk_forward_report(
     feature_set: str = DEFAULT_FEATURE_SET,
     feature_columns: tuple[str, ...] | None = None,
     skipped_microstructure_features: list[str] | None = None,
+    skipped_candidate_c_core_features: list[str] | None = None,
     feature_warning: str | None = None,
     stability_report_enabled: bool = False,
     stability_min_trades_per_bucket: int = DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
@@ -2747,14 +2796,19 @@ def build_walk_forward_report(
         if per_coin_results
         else get_walk_forward_feature_columns(feature_set)
     )
-    resolved_skipped = list(
+    resolved_skipped_micro = list(
         skipped_microstructure_features
         or (per_coin_results[0].get("skipped_microstructure_features", []) if per_coin_results else [])
+    )
+    resolved_skipped_core = list(
+        skipped_candidate_c_core_features
+        or (per_coin_results[0].get("skipped_candidate_c_core_features", []) if per_coin_results else [])
     )
     feature_metadata = build_feature_metadata(
         feature_set=feature_set,
         feature_columns=resolved_feature_columns,
-        skipped_microstructure_features=resolved_skipped,
+        skipped_microstructure_features=resolved_skipped_micro,
+        skipped_candidate_c_core_features=resolved_skipped_core,
     )
     if feature_warning:
         feature_metadata["feature_warning"] = feature_warning
@@ -2929,6 +2983,26 @@ def write_walk_forward_markdown(
             f"- label {label}: count={stats.get('count', 0)} "
             f"fraction={stats.get('fraction', 0.0):.4f}"
         )
+
+    feature_columns = report.get("feature_columns", [])
+    lines.extend(
+        [
+            "",
+            "## Features",
+            "",
+            f"- feature_set: {report.get('feature_set', DEFAULT_FEATURE_SET)}",
+            f"- feature_count: {report.get('feature_count', len(feature_columns))}",
+            f"- feature_columns: {', '.join(feature_columns) if feature_columns else 'n/a'}",
+        ]
+    )
+    skipped_core = report.get("skipped_candidate_c_core_features", [])
+    if skipped_core:
+        lines.append(f"- skipped_candidate_c_core_features: {', '.join(skipped_core)}")
+    skipped_micro = report.get("skipped_microstructure_features", [])
+    if skipped_micro:
+        lines.append(f"- skipped_microstructure_features: {', '.join(skipped_micro)}")
+    if report.get("feature_warning"):
+        lines.append(f"- feature_warning: {report['feature_warning']}")
 
     lines.extend(
         [
@@ -3241,11 +3315,18 @@ def run_walk_forward_evaluation(
         if per_coin_results and per_coin_results[0].get("feature_columns")
         else get_walk_forward_feature_columns(feature_set)
     )
-    aggregate_skipped = sorted(
+    aggregate_skipped_micro = sorted(
         {
             feature_name
             for item in per_coin_results
             for feature_name in item.get("skipped_microstructure_features", [])
+        }
+    )
+    aggregate_skipped_core = sorted(
+        {
+            feature_name
+            for item in per_coin_results
+            for feature_name in item.get("skipped_candidate_c_core_features", [])
         }
     )
     aggregate_feature_warning = next(
@@ -3279,7 +3360,8 @@ def run_walk_forward_evaluation(
         label_min_edge_bps=label_min_edge_bps,
         feature_set=feature_set,
         feature_columns=aggregate_feature_columns,
-        skipped_microstructure_features=aggregate_skipped,
+        skipped_microstructure_features=aggregate_skipped_micro,
+        skipped_candidate_c_core_features=aggregate_skipped_core,
         feature_warning=aggregate_feature_warning,
         stability_report_enabled=stability_report_enabled,
         stability_min_trades_per_bucket=stability_min_trades_per_bucket,
@@ -3380,7 +3462,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--feature-set",
         default=DEFAULT_FEATURE_SET,
         choices=sorted(SUPPORTED_FEATURE_SETS),
-        help="Feature set: basic (default) or microstructure",
+        help="Feature set: basic (default), microstructure, or candidate_c_core",
     )
     parser.add_argument(
         "--train-bars",

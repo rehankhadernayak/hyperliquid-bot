@@ -12,6 +12,7 @@ import pytest
 
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
+from bid_ask_features import CANDIDATE_C_CORE_COLUMNS, assert_no_future_feature_columns
 from bid_ask_train import FEATURE_COLUMNS, create_features, create_labels
 from bid_ask_walk_forward_evaluator import (
     ACCEPTED_TRADES_CSV_COLUMNS,
@@ -356,11 +357,13 @@ class TestFeatureSets:
     def test_parse_feature_set(self) -> None:
         assert parse_feature_set("basic") == "basic"
         assert parse_feature_set("microstructure") == "microstructure"
+        assert parse_feature_set("candidate_c_core") == "candidate_c_core"
         with pytest.raises(ValueError):
             parse_feature_set("invalid")
 
     def test_get_walk_forward_feature_columns(self) -> None:
         assert get_walk_forward_feature_columns("basic") == FEATURE_COLUMNS
+        assert get_walk_forward_feature_columns("candidate_c_core") == CANDIDATE_C_CORE_COLUMNS
         micro_columns = get_walk_forward_feature_columns("microstructure")
         assert micro_columns[: len(FEATURE_COLUMNS)] == FEATURE_COLUMNS
         assert len(micro_columns) == len(FEATURE_COLUMNS) + len(MICROSTRUCTURE_EXTRA_COLUMNS)
@@ -371,6 +374,92 @@ class TestFeatureSets:
         featured, meta = create_walk_forward_features(raw_df, feature_set="microstructure")
         matrix = walk_forward_feature_matrix(featured, tuple(meta["feature_columns"]))
         assert list(matrix.columns) == meta["feature_columns"]
+
+    def test_candidate_c_core_feature_set_creates_expected_columns(self) -> None:
+        rows = _make_resampled_rows(count=80)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, meta = create_walk_forward_features(
+            raw_df,
+            feature_set="candidate_c_core",
+            interval="15s",
+        )
+
+        assert meta["feature_set"] == "candidate_c_core"
+        assert meta["feature_columns"] == list(CANDIDATE_C_CORE_COLUMNS)
+        assert meta["feature_count"] == len(CANDIDATE_C_CORE_COLUMNS)
+        for column in CANDIDATE_C_CORE_COLUMNS:
+            assert column in featured.columns
+
+    def test_candidate_c_core_excludes_future_return_columns(self) -> None:
+        rows = _make_resampled_rows(count=40)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        _, meta = create_walk_forward_features(raw_df, feature_set="candidate_c_core", interval="15s")
+        assert_no_future_feature_columns(meta["feature_columns"])
+
+    def test_candidate_c_core_rolling_features_are_causal(self) -> None:
+        rows = _make_resampled_rows(count=60, mid_start=100.0, mid_step=1.0)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, _ = create_walk_forward_features(
+            raw_df,
+            feature_set="candidate_c_core",
+            interval="15s",
+        )
+
+        altered = raw_df.copy()
+        altered.loc[altered.index[-1], "close_mid"] = (
+            altered.loc[altered.index[-1], "close_mid"] * 2
+        )
+        altered_featured, _ = create_walk_forward_features(
+            altered,
+            feature_set="candidate_c_core",
+            interval="15s",
+        )
+
+        for column in CANDIDATE_C_CORE_COLUMNS:
+            pd.testing.assert_series_equal(
+                featured[column].iloc[:-1],
+                altered_featured[column].iloc[:-1],
+                check_names=False,
+            )
+
+    def test_cli_parses_candidate_c_core_feature_set(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--feature-set", "candidate_c_core"])
+        assert args.feature_set == "candidate_c_core"
+
+    def test_parse_feature_set_candidate_c_core(self) -> None:
+        assert parse_feature_set("candidate_c_core") == "candidate_c_core"
+
+    def test_get_walk_forward_feature_columns_candidate_c_core(self) -> None:
+        assert get_walk_forward_feature_columns("candidate_c_core") == CANDIDATE_C_CORE_COLUMNS
+
+    def test_candidate_c_core_walk_forward_runs_on_synthetic_data(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=80, mid_step=1.5))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            feature_set="candidate_c_core",
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["feature_set"] == "candidate_c_core"
+        assert report["feature_columns"] == list(CANDIDATE_C_CORE_COLUMNS)
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
 
 
 class TestCostAwareLabels:

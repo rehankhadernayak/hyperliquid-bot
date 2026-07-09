@@ -12,6 +12,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from bid_ask_features import (
+    CANDIDATE_C_CORE_COLUMNS,
+    build_candidate_c_core_metadata,
+    create_candidate_c_core_features,
+)
 from bid_ask_model_io import (
     DEFAULT_MODELS_DIR as MODEL_IO_DEFAULT_MODELS_DIR,
     _dump_artifact,
@@ -37,6 +42,8 @@ DEFAULT_REPORTS_DIR = Path("reports/bid_ask_training")
 DEFAULT_MODELS_DIR = MODEL_IO_DEFAULT_MODELS_DIR
 
 SUPPORTED_INTERVALS = frozenset({"15s", "1m"})
+DEFAULT_FEATURE_SET = "basic"
+TRAINING_SUPPORTED_FEATURE_SETS = frozenset({"basic", "candidate_c_core"})
 LABELS = ("UP", "DOWN", "FLAT")
 
 FEATURE_COLUMNS = (
@@ -91,6 +98,53 @@ def load_training_data(
         raise ValueError(f"Missing required columns in {path}: {missing}")
 
     return df.sort_values("start_timestamp_ms").reset_index(drop=True)
+
+
+def get_training_feature_columns(feature_set: str) -> tuple[str, ...]:
+    """Return ordered feature columns for the requested training feature set."""
+    mode = str(feature_set).strip().lower()
+    if mode not in TRAINING_SUPPORTED_FEATURE_SETS:
+        supported = ", ".join(sorted(TRAINING_SUPPORTED_FEATURE_SETS))
+        raise ValueError(f"Unsupported training feature_set {feature_set!r}; use one of: {supported}")
+    if mode == "candidate_c_core":
+        return CANDIDATE_C_CORE_COLUMNS
+    return FEATURE_COLUMNS
+
+
+def create_training_features(
+    df: pd.DataFrame,
+    *,
+    feature_set: str = DEFAULT_FEATURE_SET,
+    interval: str = "15s",
+) -> tuple[pd.DataFrame, dict[str, Any]]:
+    """Create model features for the requested training feature set."""
+    mode = str(feature_set).strip().lower()
+    if mode not in TRAINING_SUPPORTED_FEATURE_SETS:
+        supported = ", ".join(sorted(TRAINING_SUPPORTED_FEATURE_SETS))
+        raise ValueError(f"Unsupported training feature_set {feature_set!r}; use one of: {supported}")
+    if mode == "candidate_c_core":
+        featured_df, skipped = create_candidate_c_core_features(df, interval=interval)
+        feature_columns = tuple(
+            column
+            for column in CANDIDATE_C_CORE_COLUMNS
+            if column in featured_df.columns and column not in skipped
+        )
+        metadata = build_candidate_c_core_metadata(
+            feature_columns=feature_columns,
+            skipped_candidate_c_core_features=skipped,
+        )
+        return featured_df, metadata
+
+    featured_df = create_features(df)
+    metadata = {
+        "feature_set": mode,
+        "feature_columns": list(FEATURE_COLUMNS),
+        "feature_count": len(FEATURE_COLUMNS),
+        "skipped_microstructure_features": [],
+        "skipped_candidate_c_core_features": [],
+        "feature_warning": None,
+    }
+    return featured_df, metadata
 
 
 def create_features(df: pd.DataFrame) -> pd.DataFrame:
@@ -154,15 +208,27 @@ def chronological_train_test_split(
     return train_df, test_df
 
 
-def _feature_matrix(df: pd.DataFrame) -> pd.DataFrame:
-    matrix = df[list(FEATURE_COLUMNS)].copy()
-    matrix["avg_bbo_imbalance"] = matrix["avg_bbo_imbalance"].fillna(0.0)
-    matrix["bbo_imbalance_change_1"] = matrix["bbo_imbalance_change_1"].fillna(0.0)
+def _feature_matrix(
+    df: pd.DataFrame,
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
+) -> pd.DataFrame:
+    matrix = df[list(feature_columns)].copy()
+    for column in (
+        "avg_bbo_imbalance",
+        "bbo_imbalance",
+        "bbo_imbalance_change_1",
+        "imbalance_change_1",
+    ):
+        if column in matrix.columns:
+            matrix[column] = matrix[column].fillna(0.0)
     return matrix.astype(float)
 
 
-def _rows_ready_for_model(df: pd.DataFrame) -> pd.DataFrame:
-    required = list(FEATURE_COLUMNS) + ["label", "future_return_bps", MID_PRICE_COLUMN]
+def _rows_ready_for_model(
+    df: pd.DataFrame,
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
+) -> pd.DataFrame:
+    required = list(feature_columns) + ["label", "future_return_bps", MID_PRICE_COLUMN]
     return df.dropna(subset=required).reset_index(drop=True)
 
 
@@ -219,6 +285,7 @@ def train_baseline_model(
 
 def train_optional_sklearn_model(
     train_df: pd.DataFrame,
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
 ) -> dict[str, Any]:
     """Train sklearn classifier when available; otherwise return skip metadata."""
     if not _SKLEARN_AVAILABLE:
@@ -228,7 +295,7 @@ def train_optional_sklearn_model(
             "message": "sklearn not installed; using baseline models only",
         }
 
-    X_train = _feature_matrix(train_df)
+    X_train = _feature_matrix(train_df, feature_columns)
     y_train = train_df["label"].tolist()
     if len(X_train) == 0:
         return {
@@ -262,12 +329,13 @@ def train_optional_sklearn_model(
 def _predict_sklearn(
     sklearn_result: dict[str, Any],
     test_df: pd.DataFrame,
+    feature_columns: tuple[str, ...] = FEATURE_COLUMNS,
 ) -> list[str] | None:
     model = sklearn_result.get("model")
     scaler = sklearn_result.get("scaler")
     if model is None or scaler is None:
         return None
-    X_test = _feature_matrix(test_df)
+    X_test = _feature_matrix(test_df, feature_columns)
     if len(X_test) == 0:
         return []
     predictions = model.predict(scaler.transform(X_test))
@@ -467,6 +535,9 @@ def build_training_report(
     model_used: str,
     source: str = "local",
     data_dir: str | None = None,
+    feature_set: str = DEFAULT_FEATURE_SET,
+    feature_columns: tuple[str, ...] | None = None,
+    skipped_candidate_c_core_features: list[str] | None = None,
 ) -> dict[str, Any]:
     model_accuracy = float(evaluation.get("accuracy", 0.0))
     baseline_accuracy = float(evaluation.get("baseline_accuracy", 0.0))
@@ -484,11 +555,19 @@ def build_training_report(
     test_label_counts = _normalize_label_counts(label_counts_data.get("test"))
     overall_label_counts = _combined_label_counts(train_label_counts, test_label_counts)
 
+    resolved_feature_columns = tuple(
+        feature_columns or get_training_feature_columns(feature_set)
+    )
+
     return {
         "coin": coin,
         "interval": interval,
         "source": normalize_source(source),
         "data_dir": data_dir,
+        "feature_set": str(feature_set).strip().lower(),
+        "feature_columns": list(resolved_feature_columns),
+        "feature_count": len(resolved_feature_columns),
+        "skipped_candidate_c_core_features": list(skipped_candidate_c_core_features or []),
         "horizon": horizon,
         "threshold_bps": threshold_bps,
         "train_fraction": train_fraction,
@@ -530,6 +609,7 @@ def run_training_pipeline(
     models_dir: Path = DEFAULT_MODELS_DIR,
     save_report: bool = True,
     source: str = "local",
+    feature_set: str = DEFAULT_FEATURE_SET,
 ) -> dict[str, Any]:
     """End-to-end training pipeline for CLI and tests."""
     normalized_source = normalize_source(source)
@@ -537,17 +617,22 @@ def run_training_pipeline(
     raw_df = load_training_data(coin, interval, data_root, source=normalized_source)
     if max_rows is not None and max_rows > 0:
         raw_df = raw_df.iloc[:max_rows].copy()
-    featured_df = create_features(raw_df)
+    featured_df, feature_meta = create_training_features(
+        raw_df,
+        feature_set=feature_set,
+        interval=interval,
+    )
+    feature_columns = tuple(feature_meta["feature_columns"])
     labeled_df = create_labels(featured_df, horizon=horizon, threshold_bps=threshold_bps)
-    model_df = _rows_ready_for_model(labeled_df)
+    model_df = _rows_ready_for_model(labeled_df, feature_columns)
 
     train_df, test_df = chronological_train_test_split(model_df, train_fraction)
     baseline = train_baseline_model(train_df)
-    sklearn_result = train_optional_sklearn_model(train_df)
+    sklearn_result = train_optional_sklearn_model(train_df, feature_columns)
 
     majority_model: MajorityClassBaseline = baseline["majority_model"]
     baseline_predictions = majority_model.predict(test_df)
-    sklearn_predictions = _predict_sklearn(sklearn_result, test_df)
+    sklearn_predictions = _predict_sklearn(sklearn_result, test_df, feature_columns)
 
     if sklearn_predictions is not None:
         predictions = sklearn_predictions
@@ -561,6 +646,7 @@ def run_training_pipeline(
         test_df=test_df,
         predictions=predictions,
         baseline_predictions=baseline_predictions,
+        features_used=feature_columns,
     )
 
     source_path = str(resampled_csv_path(coin, interval, data_root, source=normalized_source))
@@ -577,6 +663,11 @@ def run_training_pipeline(
         model_used=model_used,
         source=normalized_source,
         data_dir=str(data_dir),
+        feature_set=feature_set,
+        feature_columns=feature_columns,
+        skipped_candidate_c_core_features=feature_meta.get(
+            "skipped_candidate_c_core_features", []
+        ),
     )
 
     artifact_payload: dict[str, Any] | None = None
@@ -584,7 +675,7 @@ def run_training_pipeline(
         artifact_payload = build_artifact_payload(
             model=sklearn_result["model"],
             scaler=sklearn_result.get("scaler"),
-            feature_names=FEATURE_COLUMNS,
+            feature_names=feature_columns,
             coin=coin,
             interval=interval,
             horizon=horizon,
@@ -673,6 +764,12 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         default=DEFAULT_REPORTS_DIR,
         help="Directory for JSON training reports",
     )
+    parser.add_argument(
+        "--feature-set",
+        default=DEFAULT_FEATURE_SET,
+        choices=sorted(TRAINING_SUPPORTED_FEATURE_SETS),
+        help="Feature set: basic (default) or candidate_c_core",
+    )
     return parser
 
 
@@ -687,10 +784,13 @@ def main(argv: list[str] | None = None) -> int:
         data_root=args.data_root,
         reports_dir=args.reports_dir,
         source=args.source,
+        feature_set=args.feature_set,
     )
     evaluation = result["evaluation"]
     report = result["report"]
     print(f"coin={args.coin.upper()} interval={args.interval} horizon={args.horizon}")
+    print(f"feature_set={report.get('feature_set', DEFAULT_FEATURE_SET)}")
+    print(f"feature_count={report.get('feature_count', len(FEATURE_COLUMNS))}")
     print(f"source={report['source']} data_dir={report['data_dir']}")
     print(f"train_rows={evaluation['train_rows']} test_rows={evaluation['test_rows']}")
     print(f"accuracy={evaluation['accuracy']:.4f} baseline_accuracy={evaluation['baseline_accuracy']:.4f}")

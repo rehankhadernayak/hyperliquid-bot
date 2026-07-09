@@ -12,6 +12,7 @@ import pytest
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS
 from bid_ask_model_io import build_artifact_payload, load_model_artifact
+from bid_ask_features import CANDIDATE_C_CORE_COLUMNS, assert_no_future_feature_columns
 from bid_ask_train import (
     EXECUTION_ENABLED,
     FEATURE_COLUMNS,
@@ -24,7 +25,9 @@ from bid_ask_train import (
     chronological_train_test_split,
     create_features,
     create_labels,
+    create_training_features,
     evaluate_predictions,
+    get_training_feature_columns,
     load_training_data,
     main,
     run_training_pipeline,
@@ -152,6 +155,83 @@ class TestCreateFeatures:
         assert row["bbo_imbalance_change_1"] == pytest.approx(
             row["avg_bbo_imbalance"] - featured.iloc[9]["avg_bbo_imbalance"]
         )
+
+
+class TestCandidateCCoreFeatures:
+    def test_create_training_features_candidate_c_core_columns(self) -> None:
+        rows = _make_resampled_rows(count=40)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, meta = create_training_features(
+            raw_df,
+            feature_set="candidate_c_core",
+            interval="15s",
+        )
+
+        assert meta["feature_set"] == "candidate_c_core"
+        assert meta["feature_columns"] == list(CANDIDATE_C_CORE_COLUMNS)
+        assert meta["feature_count"] == len(CANDIDATE_C_CORE_COLUMNS)
+        for column in CANDIDATE_C_CORE_COLUMNS:
+            assert column in featured.columns
+
+    def test_no_future_return_columns_in_candidate_c_core_features(self) -> None:
+        rows = _make_resampled_rows(count=30)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        _, meta = create_training_features(raw_df, feature_set="candidate_c_core", interval="15s")
+        assert_no_future_feature_columns(meta["feature_columns"])
+        assert "future_return_bps" not in meta["feature_columns"]
+
+    def test_candidate_c_core_rolling_features_are_causal(self) -> None:
+        rows = _make_resampled_rows(count=60, mid_start=100.0, mid_step=1.0)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, _ = create_training_features(raw_df, feature_set="candidate_c_core", interval="15s")
+
+        altered = raw_df.copy()
+        altered.loc[altered.index[-1], "close_mid"] = (
+            altered.loc[altered.index[-1], "close_mid"] * 2
+        )
+        altered_featured, _ = create_training_features(
+            altered,
+            feature_set="candidate_c_core",
+            interval="15s",
+        )
+
+        for column in CANDIDATE_C_CORE_COLUMNS:
+            pd.testing.assert_series_equal(
+                featured[column].iloc[:-1],
+                altered_featured[column].iloc[:-1],
+                check_names=False,
+            )
+
+    def test_get_training_feature_columns(self) -> None:
+        assert get_training_feature_columns("basic") == FEATURE_COLUMNS
+        assert get_training_feature_columns("candidate_c_core") == CANDIDATE_C_CORE_COLUMNS
+
+    def test_cli_accepts_candidate_c_core_feature_set(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            ["--coin", "BTC", "--interval", "15s", "--feature-set", "candidate_c_core"]
+        )
+        assert args.feature_set == "candidate_c_core"
+
+    def test_training_report_includes_candidate_c_core_metadata(
+        self, data_root: Path, tmp_path: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=40))
+        result = run_training_pipeline(
+            coin="BTC",
+            interval="15s",
+            horizon=1,
+            data_root=data_root,
+            reports_dir=tmp_path / "reports",
+            models_dir=tmp_path / "models",
+            feature_set="candidate_c_core",
+        )
+        report = result["report"]
+        assert report["feature_set"] == "candidate_c_core"
+        assert report["feature_columns"] == list(CANDIDATE_C_CORE_COLUMNS)
+        assert report["feature_count"] == len(CANDIDATE_C_CORE_COLUMNS)
+        assert result["evaluation"]["features_used"] == list(CANDIDATE_C_CORE_COLUMNS)
 
 
 class TestCreateLabels:
