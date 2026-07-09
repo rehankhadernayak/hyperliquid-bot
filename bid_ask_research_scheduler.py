@@ -122,6 +122,7 @@ LAUNCHD_RESEARCH_SESSION_EVENING_PLIST = "com.hyperliquid.research.session.eveni
 LAUNCHD_RESEARCH_SESSION_SETUP_MD = "launchd_research_session_setup.md"
 DEFAULT_RESEARCH_SESSION_DURATION_HOURS = 8
 DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES = 60
+DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES = 55
 DEFAULT_RESEARCH_SESSION_MORNING_HOUR = 8
 DEFAULT_RESEARCH_SESSION_EVENING_HOUR = 16
 DEFAULT_RESEARCH_SESSION_OUTPUT_DIR = Path("launchd")
@@ -4218,6 +4219,58 @@ def _dashboard_phase_audit_paths(
     )
 
 
+class ResearchSessionTickStageTracker:
+    """Record ordered research-session tick stages with UTC timestamps and elapsed seconds."""
+
+    def __init__(
+        self,
+        *,
+        tick_index: int,
+        tick_timeout_minutes: int | None = None,
+        now_fn: Any | None = None,
+    ) -> None:
+        self.tick_index = tick_index
+        self.tick_timeout_seconds = (
+            float(tick_timeout_minutes) * 60.0 if tick_timeout_minutes is not None else None
+        )
+        self._now = now_fn or (lambda: datetime.now(timezone.utc))
+        self.tick_started_at = self._now()
+        self.stage_events: list[dict[str, Any]] = []
+
+    def elapsed_seconds(self) -> float:
+        return (self._now() - self.tick_started_at).total_seconds()
+
+    def record_stage(self, stage_name: str) -> None:
+        event = {
+            "name": stage_name,
+            "timestamp": self._now().isoformat().replace("+00:00", "Z"),
+            "elapsed_seconds": round(self.elapsed_seconds(), 3),
+        }
+        self.stage_events.append(event)
+        print(
+            "[research-session] "
+            f"tick={self.tick_index} "
+            f"stage={stage_name} "
+            f"timestamp={event['timestamp']} "
+            f"elapsed_seconds={event['elapsed_seconds']}",
+            flush=True,
+        )
+
+    def timeout_failure_after_last_stage(self) -> str | None:
+        if self.tick_timeout_seconds is None:
+            return None
+        if self.elapsed_seconds() <= self.tick_timeout_seconds:
+            return None
+        last_stage = self.stage_events[-1]["name"] if self.stage_events else "tick_start"
+        return f"tick timeout exceeded after stage {last_stage}"
+
+    def check_timeout_before_stage(self, _next_stage: str) -> str | None:
+        failure = self.timeout_failure_after_last_stage()
+        if failure is None:
+            return None
+        return failure
+
+
 def _resolve_research_session_coins(
     state_path: Path,
     coins: list[str] | None,
@@ -4305,6 +4358,7 @@ def _build_research_session_tick_summary(
     resample_ran: bool = False,
     warnings: list[str] | None = None,
     failures: list[str] | None = None,
+    stage_events: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     post_btc_ts, post_eth_ts = _extract_coin_latest_timestamps(post_audit)
     summary: dict[str, Any] = {
@@ -4332,6 +4386,7 @@ def _build_research_session_tick_summary(
         "resample_validate_ran": resample_ran,
         "warnings": list(warnings or []),
         "failures": list(failures or []),
+        "stage_events": list(stage_events or []),
     }
     if candidate_report is not None:
         summary["candidate_trades"] = int(candidate_report.get("filtered_paper_trades") or 0)
@@ -4358,6 +4413,7 @@ def format_research_session_markdown(session: dict[str, Any]) -> str:
         f"- ended_at: {session.get('ended_at')}",
         f"- duration_hours: {session.get('duration_hours')}",
         f"- tick_interval_minutes: {session.get('tick_interval_minutes')}",
+        f"- tick_timeout_minutes: {session.get('tick_timeout_minutes')}",
         f"- ticks_planned: {session.get('ticks_planned')}",
         f"- ticks_completed: {session.get('ticks_completed')}",
         f"- coins: {', '.join(session.get('coins') or [])}",
@@ -4396,6 +4452,17 @@ def format_research_session_markdown(session: dict[str, Any]) -> str:
             lines.append(f"- warning: {warning}")
         for failure in tick.get("failures") or []:
             lines.append(f"- failure: {failure}")
+        stage_events = tick.get("stage_events") or []
+        if stage_events:
+            lines.append("")
+            lines.append("#### Stage events")
+            lines.append("")
+            for event in stage_events:
+                lines.append(
+                    f"- {event.get('name')}: "
+                    f"{event.get('timestamp')} "
+                    f"({event.get('elapsed_seconds')}s)"
+                )
         lines.append("")
 
     final_summary = session.get("final_summary") or {}
@@ -4472,14 +4539,60 @@ def _execute_research_session_tick(
     chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
     audit_json_path: Path | None = None,
     audit_markdown_path: Path | None = None,
+    tick_timeout_minutes: int | None = DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES,
+    now_fn: Any | None = None,
 ) -> dict[str, Any]:
     started_at = _utc_now_iso()
     tick_warnings: list[str] = []
     tick_failures: list[str] = []
+    tracker = ResearchSessionTickStageTracker(
+        tick_index=tick_index,
+        tick_timeout_minutes=tick_timeout_minutes,
+        now_fn=now_fn,
+    )
 
     json_path = audit_json_path if update_dashboard_artifacts else None
     markdown_path = audit_markdown_path if update_dashboard_artifacts else None
 
+    def _timeout_before(stage_name: str) -> bool:
+        failure = tracker.check_timeout_before_stage(stage_name)
+        if failure is None:
+            return False
+        tick_failures.append(failure)
+        return True
+
+    def _finish_tick(
+        *,
+        pre_audit: dict[str, Any] | None = None,
+        post_audit: dict[str, Any] | None = None,
+        autopilot_report: AutopilotReport | None = None,
+        candidate_report: dict[str, Any] | None = None,
+        relaxed_report: dict[str, Any] | None = None,
+        resample_ran: bool = False,
+    ) -> dict[str, Any]:
+        tracker.record_stage("tick_done")
+        ended_at = _utc_now_iso()
+        return _build_research_session_tick_summary(
+            tick_index=tick_index,
+            started_at=started_at,
+            ended_at=ended_at,
+            pre_audit=pre_audit or {"imported_historical_1s": {}},
+            post_audit=post_audit or pre_audit or {"imported_historical_1s": {}},
+            autopilot_report=autopilot_report or AutopilotReport(),
+            candidate_report=candidate_report,
+            relaxed_report=relaxed_report,
+            resample_ran=resample_ran,
+            warnings=tick_warnings,
+            failures=tick_failures,
+            stage_events=tracker.stage_events,
+        )
+
+    tracker.record_stage("tick_start")
+
+    if _timeout_before("pre_audit_start"):
+        return _finish_tick()
+
+    tracker.record_stage("pre_audit_start")
     pre_audit = cmd_phase_backfill_audit(
         coins=coins,
         source=source,
@@ -4492,7 +4605,11 @@ def _execute_research_session_tick(
         markdown_path=markdown_path,
         chunk_size_hours=chunk_size_hours,
     )
+    tracker.record_stage("pre_audit_done")
+    if _timeout_before("autopilot_tick_start"):
+        return _finish_tick(pre_audit=pre_audit)
 
+    tracker.record_stage("autopilot_tick_start")
     autopilot_report = cmd_autopilot_tick(
         coins=coins,
         chunk_size_hours=chunk_size_hours,
@@ -4503,7 +4620,11 @@ def _execute_research_session_tick(
         state_path=state_path,
         runs_dir=runs_dir,
     )
+    tracker.record_stage("autopilot_tick_done")
+    if _timeout_before("post_audit_start"):
+        return _finish_tick(pre_audit=pre_audit, autopilot_report=autopilot_report)
 
+    tracker.record_stage("post_audit_start")
     post_audit = cmd_phase_backfill_audit(
         coins=coins,
         source=source,
@@ -4512,13 +4633,21 @@ def _execute_research_session_tick(
         downloads_root=downloads_root,
         candidate_reports_dir=candidate_reports_dir,
         state_path=state_path,
-        json_path=json_path,
-        markdown_path=markdown_path,
+        json_path=None,
+        markdown_path=None,
         chunk_size_hours=chunk_size_hours,
     )
+    tracker.record_stage("post_audit_done")
 
     resample_ran = False
     if _historical_1s_coverage_advanced(pre_audit, post_audit, coins=RESEARCH_SESSION_RESAMPLE_COINS):
+        if _timeout_before("resample_validate_start"):
+            return _finish_tick(
+                pre_audit=pre_audit,
+                post_audit=post_audit,
+                autopilot_report=autopilot_report,
+            )
+        tracker.record_stage("resample_validate_start")
         resample_report = orchestrator.cmd_resample_validate(
             coins=RESEARCH_SESSION_RESAMPLE_COINS,
             source=source,
@@ -4528,9 +4657,18 @@ def _execute_research_session_tick(
         resample_ran = True
         tick_warnings.extend(resample_report.warnings)
         tick_failures.extend(resample_report.failures)
+        tracker.record_stage("resample_validate_done")
 
     candidate_report: dict[str, Any] | None = None
     if run_candidate_tests:
+        if _timeout_before("candidate_validation_start"):
+            return _finish_tick(
+                pre_audit=pre_audit,
+                post_audit=post_audit,
+                autopilot_report=autopilot_report,
+                resample_ran=resample_ran,
+            )
+        tracker.record_stage("candidate_validation_start")
         try:
             candidate_report = candidate_validator.run_candidate_validation(
                 source=source,
@@ -4542,9 +4680,19 @@ def _execute_research_session_tick(
             )
         except Exception as exc:  # noqa: BLE001
             tick_failures.append(f"candidate validation failed: {exc}")
+        tracker.record_stage("candidate_validation_done")
 
     relaxed_report: dict[str, Any] | None = None
     if run_relaxed_candidate_test:
+        if _timeout_before("relaxed_candidate_validation_start"):
+            return _finish_tick(
+                pre_audit=pre_audit,
+                post_audit=post_audit,
+                autopilot_report=autopilot_report,
+                candidate_report=candidate_report,
+                resample_ran=resample_ran,
+            )
+        tracker.record_stage("relaxed_candidate_validation_start")
         try:
             relaxed_report = _run_relaxed_candidate_b_validation(
                 source=source,
@@ -4554,20 +4702,41 @@ def _execute_research_session_tick(
             )
         except Exception as exc:  # noqa: BLE001
             tick_failures.append(f"relaxed candidate validation failed: {exc}")
+        tracker.record_stage("relaxed_candidate_validation_done")
 
-    ended_at = _utc_now_iso()
-    return _build_research_session_tick_summary(
-        tick_index=tick_index,
-        started_at=started_at,
-        ended_at=ended_at,
+    if _timeout_before("dashboard_refresh_start"):
+        return _finish_tick(
+            pre_audit=pre_audit,
+            post_audit=post_audit,
+            autopilot_report=autopilot_report,
+            candidate_report=candidate_report,
+            relaxed_report=relaxed_report,
+            resample_ran=resample_ran,
+        )
+
+    tracker.record_stage("dashboard_refresh_start")
+    if update_dashboard_artifacts:
+        post_audit = cmd_phase_backfill_audit(
+            coins=coins,
+            source=source,
+            reports_dir=runs_dir,
+            data_root=data_root,
+            downloads_root=downloads_root,
+            candidate_reports_dir=candidate_reports_dir,
+            state_path=state_path,
+            json_path=json_path,
+            markdown_path=markdown_path,
+            chunk_size_hours=chunk_size_hours,
+        )
+    tracker.record_stage("dashboard_refresh_done")
+
+    return _finish_tick(
         pre_audit=pre_audit,
         post_audit=post_audit,
         autopilot_report=autopilot_report,
         candidate_report=candidate_report,
         relaxed_report=relaxed_report,
         resample_ran=resample_ran,
-        warnings=tick_warnings,
-        failures=tick_failures,
     )
 
 
@@ -4575,6 +4744,7 @@ def cmd_research_session(
     *,
     duration_hours: float = DEFAULT_RESEARCH_SESSION_DURATION_HOURS,
     tick_interval_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
+    tick_timeout_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES,
     coins: list[str] | None = None,
     source: str = "historical",
     aws_profile: str | None = None,
@@ -4595,10 +4765,15 @@ def cmd_research_session(
     chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS,
     sleep_fn: Any | None = None,
     now_fn: Any | None = None,
+    tick_now_fn: Any | None = None,
 ) -> dict[str, Any]:
     """Run a bounded paper-only research session with periodic safe research ticks."""
     normalized_coins = _resolve_research_session_coins(state_path, coins)
     normalized_source = normalize_source(source)
+    if tick_interval_minutes < 1:
+        raise ValueError("tick-interval-minutes must be at least 1")
+    if tick_timeout_minutes < 1:
+        raise ValueError("tick-timeout-minutes must be at least 1")
     ticks_planned = _compute_research_session_ticks_planned(
         duration_hours,
         tick_interval_minutes,
@@ -4622,6 +4797,7 @@ def cmd_research_session(
         "ended_at": None,
         "duration_hours": duration_hours,
         "tick_interval_minutes": tick_interval_minutes,
+        "tick_timeout_minutes": tick_timeout_minutes,
         "ticks_planned": ticks_planned,
         "ticks_completed": 0,
         "coins": normalized_coins,
@@ -4701,8 +4877,22 @@ def cmd_research_session(
             chunk_size_hours=chunk_size_hours,
             audit_json_path=audit_json_path,
             audit_markdown_path=audit_markdown_path,
+            tick_timeout_minutes=tick_timeout_minutes,
+            now_fn=tick_now_fn,
         )
         per_tick_summaries.append(tick_summary)
+
+        tick_timed_out = any(
+            str(failure).startswith("tick timeout exceeded after stage")
+            for failure in tick_summary.get("failures") or []
+        )
+        if tick_timed_out:
+            stop_reason = next(
+                failure
+                for failure in tick_summary.get("failures") or []
+                if str(failure).startswith("tick timeout exceeded after stage")
+            )
+            break
 
         should_stop, stop_message = _research_session_should_stop(state_path)
         if should_stop:
@@ -4720,7 +4910,12 @@ def cmd_research_session(
     session["ended_at"] = _utc_now_iso()
     session["stop_reason"] = stop_reason
 
-    if stop_reason:
+    if stop_reason and str(stop_reason).startswith("tick timeout exceeded after stage"):
+        session["next_recommended_action"] = (
+            "Review tick stage_events and timeout settings; "
+            "rerun research-session after resolving the blocking stage"
+        )
+    elif stop_reason:
         session["next_recommended_action"] = (
             "Review stop_reason and autopilot status; "
             "configure-autopilot --resume if needed before next session"
@@ -4797,6 +4992,7 @@ def _build_research_session_program_arguments(
     scheduler_script: Path,
     duration_hours: float,
     tick_interval_minutes: int,
+    tick_timeout_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES,
     use_caffeinate: bool,
     caffeinate_flags: str = DEFAULT_CAFFEINATE_FLAGS,
 ) -> list[str]:
@@ -4808,6 +5004,8 @@ def _build_research_session_program_arguments(
         str(duration_hours),
         "--tick-interval-minutes",
         str(tick_interval_minutes),
+        "--tick-timeout-minutes",
+        str(tick_timeout_minutes),
     ]
     _append_research_session_bool_flags(session_args)
     if use_caffeinate:
@@ -5761,6 +5959,11 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
     )
+    research_session.add_argument(
+        "--tick-timeout-minutes",
+        type=int,
+        default=DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES,
+    )
     research_session.add_argument("--coins", nargs="+", default=None)
     research_session.add_argument("--source", default="historical")
     research_session.add_argument("--aws-profile", default=None)
@@ -6250,6 +6453,7 @@ def main(argv: list[str] | None = None) -> int:
             session = cmd_research_session(
                 duration_hours=args.duration_hours,
                 tick_interval_minutes=args.tick_interval_minutes,
+                tick_timeout_minutes=args.tick_timeout_minutes,
                 coins=args.coins,
                 source=args.source,
                 aws_profile=args.aws_profile,

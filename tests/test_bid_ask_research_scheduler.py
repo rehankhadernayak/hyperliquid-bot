@@ -5,6 +5,7 @@ from __future__ import annotations
 import ast
 import json
 import xml.etree.ElementTree as ET
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
@@ -4288,6 +4289,267 @@ class TestResearchSession:
         )
 
 
+class TestResearchSessionStageLogging:
+    _EXPECTED_STAGE_ORDER = [
+        "tick_start",
+        "pre_audit_start",
+        "pre_audit_done",
+        "autopilot_tick_start",
+        "autopilot_tick_done",
+        "post_audit_start",
+        "post_audit_done",
+        "candidate_validation_start",
+        "candidate_validation_done",
+        "relaxed_candidate_validation_start",
+        "relaxed_candidate_validation_done",
+        "dashboard_refresh_start",
+        "dashboard_refresh_done",
+        "tick_done",
+    ]
+
+    def test_successful_tick_records_ordered_stage_events(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        audit_payload = {"imported_historical_1s": {}}
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: audit_payload,
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_autopilot_tick",
+            lambda **kwargs: scheduler.AutopilotReport(action="chunk_completed"),
+        )
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "run_candidate_validation",
+            lambda **kwargs: {"filtered_paper_trades": 3, "cumulative_net_return_bps": 1.0},
+        )
+        monkeypatch.setattr(
+            scheduler.candidate_validator,
+            "summarize_candidate_validation_reports",
+            lambda **kwargs: "summary",
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "_run_relaxed_candidate_b_validation",
+            lambda **kwargs: {"filtered_paper_trades": 4, "cumulative_net_return_bps": 2.0},
+        )
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            max_ticks=1,
+            run_candidate_tests=True,
+            run_relaxed_candidate_test=True,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            sleep_fn=lambda _seconds: None,
+        )
+
+        tick = session["per_tick_summaries"][0]
+        stage_names = [event["name"] for event in tick["stage_events"]]
+        assert stage_names == self._EXPECTED_STAGE_ORDER
+
+    def test_stage_event_has_name_timestamp_elapsed_seconds(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: {"imported_historical_1s": {}},
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_autopilot_tick",
+            lambda **kwargs: scheduler.AutopilotReport(action="noop"),
+        )
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            max_ticks=1,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            sleep_fn=lambda _seconds: None,
+        )
+
+        event = session["per_tick_summaries"][0]["stage_events"][0]
+        assert set(event.keys()) == {"name", "timestamp", "elapsed_seconds"}
+        assert event["name"] == "tick_start"
+        assert event["timestamp"].endswith("Z")
+        assert event["elapsed_seconds"] == 0.0
+
+    def test_stdout_receives_stage_lines(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: {"imported_historical_1s": {}},
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_autopilot_tick",
+            lambda **kwargs: scheduler.AutopilotReport(action="noop"),
+        )
+        _block_network_subprocess(monkeypatch)
+
+        scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            max_ticks=1,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            sleep_fn=lambda _seconds: None,
+        )
+
+        captured = capsys.readouterr().out
+        assert "[research-session] tick=0 stage=tick_start" in captured
+        assert "elapsed_seconds=" in captured
+        assert "[research-session] tick=0 stage=tick_done" in captured
+
+    def test_timeout_before_next_stage_records_failure_and_ends_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        start = datetime(2026, 7, 8, 0, 0, 0, tzinfo=timezone.utc)
+        elapsed_seconds = {"value": 0}
+
+        def now_fn() -> datetime:
+            return start + timedelta(seconds=elapsed_seconds["value"])
+
+        def fake_audit(**kwargs: object) -> dict[str, object]:
+            elapsed_seconds["value"] = 120
+            return {"imported_historical_1s": {}}
+
+        monkeypatch.setattr(scheduler, "cmd_phase_backfill_audit", fake_audit)
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_autopilot_tick",
+            lambda **kwargs: scheduler.AutopilotReport(action="noop"),
+        )
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=8,
+            tick_interval_minutes=60,
+            max_ticks=3,
+            tick_timeout_minutes=1,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            tick_now_fn=now_fn,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        assert session["ticks_completed"] == 1
+        assert session["stop_reason"] == "tick timeout exceeded after stage pre_audit_done"
+        failure = session["per_tick_summaries"][0]["failures"][0]
+        assert failure == "tick timeout exceeded after stage pre_audit_done"
+        stage_names = [
+            event["name"] for event in session["per_tick_summaries"][0]["stage_events"]
+        ]
+        assert "autopilot_tick_start" not in stage_names
+        assert stage_names[-1] == "tick_done"
+
+    def test_partial_session_report_is_written_on_timeout(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        sessions_dir = tmp_path / "sessions"
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        start = datetime(2026, 7, 8, 0, 0, 0, tzinfo=timezone.utc)
+        elapsed_seconds = {"value": 0}
+
+        def now_fn() -> datetime:
+            return start + timedelta(seconds=elapsed_seconds["value"])
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: (
+                elapsed_seconds.__setitem__("value", 120) or {"imported_historical_1s": {}}
+            ),
+        )
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_autopilot_tick",
+            lambda **kwargs: scheduler.AutopilotReport(action="noop"),
+        )
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=8,
+            tick_interval_minutes=60,
+            max_ticks=2,
+            tick_timeout_minutes=1,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=sessions_dir,
+            data_root=tmp_path / "data",
+            tick_now_fn=now_fn,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        report_json = sessions_dir / f"research_session_{session['session_id']}.json"
+        report_md = sessions_dir / f"research_session_{session['session_id']}.md"
+        assert report_json.is_file()
+        assert report_md.is_file()
+        saved = json.loads(report_json.read_text(encoding="utf-8"))
+        assert saved["ticks_completed"] == 1
+        assert saved["stop_reason"].startswith("tick timeout exceeded after stage")
+        assert saved["per_tick_summaries"][0]["stage_events"]
+        assert "Stage events" in report_md.read_text(encoding="utf-8")
+
+
 class TestResearchSessionLaunchdTemplate:
     def test_writes_two_plists(self, tmp_path: Path) -> None:
         output_dir = tmp_path / "launchd"
@@ -4468,3 +4730,21 @@ class TestResearchSessionLaunchdTemplate:
         assert parsed.run_candidate_tests is True
         assert parsed.run_relaxed_candidate_test is True
         assert parsed.update_dashboard_artifacts is True
+        assert parsed.tick_timeout_minutes == 55
+
+    def test_generated_launchd_template_includes_tick_timeout_minutes(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = tmp_path / "launchd"
+        morning_plist, evening_plist, _ = scheduler.cmd_write_research_session_launchd_template(
+            output_dir=output_dir,
+            project_dir=tmp_path,
+            python_path="/usr/bin/python3",
+            use_caffeinate=False,
+        )
+
+        for plist in (morning_plist, evening_plist):
+            program_args = _extract_plist_program_arguments(plist)
+            timeout_index = program_args.index("--tick-timeout-minutes")
+            assert program_args[timeout_index + 1] == "55"
