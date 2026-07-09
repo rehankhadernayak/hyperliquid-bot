@@ -47,6 +47,7 @@ from bid_ask_walk_forward_evaluator import (
     compute_stability_diagnostics,
     compute_stability_summary,
     cost_aware_label_warnings,
+    create_candidate_d_labels,
     create_cost_aware_labels,
     create_walk_forward_features,
     create_walk_forward_labels,
@@ -56,6 +57,7 @@ from bid_ask_walk_forward_evaluator import (
     finalize_accepted_trades_csv,
     generate_walk_forward_windows,
     get_walk_forward_feature_columns,
+    is_candidate_d_label_mode,
     longest_losing_streak,
     main,
     max_drawdown_bps,
@@ -63,6 +65,9 @@ from bid_ask_walk_forward_evaluator import (
     parse_hours_list,
     parse_label_mode,
     parse_trade_classes,
+    build_candidate_d_label_diagnostics,
+    compute_candidate_d_class_distribution,
+    compute_candidate_d_estimated_cost_bps,
     regime_filters_enabled,
     resolve_coins,
     run_walk_forward_evaluation,
@@ -751,8 +756,282 @@ class TestCostAwareLabels:
     def test_parse_label_mode(self) -> None:
         assert parse_label_mode("direction") == "direction"
         assert parse_label_mode("cost_aware") == "cost_aware"
+        assert parse_label_mode("cost_aware_3class") == "cost_aware_3class"
+        assert parse_label_mode("binary_tradeable_down") == "binary_tradeable_down"
+        assert parse_label_mode("binary_tradeable_up") == "binary_tradeable_up"
         with pytest.raises(ValueError):
             parse_label_mode("invalid")
+
+
+def _make_candidate_d_featured(
+    mids: list[float],
+    *,
+    spread_bps: float | None = 2.0,
+) -> pd.DataFrame:
+    rows: list[dict] = []
+    for index, mid in enumerate(mids):
+        row = {
+            "start_timestamp_ms": BASE_MS + index * 15_000,
+            "end_timestamp_ms": BASE_MS + index * 15_000 + 14_999,
+            "timestamp_iso": f"2024-06-10T00:00:{index:02d}Z",
+            "coin": "BTC",
+            "open_mid": mid,
+            "high_mid": mid + 0.1,
+            "low_mid": mid - 0.1,
+            "close_mid": mid,
+            "avg_bid": mid - 0.5,
+            "avg_ask": mid + 0.5,
+            "avg_mid": mid,
+            "avg_spread": 1.0,
+            "avg_bbo_imbalance": 0.2,
+            "row_count": 15,
+            "missing_seconds": 0,
+        }
+        if spread_bps is not None:
+            row["avg_spread_bps"] = spread_bps
+        rows.append(row)
+
+    columns = list(RESAMPLED_COLUMNS)
+    if spread_bps is None:
+        columns = [column for column in columns if column != "avg_spread_bps"]
+    return create_features(pd.DataFrame(rows, columns=columns))
+
+
+class TestCandidateDLabels:
+    FEE_BPS = 2.0
+    SLIPPAGE_BPS = 1.0
+    SPREAD_BPS = 2.0
+    THRESHOLD_BPS = 1.0
+
+    def test_cost_aware_3class_labels_edges(self) -> None:
+        featured = _make_candidate_d_featured(
+            [100.0, 100.08, 99.92, 99.925, 100.0],
+            spread_bps=self.SPREAD_BPS,
+        )
+        labeled, meta = create_walk_forward_labels(
+            featured,
+            label_mode="cost_aware_3class",
+            horizon=1,
+            threshold_bps=self.THRESHOLD_BPS,
+            fee_bps=self.FEE_BPS,
+            slippage_bps=self.SLIPPAGE_BPS,
+        )
+        labels = labeled["label"].tolist()
+
+        assert labels[0] == "UP_EDGE"
+        assert labels[1] == "DOWN_EDGE"
+        assert labels[2] == "NO_TRADE"
+        assert meta["label_mode"] == "cost_aware_3class"
+        assert meta["estimated_cost_formula"] == "fee_bps + slippage_bps + spread_bps"
+
+    def test_binary_tradeable_down_labels(self) -> None:
+        featured = _make_candidate_d_featured(
+            [100.0, 99.90, 100.02, 100.0],
+            spread_bps=self.SPREAD_BPS,
+        )
+        labeled, _ = create_walk_forward_labels(
+            featured,
+            label_mode="binary_tradeable_down",
+            horizon=1,
+            threshold_bps=self.THRESHOLD_BPS,
+            fee_bps=self.FEE_BPS,
+            slippage_bps=self.SLIPPAGE_BPS,
+        )
+        labels = labeled["label"].tolist()
+
+        assert labels[0] == "1"
+        assert labels[1] == "0"
+        assert labels[2] == "0"
+
+    def test_binary_tradeable_up_labels(self) -> None:
+        featured = _make_candidate_d_featured(
+            [100.0, 100.08, 100.02, 100.0],
+            spread_bps=self.SPREAD_BPS,
+        )
+        labeled, _ = create_walk_forward_labels(
+            featured,
+            label_mode="binary_tradeable_up",
+            horizon=1,
+            threshold_bps=self.THRESHOLD_BPS,
+            fee_bps=self.FEE_BPS,
+            slippage_bps=self.SLIPPAGE_BPS,
+        )
+        labels = labeled["label"].tolist()
+
+        assert labels[0] == "1"
+        assert labels[1] == "0"
+        assert labels[2] == "0"
+
+    def test_missing_spread_bps_uses_fee_plus_slippage_with_warning(self) -> None:
+        raw_df = pd.DataFrame({"close_mid": [100.0, 100.08, 100.0]})
+        estimated, formula, warnings = compute_candidate_d_estimated_cost_bps(
+            raw_df,
+            fee_bps=self.FEE_BPS,
+            slippage_bps=self.SLIPPAGE_BPS,
+        )
+
+        assert formula == "fee_bps + slippage_bps"
+        assert any("candidate_d_missing_spread_bps" in warning for warning in warnings)
+        assert all(
+            value == pytest.approx(self.FEE_BPS + self.SLIPPAGE_BPS)
+            for value in estimated.tolist()
+        )
+
+        labeled, label_warnings = create_candidate_d_labels(
+            raw_df,
+            label_mode="cost_aware_3class",
+            horizon=1,
+            threshold_bps=self.THRESHOLD_BPS,
+            fee_bps=self.FEE_BPS,
+            slippage_bps=self.SLIPPAGE_BPS,
+        )
+        assert any("candidate_d_missing_spread_bps" in warning for warning in label_warnings)
+        assert labeled.attrs["candidate_d_estimated_cost_formula"] == "fee_bps + slippage_bps"
+        assert labeled["estimated_cost_bps"].iloc[0] == pytest.approx(
+            self.FEE_BPS + self.SLIPPAGE_BPS
+        )
+
+    def test_label_diagnostics_include_class_counts_and_fractions(self) -> None:
+        featured = _make_candidate_d_featured(
+            [100.0, 100.08, 99.92, 99.925, 100.0],
+            spread_bps=self.SPREAD_BPS,
+        )
+        labeled, _ = create_walk_forward_labels(
+            featured,
+            label_mode="cost_aware_3class",
+            horizon=1,
+            threshold_bps=self.THRESHOLD_BPS,
+            fee_bps=self.FEE_BPS,
+            slippage_bps=self.SLIPPAGE_BPS,
+        )
+        ready = labeled.dropna(subset=["future_return_bps"]).iloc[:-1]
+        diagnostics = build_candidate_d_label_diagnostics(
+            ready,
+            label_mode="cost_aware_3class",
+            horizon_bars=1,
+            threshold_bps=self.THRESHOLD_BPS,
+            estimated_cost_formula="fee_bps + slippage_bps + spread_bps",
+        )
+
+        assert diagnostics["class_counts"]["UP_EDGE"] >= 1
+        assert diagnostics["class_counts"]["DOWN_EDGE"] >= 1
+        assert diagnostics["class_counts"]["NO_TRADE"] >= 1
+        assert sum(diagnostics["class_fractions"].values()) == pytest.approx(1.0)
+        assert diagnostics["no_trade_fraction"] == pytest.approx(
+            diagnostics["class_fractions"]["NO_TRADE"]
+        )
+        assert diagnostics["edge_fraction"] == pytest.approx(
+            diagnostics["class_fractions"]["UP_EDGE"]
+            + diagnostics["class_fractions"]["DOWN_EDGE"]
+        )
+        assert diagnostics["false_edge_rate_if_predictions_available"] is None
+        assert diagnostics["walk_forward_training_supported"] is False
+
+    def test_run_walk_forward_evaluation_diagnostics_only(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=40, mid_step=1.0))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            label_mode="cost_aware_3class",
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["label_mode"] == "cost_aware_3class"
+        assert "candidate_d_label_diagnostics" in report
+        diagnostics = report["candidate_d_label_diagnostics"]
+        assert "class_counts" in diagnostics
+        assert "class_fractions" in diagnostics
+        assert "no_trade_fraction" in diagnostics
+        assert "edge_fraction" in diagnostics
+        assert any(
+            "candidate_d_diagnostics_only" in warning for warning in report["warnings"]
+        )
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+
+    def test_markdown_includes_candidate_d_section(self, data_root: Path, reports_dir: Path) -> None:
+        report = build_walk_forward_report(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=1,
+            threshold_bps=1.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=_permissive_filter(),
+            per_coin_results=[
+                {
+                    "coin": "BTC",
+                    "status": "diagnostics_only",
+                    "completed_windows": 0,
+                    "total_windows": 0,
+                    "skipped_windows": 0,
+                    "model_accuracy_mean": 0.0,
+                    "baseline_accuracy_mean": 0.0,
+                    "accuracy_edge_vs_baseline": 0.0,
+                    "label_mode": "cost_aware_3class",
+                    "label_distribution_by_mode": compute_candidate_d_class_distribution(
+                        ["UP_EDGE", "NO_TRADE", "DOWN_EDGE"],
+                        label_mode="cost_aware_3class",
+                    ),
+                    "label_required_edge_summary": summarize_label_required_edge_bps([6.0, 6.0]),
+                    "candidate_d_label_diagnostics": build_candidate_d_label_diagnostics(
+                        pd.DataFrame(
+                            {
+                                "label": ["UP_EDGE", "NO_TRADE", "DOWN_EDGE"],
+                                "future_return_bps": [8.0, 1.0, -8.0],
+                                "estimated_cost_bps": [5.0, 5.0, 5.0],
+                            }
+                        ),
+                        label_mode="cost_aware_3class",
+                        horizon_bars=1,
+                        threshold_bps=1.0,
+                        estimated_cost_formula="fee_bps + slippage_bps + spread_bps",
+                    ),
+                    "warnings": [],
+                    "windows": [],
+                }
+            ],
+            data_root=data_root,
+            label_mode="cost_aware_3class",
+        )
+        md_path = write_walk_forward_markdown(report, reports_dir=reports_dir)
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "## Candidate D Cost-Aware Label Diagnostics" in md_text
+        assert "no_trade_fraction:" in md_text
+
+    def test_no_future_leakage_in_feature_columns(self) -> None:
+        rows = _make_resampled_rows(count=40, mid_step=1.0)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        _, meta = create_walk_forward_features(raw_df, feature_set="basic", interval="15s")
+        assert_no_future_feature_columns(meta["feature_columns"])
+
+    def test_cli_parses_candidate_d_label_modes(self) -> None:
+        parser = _build_arg_parser()
+        for mode in (
+            "cost_aware_3class",
+            "binary_tradeable_down",
+            "binary_tradeable_up",
+        ):
+            args = parser.parse_args(["--label-mode", mode])
+            assert args.label_mode == mode
+            assert is_candidate_d_label_mode(mode)
 
 
 class TestComputeReadinessFlags:

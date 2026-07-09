@@ -73,7 +73,13 @@ DEFAULT_ACCEPTED_TRADES_LIMIT = 1000
 DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET = 3
 STABILITY_CONCENTRATION_FRACTION = 0.70
 
-SUPPORTED_LABEL_MODES = frozenset({"direction", "cost_aware"})
+CANDIDATE_D_LABEL_MODES = frozenset(
+    {"cost_aware_3class", "binary_tradeable_down", "binary_tradeable_up"}
+)
+CANDIDATE_D_3CLASS_LABELS = ("UP_EDGE", "DOWN_EDGE", "NO_TRADE")
+CANDIDATE_D_BINARY_LABELS = ("0", "1")
+
+SUPPORTED_LABEL_MODES = frozenset({"direction", "cost_aware", *CANDIDATE_D_LABEL_MODES})
 DEFAULT_FEATURE_SET = "basic"
 
 MICROSTRUCTURE_EXTRA_COLUMNS = (
@@ -208,12 +214,22 @@ def parse_trade_classes(value: str) -> frozenset[str]:
 
 
 def parse_label_mode(value: str) -> str:
-    """Parse label mode: direction (default) or cost_aware."""
+    """Parse label mode: direction, cost_aware, or Candidate D cost-aware modes."""
     mode = str(value).strip().lower()
     if mode not in SUPPORTED_LABEL_MODES:
         supported = ", ".join(sorted(SUPPORTED_LABEL_MODES))
         raise ValueError(f"Unsupported label_mode {value!r}; use one of: {supported}")
     return mode
+
+
+def is_candidate_d_label_mode(label_mode: str) -> bool:
+    """Return True when label_mode is a Candidate D cost-aware diagnostic mode."""
+    return parse_label_mode(label_mode) in CANDIDATE_D_LABEL_MODES
+
+
+def candidate_d_supports_walk_forward_training(label_mode: str) -> bool:
+    """Candidate D label modes are diagnostic-only; walk-forward training is not supported."""
+    return False
 
 
 def resolve_mid_price_column(df: pd.DataFrame) -> str | None:
@@ -741,6 +757,311 @@ def create_cost_aware_labels(
     return out
 
 
+def _row_spread_bps_for_candidate_d(row: pd.Series) -> float | None:
+    """Return row spread in bps when present; never substitute a default spread."""
+    for column in ("avg_spread_bps", "spread_bps"):
+        if column in row.index and pd.notna(row[column]):
+            return float(row[column])
+    return None
+
+
+def compute_candidate_d_estimated_cost_bps(
+    df: pd.DataFrame,
+    *,
+    fee_bps: float,
+    slippage_bps: float,
+) -> tuple[pd.Series, str, list[str]]:
+    """Compute causal per-row estimated_cost_bps for Candidate D labels."""
+    warnings: list[str] = []
+    spread_column = resolve_spread_column(df)
+    if spread_column is None:
+        formula = "fee_bps + slippage_bps"
+        warnings.append(
+            "candidate_d_missing_spread_bps: spread column absent; "
+            "using fee_bps + slippage_bps only"
+        )
+        estimated = pd.Series(fee_bps + slippage_bps, index=df.index, dtype=float)
+        return estimated, formula, warnings
+
+    formula = "fee_bps + slippage_bps + spread_bps"
+    values: list[float] = []
+    for _, row in df.iterrows():
+        spread = _row_spread_bps_for_candidate_d(row)
+        if spread is None:
+            values.append(fee_bps + slippage_bps)
+        else:
+            values.append(fee_bps + slippage_bps + spread)
+    estimated = pd.Series(values, index=df.index, dtype=float)
+    return estimated, formula, warnings
+
+
+def _candidate_d_label_classes(label_mode: str) -> tuple[str, ...]:
+    mode = parse_label_mode(label_mode)
+    if mode == "cost_aware_3class":
+        return CANDIDATE_D_3CLASS_LABELS
+    if mode in {"binary_tradeable_down", "binary_tradeable_up"}:
+        return CANDIDATE_D_BINARY_LABELS
+    raise ValueError(f"Not a Candidate D label mode: {label_mode!r}")
+
+
+def create_candidate_d_labels(
+    df: pd.DataFrame,
+    *,
+    label_mode: str,
+    horizon: int,
+    threshold_bps: float,
+    fee_bps: float,
+    slippage_bps: float,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Add future_return_bps, estimated_cost_bps, and Candidate D labels."""
+    if horizon < 1:
+        raise ValueError("horizon must be >= 1")
+
+    mode = parse_label_mode(label_mode)
+    if mode not in CANDIDATE_D_LABEL_MODES:
+        raise ValueError(f"Unsupported Candidate D label_mode {label_mode!r}")
+
+    out = df.copy()
+    mid_column = resolve_mid_price_column(out) or MID_PRICE_COLUMN
+    mid = out[mid_column].astype(float)
+    future_mid = mid.shift(-horizon)
+    out["future_return_bps"] = (future_mid - mid) / mid.replace(0, np.nan) * 10_000.0
+
+    estimated_cost_bps, formula, warnings = compute_candidate_d_estimated_cost_bps(
+        out,
+        fee_bps=fee_bps,
+        slippage_bps=slippage_bps,
+    )
+    out["estimated_cost_bps"] = estimated_cost_bps
+    out["label_required_edge_bps"] = estimated_cost_bps + threshold_bps
+
+    future_return = out["future_return_bps"]
+    required_edge = out["label_required_edge_bps"]
+    valid = future_return.notna()
+
+    if mode == "cost_aware_3class":
+        labels = np.full(len(out), "NO_TRADE", dtype=object)
+        labels[valid & (future_return > required_edge)] = "UP_EDGE"
+        labels[valid & (future_return < -required_edge)] = "DOWN_EDGE"
+    elif mode == "binary_tradeable_down":
+        labels = np.full(len(out), "0", dtype=object)
+        labels[valid & (future_return < -required_edge)] = "1"
+    else:
+        labels = np.full(len(out), "0", dtype=object)
+        labels[valid & (future_return > required_edge)] = "1"
+
+    out["label"] = labels
+    out.attrs["candidate_d_estimated_cost_formula"] = formula
+    return out, warnings
+
+
+def compute_candidate_d_class_distribution(
+    labels: list[str],
+    *,
+    label_mode: str,
+) -> dict[str, dict[str, float | int]]:
+    """Return class counts and fractions for Candidate D label modes."""
+    classes = _candidate_d_label_classes(label_mode)
+    total = len(labels)
+    counts = {label: 0 for label in classes}
+    for label in labels:
+        normalized = str(label)
+        if normalized in counts:
+            counts[normalized] += 1
+    if total == 0:
+        return {label: {"count": 0, "fraction": 0.0} for label in classes}
+    return {
+        label: {"count": counts[label], "fraction": counts[label] / total}
+        for label in classes
+    }
+
+
+def _numeric_series_summary(values: pd.Series) -> dict[str, float | int]:
+    series = values.dropna().astype(float)
+    if series.empty:
+        return {"count": 0, "mean": 0.0, "min": 0.0, "max": 0.0, "std": 0.0}
+    return {
+        "count": int(series.count()),
+        "mean": float(series.mean()),
+        "min": float(series.min()),
+        "max": float(series.max()),
+        "std": float(series.std(ddof=0)),
+    }
+
+
+def build_candidate_d_label_diagnostics(
+    labeled_df: pd.DataFrame,
+    *,
+    label_mode: str,
+    horizon_bars: int,
+    threshold_bps: float,
+    estimated_cost_formula: str,
+    predictions: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build Candidate D cost-aware label diagnostics payload."""
+    mode = parse_label_mode(label_mode)
+    labels = labeled_df["label"].tolist() if not labeled_df.empty else []
+    class_distribution = compute_candidate_d_class_distribution(labels, label_mode=mode)
+    class_counts = {label: stats["count"] for label, stats in class_distribution.items()}
+    class_fractions = {label: stats["fraction"] for label, stats in class_distribution.items()}
+
+    if mode == "cost_aware_3class":
+        no_trade_fraction = float(class_fractions.get("NO_TRADE", 0.0))
+        edge_fraction = float(
+            class_fractions.get("UP_EDGE", 0.0) + class_fractions.get("DOWN_EDGE", 0.0)
+        )
+    else:
+        no_trade_fraction = float(class_fractions.get("0", 0.0))
+        edge_fraction = float(class_fractions.get("1", 0.0))
+
+    future_return_summary_by_label: dict[str, dict[str, float | int]] = {}
+    estimated_cost_summary_by_label: dict[str, dict[str, float | int]] = {}
+    for label in _candidate_d_label_classes(mode):
+        mask = labeled_df["label"].astype(str) == label
+        future_return_summary_by_label[label] = _numeric_series_summary(
+            labeled_df.loc[mask, "future_return_bps"]
+        )
+        estimated_cost_summary_by_label[label] = _numeric_series_summary(
+            labeled_df.loc[mask, "estimated_cost_bps"]
+        )
+
+    false_edge_rate: float | None = None
+    if predictions is not None and len(predictions) == len(labels) and labels:
+        false_edges = 0
+        predicted_edges = 0
+        for predicted, actual in zip(predictions, labels):
+            predicted_label = str(predicted)
+            actual_label = str(actual)
+            if mode == "cost_aware_3class":
+                if predicted_label in {"UP_EDGE", "DOWN_EDGE"}:
+                    predicted_edges += 1
+                    if actual_label == "NO_TRADE":
+                        false_edges += 1
+            elif predicted_label == "1":
+                predicted_edges += 1
+                if actual_label == "0":
+                    false_edges += 1
+        if predicted_edges > 0:
+            false_edge_rate = false_edges / predicted_edges
+
+    return {
+        "label_mode": mode,
+        "horizon_bars": int(horizon_bars),
+        "threshold_bps": float(threshold_bps),
+        "estimated_cost_formula": estimated_cost_formula,
+        "class_counts": class_counts,
+        "class_fractions": class_fractions,
+        "no_trade_fraction": no_trade_fraction,
+        "edge_fraction": edge_fraction,
+        "future_return_summary_by_label": future_return_summary_by_label,
+        "estimated_cost_summary_by_label": estimated_cost_summary_by_label,
+        "false_edge_rate_if_predictions_available": false_edge_rate,
+        "walk_forward_training_supported": candidate_d_supports_walk_forward_training(mode),
+    }
+
+
+def _aggregate_candidate_d_label_diagnostics(
+    per_coin_diagnostics: list[dict[str, Any]],
+    *,
+    label_mode: str,
+) -> dict[str, Any]:
+    """Merge per-coin Candidate D diagnostics into one aggregate payload."""
+    if not per_coin_diagnostics:
+        return {}
+
+    mode = parse_label_mode(label_mode)
+    classes = _candidate_d_label_classes(mode)
+    total_counts = {label: 0 for label in classes}
+    for diagnostics in per_coin_diagnostics:
+        for label in classes:
+            total_counts[label] += int(diagnostics.get("class_counts", {}).get(label, 0))
+
+    total_rows = sum(total_counts.values())
+    class_fractions = {
+        label: (total_counts[label] / total_rows if total_rows else 0.0)
+        for label in classes
+    }
+    if mode == "cost_aware_3class":
+        no_trade_fraction = float(class_fractions.get("NO_TRADE", 0.0))
+        edge_fraction = float(
+            class_fractions.get("UP_EDGE", 0.0) + class_fractions.get("DOWN_EDGE", 0.0)
+        )
+    else:
+        no_trade_fraction = float(class_fractions.get("0", 0.0))
+        edge_fraction = float(class_fractions.get("1", 0.0))
+
+    false_edge_rates = [
+        float(item["false_edge_rate_if_predictions_available"])
+        for item in per_coin_diagnostics
+        if item.get("false_edge_rate_if_predictions_available") is not None
+    ]
+    aggregate_false_edge_rate = (
+        float(np.mean(false_edge_rates)) if false_edge_rates else None
+    )
+
+    template = per_coin_diagnostics[0]
+    return {
+        "label_mode": mode,
+        "horizon_bars": template.get("horizon_bars"),
+        "threshold_bps": template.get("threshold_bps"),
+        "estimated_cost_formula": template.get("estimated_cost_formula"),
+        "class_counts": total_counts,
+        "class_fractions": class_fractions,
+        "no_trade_fraction": no_trade_fraction,
+        "edge_fraction": edge_fraction,
+        "future_return_summary_by_label": template.get("future_return_summary_by_label", {}),
+        "estimated_cost_summary_by_label": template.get("estimated_cost_summary_by_label", {}),
+        "false_edge_rate_if_predictions_available": aggregate_false_edge_rate,
+        "walk_forward_training_supported": False,
+        "per_coin": {
+            str(index): diagnostics for index, diagnostics in enumerate(per_coin_diagnostics)
+        },
+    }
+
+
+def _format_candidate_d_diagnostics_section(report: dict[str, Any]) -> list[str]:
+    """Render Candidate D label diagnostics for Markdown reports."""
+    diagnostics = report.get("candidate_d_label_diagnostics")
+    if not diagnostics:
+        return []
+
+    lines = [
+        "",
+        "## Candidate D Cost-Aware Label Diagnostics",
+        "",
+        f"- label_mode: {diagnostics.get('label_mode')}",
+        f"- horizon_bars: {diagnostics.get('horizon_bars')}",
+        f"- threshold_bps: {diagnostics.get('threshold_bps')}",
+        f"- estimated_cost_formula: {diagnostics.get('estimated_cost_formula')}",
+        f"- no_trade_fraction: {diagnostics.get('no_trade_fraction', 0.0):.4f}",
+        f"- edge_fraction: {diagnostics.get('edge_fraction', 0.0):.4f}",
+        f"- walk_forward_training_supported: "
+        f"{str(diagnostics.get('walk_forward_training_supported', False)).lower()}",
+        "",
+        "### Class counts",
+        "",
+    ]
+    for label, count in sorted(diagnostics.get("class_counts", {}).items()):
+        fraction = diagnostics.get("class_fractions", {}).get(label, 0.0)
+        lines.append(f"- {label}: count={count} fraction={fraction:.4f}")
+
+    false_edge_rate = diagnostics.get("false_edge_rate_if_predictions_available")
+    lines.extend(
+        [
+            "",
+            "### False edge rate",
+            "",
+            (
+                f"- false_edge_rate_if_predictions_available: {false_edge_rate:.4f}"
+                if false_edge_rate is not None
+                else "- false_edge_rate_if_predictions_available: n/a (no predictions)"
+            ),
+            "",
+        ]
+    )
+    return lines
+
+
 def create_walk_forward_labels(
     df: pd.DataFrame,
     *,
@@ -769,6 +1090,31 @@ def create_walk_forward_labels(
             "label_min_edge_bps": label_min_edge_bps,
             "label_required_edge_summary": summary,
             "label_distribution_by_mode": distribution,
+        }
+
+    if mode in CANDIDATE_D_LABEL_MODES:
+        labeled_df, candidate_d_warnings = create_candidate_d_labels(
+            df,
+            label_mode=mode,
+            horizon=horizon,
+            threshold_bps=threshold_bps,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+        )
+        distribution = compute_candidate_d_class_distribution(
+            labeled_df["label"].tolist(),
+            label_mode=mode,
+        )
+        summary = summarize_label_required_edge_bps(labeled_df["label_required_edge_bps"])
+        formula = str(labeled_df.attrs.get("candidate_d_estimated_cost_formula", ""))
+        return labeled_df, {
+            "label_mode": mode,
+            "label_cost_multiplier": label_cost_multiplier,
+            "label_min_edge_bps": label_min_edge_bps,
+            "label_required_edge_summary": summary,
+            "label_distribution_by_mode": distribution,
+            "estimated_cost_formula": formula,
+            "candidate_d_label_warnings": candidate_d_warnings,
         }
 
     labeled_df = create_cost_aware_labels(
@@ -2382,6 +2728,78 @@ def evaluate_coin_walk_forward(
     if len(model_df) < MIN_ROWS_WARNING:
         warnings.append(f"too_few_rows: only {len(model_df)} model-ready rows for {coin}")
 
+    if is_candidate_d_label_mode(label_mode):
+        warnings.extend(label_meta.get("candidate_d_label_warnings", []))
+        warnings.append(
+            f"candidate_d_diagnostics_only: label_mode={parse_label_mode(label_mode)} "
+            "does not support walk-forward model training; reporting label diagnostics only"
+        )
+        candidate_d_label_diagnostics = build_candidate_d_label_diagnostics(
+            model_df,
+            label_mode=label_mode,
+            horizon_bars=horizon,
+            threshold_bps=threshold_bps,
+            estimated_cost_formula=str(label_meta.get("estimated_cost_formula", "")),
+        )
+        readiness = compute_readiness_flags(
+            accuracy_edge_vs_baseline=0.0,
+            cumulative_net_return_bps=0.0,
+            completed_windows=0,
+            total_paper_trades=0,
+            min_windows=min_windows,
+            min_trades=min_trades,
+        )
+        source_path = str(
+            resampled_csv_path(coin, interval, data_root, source=normalized_source)
+        )
+        return {
+            "coin": coin,
+            "status": "diagnostics_only",
+            "reason": "candidate_d_label_mode",
+            "source_path": source_path,
+            "model_ready_rows": len(model_df),
+            "total_windows": 0,
+            "completed_windows": 0,
+            "skipped_windows": 0,
+            "model_accuracy_mean": 0.0,
+            "baseline_accuracy_mean": 0.0,
+            "accuracy_edge_vs_baseline": 0.0,
+            "total_paper_signals": 0,
+            "total_paper_trades": 0,
+            "raw_predictions": 0,
+            "filtered_paper_trades": 0,
+            "blocked_by_confidence": 0,
+            "blocked_by_cost": 0,
+            "blocked_by_spread": 0,
+            "blocked_by_volatility": 0,
+            "blocked_by_trade_class": 0,
+            "blocked_by_class": empty_class_count(),
+            "accepted_by_class": empty_class_count(),
+            "class_trade_diagnostics": aggregate_class_trade_diagnostics([]),
+            "coin_class_trade_diagnostics": {coin: aggregate_class_trade_diagnostics([])},
+            "accepted_trade_records": [],
+            "trade_filter_summary": trade_filter_to_summary(trade_filter),
+            "average_cost_bps": 0.0,
+            "average_required_edge_bps": 0.0,
+            "average_gross_return_bps": 0.0,
+            "accepted_trade_net_returns_bps": [],
+            "average_net_return_bps": 0.0,
+            "cumulative_net_return_bps": 0.0,
+            "max_drawdown_bps": 0.0,
+            "win_rate_after_costs": 0.0,
+            "longest_losing_streak": 0,
+            "expected_average_from_cumulative": 0.0,
+            "average_net_return_difference_abs": 0.0,
+            "net_return_consistency_check": True,
+            **readiness,
+            "readiness": readiness,
+            "windows": [],
+            "warnings": warnings,
+            "candidate_d_label_diagnostics": candidate_d_label_diagnostics,
+            **label_meta,
+            **feature_meta,
+        }
+
     windows = generate_walk_forward_windows(
         len(model_df),
         train_bars=train_bars,
@@ -2555,20 +2973,28 @@ def evaluate_coin_walk_forward(
 
 def _aggregate_label_distribution(
     per_coin_results: list[dict[str, Any]],
+    *,
+    label_mode: str = DEFAULT_LABEL_MODE,
 ) -> dict[str, dict[str, float | int]]:
     """Merge per-coin label distributions into one aggregate distribution."""
-    totals = {label: 0 for label in LABELS}
+    mode = parse_label_mode(label_mode)
+    if mode in CANDIDATE_D_LABEL_MODES:
+        label_keys = _candidate_d_label_classes(mode)
+    else:
+        label_keys = LABELS
+
+    totals = {label: 0 for label in label_keys}
     for item in per_coin_results:
         distribution = item.get("label_distribution_by_mode", {})
-        for label in LABELS:
+        for label in label_keys:
             label_stats = distribution.get(label, {})
             totals[label] += int(label_stats.get("count", 0))
     total_rows = sum(totals.values())
     if total_rows == 0:
-        return {label: {"count": 0, "fraction": 0.0} for label in LABELS}
+        return {label: {"count": 0, "fraction": 0.0} for label in label_keys}
     return {
         label: {"count": totals[label], "fraction": totals[label] / total_rows}
-        for label in LABELS
+        for label in label_keys
     }
 
 
@@ -2719,16 +3145,20 @@ def build_walk_forward_report(
     for item in per_coin_results:
         warnings.extend(item.get("warnings", []))
 
-    if total_windows < min_windows:
-        warnings.append(
-            f"too_few_windows: aggregate total_windows={total_windows} "
-            f"(need {min_windows})"
-        )
-    accuracy_edge_vs_baseline = model_accuracy_mean - baseline_accuracy_mean
-    if accuracy_edge_vs_baseline <= 0 and completed_coins:
-        warnings.append("model_not_better_than_baseline")
-    if cumulative_net_return_bps <= 0 and total_paper_trades > 0:
-        warnings.append("negative_after_costs")
+    candidate_d_mode = is_candidate_d_label_mode(label_mode)
+    if not candidate_d_mode:
+        if total_windows < min_windows:
+            warnings.append(
+                f"too_few_windows: aggregate total_windows={total_windows} "
+                f"(need {min_windows})"
+            )
+        accuracy_edge_vs_baseline = model_accuracy_mean - baseline_accuracy_mean
+        if accuracy_edge_vs_baseline <= 0 and completed_coins:
+            warnings.append("model_not_better_than_baseline")
+        if cumulative_net_return_bps <= 0 and total_paper_trades > 0:
+            warnings.append("negative_after_costs")
+    else:
+        accuracy_edge_vs_baseline = model_accuracy_mean - baseline_accuracy_mean
     if not trade_metrics["net_return_consistency_check"]:
         warnings.append("net_return_aggregation_inconsistent")
 
@@ -2783,7 +3213,10 @@ def build_walk_forward_report(
         for item in per_coin_results
     }
 
-    label_distribution_by_mode = _aggregate_label_distribution(per_coin_results)
+    label_distribution_by_mode = _aggregate_label_distribution(
+        per_coin_results,
+        label_mode=label_mode,
+    )
     label_required_edge_summary = _aggregate_label_required_edge_summary(
         per_coin_results,
         label_mode=label_mode,
@@ -2899,6 +3332,17 @@ def build_walk_forward_report(
         report.update(readiness)
         report["readiness"] = readiness
 
+    per_coin_candidate_d = [
+        item["candidate_d_label_diagnostics"]
+        for item in per_coin_results
+        if item.get("candidate_d_label_diagnostics")
+    ]
+    if per_coin_candidate_d:
+        report["candidate_d_label_diagnostics"] = _aggregate_candidate_d_label_diagnostics(
+            per_coin_candidate_d,
+            label_mode=label_mode,
+        )
+
     return report
 
 
@@ -2977,12 +3421,19 @@ def write_walk_forward_markdown(
         ]
     )
     label_distribution = report.get("label_distribution_by_mode", {})
-    for label in LABELS:
+    distribution_labels = (
+        list(label_distribution.keys())
+        if is_candidate_d_label_mode(str(report.get("label_mode", DEFAULT_LABEL_MODE)))
+        else list(LABELS)
+    )
+    for label in distribution_labels:
         stats = label_distribution.get(label, {})
         lines.append(
             f"- label {label}: count={stats.get('count', 0)} "
             f"fraction={stats.get('fraction', 0.0):.4f}"
         )
+
+    lines.extend(_format_candidate_d_diagnostics_section(report))
 
     feature_columns = report.get("feature_columns", [])
     lines.extend(
@@ -3438,7 +3889,10 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--label-mode",
         default=DEFAULT_LABEL_MODE,
         choices=sorted(SUPPORTED_LABEL_MODES),
-        help="Label mode: direction (threshold) or cost_aware (default: direction)",
+        help=(
+            "Label mode: direction (default), cost_aware, cost_aware_3class, "
+            "binary_tradeable_down, or binary_tradeable_up"
+        ),
     )
     parser.add_argument(
         "--label-cost-multiplier",
