@@ -18,9 +18,12 @@ import pandas as pd
 
 from bid_ask_features import (
     CANDIDATE_C_CORE_COLUMNS,
+    CANDIDATE_E_DEPTH_AWARE_COLUMNS,
     MIN_CANDIDATE_C_CORE_FEATURE_COUNT,
+    MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT,
     SUPPORTED_FEATURE_SETS,
     create_candidate_c_core_features,
+    create_candidate_e_depth_aware_features,
     parse_feature_set,
 )
 from bid_ask_model_io import build_artifact_payload, save_model_artifact
@@ -291,6 +294,8 @@ def get_walk_forward_feature_columns(feature_set: str) -> tuple[str, ...]:
         return FEATURE_COLUMNS
     if mode == "candidate_c_core":
         return CANDIDATE_C_CORE_COLUMNS
+    if mode == "candidate_e_depth_aware":
+        return CANDIDATE_E_DEPTH_AWARE_COLUMNS
     return FEATURE_COLUMNS + MICROSTRUCTURE_EXTRA_COLUMNS
 
 
@@ -544,6 +549,11 @@ def build_feature_metadata(
             f"too_few_features: only {len(columns)} columns available "
             f"(expected at least {MIN_CANDIDATE_C_CORE_FEATURE_COUNT})"
         )
+    elif mode == "candidate_e_depth_aware" and len(columns) < MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT:
+        metadata["feature_warning"] = (
+            f"too_few_features: only {len(columns)} columns available "
+            f"(expected at least {MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT})"
+        )
     return metadata
 
 
@@ -600,6 +610,24 @@ def create_walk_forward_features(
         feature_columns = tuple(
             column
             for column in CANDIDATE_C_CORE_COLUMNS
+            if column in featured_df.columns and column not in core_skipped
+        )
+        metadata = build_feature_metadata(
+            feature_set=mode,
+            feature_columns=feature_columns,
+            skipped_candidate_c_core_features=skipped,
+        )
+        return featured_df, metadata
+
+    if mode == "candidate_e_depth_aware":
+        featured_df, core_skipped = create_candidate_e_depth_aware_features(
+            prepared_df,
+            interval=interval,
+        )
+        skipped = sorted(set(skipped) | set(core_skipped))
+        feature_columns = tuple(
+            column
+            for column in CANDIDATE_E_DEPTH_AWARE_COLUMNS
             if column in featured_df.columns and column not in core_skipped
         )
         metadata = build_feature_metadata(
@@ -4295,7 +4323,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--feature-set",
         default=DEFAULT_FEATURE_SET,
         choices=sorted(SUPPORTED_FEATURE_SETS),
-        help="Feature set: basic (default), microstructure, or candidate_c_core",
+        help="Feature set: basic (default), microstructure, candidate_c_core, or candidate_e_depth_aware",
     )
     parser.add_argument(
         "--train-bars",

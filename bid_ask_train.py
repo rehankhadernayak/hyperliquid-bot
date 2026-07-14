@@ -14,8 +14,11 @@ import pandas as pd
 
 from bid_ask_features import (
     CANDIDATE_C_CORE_COLUMNS,
+    CANDIDATE_E_DEPTH_AWARE_COLUMNS,
     build_candidate_c_core_metadata,
+    build_candidate_e_depth_aware_metadata,
     create_candidate_c_core_features,
+    create_candidate_e_depth_aware_features,
 )
 from bid_ask_model_io import (
     DEFAULT_MODELS_DIR as MODEL_IO_DEFAULT_MODELS_DIR,
@@ -43,7 +46,9 @@ DEFAULT_MODELS_DIR = MODEL_IO_DEFAULT_MODELS_DIR
 
 SUPPORTED_INTERVALS = frozenset({"15s", "1m"})
 DEFAULT_FEATURE_SET = "basic"
-TRAINING_SUPPORTED_FEATURE_SETS = frozenset({"basic", "candidate_c_core"})
+TRAINING_SUPPORTED_FEATURE_SETS = frozenset(
+    {"basic", "candidate_c_core", "candidate_e_depth_aware"}
+)
 LABELS = ("UP", "DOWN", "FLAT")
 
 FEATURE_COLUMNS = (
@@ -108,6 +113,8 @@ def get_training_feature_columns(feature_set: str) -> tuple[str, ...]:
         raise ValueError(f"Unsupported training feature_set {feature_set!r}; use one of: {supported}")
     if mode == "candidate_c_core":
         return CANDIDATE_C_CORE_COLUMNS
+    if mode == "candidate_e_depth_aware":
+        return CANDIDATE_E_DEPTH_AWARE_COLUMNS
     return FEATURE_COLUMNS
 
 
@@ -130,6 +137,19 @@ def create_training_features(
             if column in featured_df.columns and column not in skipped
         )
         metadata = build_candidate_c_core_metadata(
+            feature_columns=feature_columns,
+            skipped_candidate_c_core_features=skipped,
+        )
+        return featured_df, metadata
+
+    if mode == "candidate_e_depth_aware":
+        featured_df, skipped = create_candidate_e_depth_aware_features(df, interval=interval)
+        feature_columns = tuple(
+            column
+            for column in CANDIDATE_E_DEPTH_AWARE_COLUMNS
+            if column in featured_df.columns and column not in skipped
+        )
+        metadata = build_candidate_e_depth_aware_metadata(
             feature_columns=feature_columns,
             skipped_candidate_c_core_features=skipped,
         )
@@ -768,7 +788,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--feature-set",
         default=DEFAULT_FEATURE_SET,
         choices=sorted(TRAINING_SUPPORTED_FEATURE_SETS),
-        help="Feature set: basic (default) or candidate_c_core",
+        help="Feature set: basic (default), candidate_c_core, or candidate_e_depth_aware",
     )
     return parser
 

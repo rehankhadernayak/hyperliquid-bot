@@ -14,7 +14,9 @@ import pandas as pd
 
 from bid_ask_resampler import INTERVAL_SECONDS
 
-SUPPORTED_FEATURE_SETS = frozenset({"basic", "microstructure", "candidate_c_core"})
+SUPPORTED_FEATURE_SETS = frozenset(
+    {"basic", "microstructure", "candidate_c_core", "candidate_e_depth_aware"}
+)
 
 MID_PRICE_COLUMN = "close_mid"
 
@@ -38,6 +40,18 @@ CANDIDATE_C_CORE_COLUMNS = (
     "is_weekend",
 )
 
+CANDIDATE_E_DEPTH_AWARE_EXTRA_COLUMNS = (
+    "bid_size",
+    "ask_size",
+    "total_top_size",
+    "size_imbalance",
+    "microprice",
+    "microprice_mid_deviation_bps",
+    "rolling_pressure_change",
+)
+
+CANDIDATE_E_DEPTH_AWARE_COLUMNS = CANDIDATE_C_CORE_COLUMNS + CANDIDATE_E_DEPTH_AWARE_EXTRA_COLUMNS
+
 FUTURE_FEATURE_COLUMNS = frozenset(
     {
         "future_return_bps",
@@ -46,6 +60,8 @@ FUTURE_FEATURE_COLUMNS = frozenset(
 )
 
 MIN_CANDIDATE_C_CORE_FEATURE_COUNT = 5
+MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT = 5
+REQUIRED_DEPTH_SIZE_COLUMNS = ("bid_size", "ask_size")
 
 
 def parse_feature_set(value: str) -> str:
@@ -100,6 +116,47 @@ def _bars_for_seconds(interval: str, seconds: int) -> int:
 def _safe_fill_series(series: pd.Series) -> pd.Series:
     """Fill NaNs from rolling calculations without using future rows."""
     return series.ffill().bfill().fillna(0.0)
+
+
+def _require_depth_size_columns(df: pd.DataFrame) -> None:
+    """Raise if bid_size/ask_size are unavailable for depth-aware features."""
+    missing = [column for column in REQUIRED_DEPTH_SIZE_COLUMNS if column not in df.columns]
+    if missing:
+        raise ValueError(
+            "Missing bid_size/ask_size columns required for "
+            f"candidate_e_depth_aware depth features: {missing}"
+        )
+
+    bid_size = df["bid_size"]
+    ask_size = df["ask_size"]
+    if bid_size.isna().all() or ask_size.isna().all():
+        raise ValueError(
+            "bid_size/ask_size contain no usable data; "
+            "candidate_e_depth_aware requires resampled depth columns"
+        )
+
+
+def _resolve_bid_ask_price_columns(df: pd.DataFrame) -> tuple[str, str]:
+    bid_column = "avg_bid" if "avg_bid" in df.columns else "best_bid"
+    ask_column = "avg_ask" if "avg_ask" in df.columns else "best_ask"
+    missing = [column for column in (bid_column, ask_column) if column not in df.columns]
+    if missing:
+        raise ValueError(
+            "Missing bid/ask price columns required for "
+            f"candidate_e_depth_aware microprice features: {missing}"
+        )
+    return bid_column, ask_column
+
+
+def _compute_microprice(
+    bid: pd.Series,
+    ask: pd.Series,
+    bid_size: pd.Series,
+    ask_size: pd.Series,
+) -> pd.Series:
+    total = bid_size.astype(float) + ask_size.astype(float)
+    numerator = ask.astype(float) * bid_size.astype(float) + bid.astype(float) * ask_size.astype(float)
+    return numerator / total.replace(0, np.nan)
 
 
 def create_candidate_c_core_features(
@@ -184,6 +241,52 @@ def create_candidate_c_core_features(
     return out, sorted(set(skipped))
 
 
+def create_candidate_e_depth_aware_features(
+    df: pd.DataFrame,
+    *,
+    interval: str = "15s",
+) -> tuple[pd.DataFrame, list[str]]:
+    """Build candidate_e_depth_aware features from resampled bid/ask bars."""
+    if df.empty:
+        return df.copy(), []
+
+    _require_depth_size_columns(df)
+    out, skipped = create_candidate_c_core_features(df, interval=interval)
+
+    bid_size = out["bid_size"].astype(float)
+    ask_size = out["ask_size"].astype(float)
+    out["bid_size"] = bid_size
+    out["ask_size"] = ask_size
+    out["total_top_size"] = bid_size + ask_size
+    total = out["total_top_size"].replace(0, np.nan)
+    out["size_imbalance"] = (bid_size - ask_size) / total
+
+    bid_column, ask_column = _resolve_bid_ask_price_columns(out)
+    mid_column = resolve_mid_price_column(out)
+    if mid_column is None:
+        raise ValueError(
+            "Missing mid price column (close_mid/avg_mid); "
+            "required for candidate_e_depth_aware microprice features"
+        )
+    mid = out[mid_column].astype(float)
+    out["microprice"] = _compute_microprice(
+        out[bid_column],
+        out[ask_column],
+        bid_size,
+        ask_size,
+    )
+    out["microprice_mid_deviation_bps"] = (
+        (out["microprice"] - mid) / mid.replace(0, np.nan) * 10_000.0
+    )
+    out["rolling_pressure_change"] = out["microprice_mid_deviation_bps"].diff(5)
+
+    for column in CANDIDATE_E_DEPTH_AWARE_COLUMNS:
+        if column in out.columns:
+            out[column] = _safe_fill_series(out[column])
+
+    return out, sorted(set(skipped))
+
+
 def build_candidate_c_core_metadata(
     *,
     feature_columns: tuple[str, ...],
@@ -204,6 +307,30 @@ def build_candidate_c_core_metadata(
         metadata["feature_warning"] = (
             f"too_few_features: only {len(columns)} columns available "
             f"(expected at least {MIN_CANDIDATE_C_CORE_FEATURE_COUNT})"
+        )
+    return metadata
+
+
+def build_candidate_e_depth_aware_metadata(
+    *,
+    feature_columns: tuple[str, ...],
+    skipped_candidate_c_core_features: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build report metadata for candidate_e_depth_aware feature selection."""
+    columns = list(feature_columns)
+    skipped = list(skipped_candidate_c_core_features or [])
+    metadata: dict[str, Any] = {
+        "feature_set": "candidate_e_depth_aware",
+        "feature_columns": columns,
+        "feature_count": len(columns),
+        "skipped_microstructure_features": [],
+        "skipped_candidate_c_core_features": skipped,
+        "feature_warning": None,
+    }
+    if len(columns) < MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT:
+        metadata["feature_warning"] = (
+            f"too_few_features: only {len(columns)} columns available "
+            f"(expected at least {MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT})"
         )
     return metadata
 

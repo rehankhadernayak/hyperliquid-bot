@@ -12,7 +12,11 @@ import pytest
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS
 from bid_ask_model_io import build_artifact_payload, load_model_artifact
-from bid_ask_features import CANDIDATE_C_CORE_COLUMNS, assert_no_future_feature_columns
+from bid_ask_features import (
+    CANDIDATE_C_CORE_COLUMNS,
+    CANDIDATE_E_DEPTH_AWARE_COLUMNS,
+    assert_no_future_feature_columns,
+)
 from bid_ask_train import (
     EXECUTION_ENABLED,
     FEATURE_COLUMNS,
@@ -69,32 +73,37 @@ def _make_resampled_rows(
     mid_step: float = 0.5,
     spread_bps: float = 2.0,
     imbalance: float = 0.2,
+    include_sizes: bool = False,
+    bid_size: float = 2.0,
+    ask_size: float = 1.0,
 ) -> list[dict]:
     rows: list[dict] = []
     for index in range(count):
         start = start_ms + index * step_ms
         end = start + step_ms - 1
         mid = mid_start + index * mid_step
-        rows.append(
-            {
-                "start_timestamp_ms": start,
-                "end_timestamp_ms": end,
-                "timestamp_iso": f"2024-06-10T00:00:{index:02d}Z",
-                "coin": coin,
-                "open_mid": mid,
-                "high_mid": mid + 0.1,
-                "low_mid": mid - 0.1,
-                "close_mid": mid,
-                "avg_bid": mid - 0.5,
-                "avg_ask": mid + 0.5,
-                "avg_mid": mid,
-                "avg_spread": 1.0,
-                "avg_spread_bps": spread_bps + (index % 3) * 0.1,
-                "avg_bbo_imbalance": imbalance + index * 0.01,
-                "row_count": 15,
-                "missing_seconds": 0,
-            }
-        )
+        row = {
+            "start_timestamp_ms": start,
+            "end_timestamp_ms": end,
+            "timestamp_iso": f"2024-06-10T00:00:{index:02d}Z",
+            "coin": coin,
+            "open_mid": mid,
+            "high_mid": mid + 0.1,
+            "low_mid": mid - 0.1,
+            "close_mid": mid,
+            "avg_bid": mid - 0.5,
+            "avg_ask": mid + 0.5,
+            "avg_mid": mid,
+            "avg_spread": 1.0,
+            "avg_spread_bps": spread_bps + (index % 3) * 0.1,
+            "avg_bbo_imbalance": imbalance + index * 0.01,
+            "row_count": 15,
+            "missing_seconds": 0,
+        }
+        if include_sizes:
+            row["bid_size"] = bid_size + index * 0.01
+            row["ask_size"] = ask_size + index * 0.01
+        rows.append(row)
     return rows
 
 
@@ -232,6 +241,110 @@ class TestCandidateCCoreFeatures:
         assert report["feature_columns"] == list(CANDIDATE_C_CORE_COLUMNS)
         assert report["feature_count"] == len(CANDIDATE_C_CORE_COLUMNS)
         assert result["evaluation"]["features_used"] == list(CANDIDATE_C_CORE_COLUMNS)
+
+
+class TestCandidateEDepthAwareFeatures:
+    def test_create_training_features_candidate_e_depth_aware_columns(self) -> None:
+        rows = _make_resampled_rows(count=40, include_sizes=True)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, meta = create_training_features(
+            raw_df,
+            feature_set="candidate_e_depth_aware",
+            interval="15s",
+        )
+
+        assert meta["feature_set"] == "candidate_e_depth_aware"
+        assert meta["feature_columns"] == list(CANDIDATE_E_DEPTH_AWARE_COLUMNS)
+        assert meta["feature_count"] == len(CANDIDATE_E_DEPTH_AWARE_COLUMNS)
+        for column in CANDIDATE_E_DEPTH_AWARE_COLUMNS:
+            assert column in featured.columns
+
+    def test_candidate_e_depth_aware_fails_without_size_columns(self) -> None:
+        rows = _make_resampled_rows(count=30)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+
+        with pytest.raises(ValueError, match="bid_size/ask_size"):
+            create_training_features(
+                raw_df,
+                feature_set="candidate_e_depth_aware",
+                interval="15s",
+            )
+
+    def test_no_future_return_columns_in_candidate_e_depth_aware_features(self) -> None:
+        rows = _make_resampled_rows(count=30, include_sizes=True)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        _, meta = create_training_features(
+            raw_df,
+            feature_set="candidate_e_depth_aware",
+            interval="15s",
+        )
+        assert_no_future_feature_columns(meta["feature_columns"])
+        assert "future_return_bps" not in meta["feature_columns"]
+
+    def test_candidate_e_depth_aware_rolling_features_are_causal(self) -> None:
+        rows = _make_resampled_rows(count=60, mid_start=100.0, mid_step=1.0, include_sizes=True)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, _ = create_training_features(
+            raw_df,
+            feature_set="candidate_e_depth_aware",
+            interval="15s",
+        )
+
+        altered = raw_df.copy()
+        altered.loc[altered.index[-1], "close_mid"] = (
+            altered.loc[altered.index[-1], "close_mid"] * 2
+        )
+        altered_featured, _ = create_training_features(
+            altered,
+            feature_set="candidate_e_depth_aware",
+            interval="15s",
+        )
+
+        for column in CANDIDATE_E_DEPTH_AWARE_COLUMNS:
+            pd.testing.assert_series_equal(
+                featured[column].iloc[:-1],
+                altered_featured[column].iloc[:-1],
+                check_names=False,
+            )
+
+    def test_get_training_feature_columns_candidate_e(self) -> None:
+        assert get_training_feature_columns("candidate_e_depth_aware") == CANDIDATE_E_DEPTH_AWARE_COLUMNS
+
+    def test_cli_accepts_candidate_e_depth_aware_feature_set(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(
+            [
+                "--coin",
+                "BTC",
+                "--interval",
+                "15s",
+                "--feature-set",
+                "candidate_e_depth_aware",
+            ]
+        )
+        assert args.feature_set == "candidate_e_depth_aware"
+
+    def test_training_report_includes_candidate_e_depth_aware_metadata(
+        self, data_root: Path, tmp_path: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=40, include_sizes=True))
+        result = run_training_pipeline(
+            coin="BTC",
+            interval="15s",
+            horizon=1,
+            data_root=data_root,
+            reports_dir=tmp_path / "reports",
+            models_dir=tmp_path / "models",
+            feature_set="candidate_e_depth_aware",
+        )
+        report = result["report"]
+        assert report["feature_set"] == "candidate_e_depth_aware"
+        assert report["feature_columns"] == list(CANDIDATE_E_DEPTH_AWARE_COLUMNS)
+        assert report["feature_count"] == len(CANDIDATE_E_DEPTH_AWARE_COLUMNS)
+        assert result["evaluation"]["features_used"] == list(CANDIDATE_E_DEPTH_AWARE_COLUMNS)
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
 
 
 class TestCreateLabels:
