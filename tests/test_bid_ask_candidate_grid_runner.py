@@ -33,6 +33,7 @@ from bid_ask_candidate_grid_runner import (
     parse_max_cost_bps_value,
     parse_regime_filter_csv_values,
     rank_grid_results,
+    resolve_min_trades_enforcement_count,
     run_candidate_grid,
     write_grid_report_csv,
     write_grid_report_json,
@@ -89,21 +90,49 @@ def _mock_walk_forward_report(**overrides: Any) -> dict[str, Any]:
 
 def _result_from_metrics(config: CandidateGridConfig, **metrics: Any) -> dict[str, Any]:
     report = _mock_walk_forward_report(**metrics)
+    label_mode = str(metrics.get("label_mode", config.label_mode))
     score = compute_paper_score(
         {
             "positive_after_costs": report["positive_after_costs"],
             "beats_baseline_accuracy": report["beats_baseline_accuracy"],
             "filtered_paper_trades": report["filtered_paper_trades"],
+            "accepted_edge_predictions": report.get("accepted_edge_predictions"),
+            "accepted_trades_count": report.get("accepted_trades_count"),
             "average_net_return_bps": report["average_net_return_bps"],
             "stability_summary": report["stability_summary"],
             "stability_warnings": report["stability_warnings"],
-        }
+            "regime_filters_enabled": report.get("regime_filters_enabled", False),
+            "trades_after_regime_filters": report.get("trades_after_regime_filters"),
+        },
+        label_mode=label_mode,
+        min_trades_after_regime_filter=metrics.get(
+            "min_trades_after_regime_filter",
+            DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
+        ),
     )
+    status = "too_few_trades" if score["too_few_trades"] else "ok"
+    rejection_reason = ""
+    if score["too_few_trades"]:
+        rejection_reason = (
+            f"{score['enforcement_trade_count_field']}="
+            f"{score['enforcement_trade_count']} < "
+            f"min_trades_after_regime_filter="
+            f"{metrics.get('min_trades_after_regime_filter', DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER)}"
+        )
+    positive_after_costs = report["positive_after_costs"] and not score["too_few_trades"]
     return {
         "config_id": config.config_id,
         "config": config.__dict__,
         **report,
         **score,
+        "label_mode": label_mode,
+        "min_trades_after_regime_filter": metrics.get(
+            "min_trades_after_regime_filter",
+            DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
+        ),
+        "status": status,
+        "rejection_reason": rejection_reason,
+        "positive_after_costs": positive_after_costs,
         "paper_only": True,
         "execution_enabled": False,
         "real_execution_ready": False,
@@ -623,10 +652,13 @@ class TestRegimeFilterGrid:
                 "regime_filters_enabled": True,
                 "trades_after_regime_filters": 3,
             },
+            label_mode="direction",
             min_trades_after_regime_filter=DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
         )
+        assert score["too_few_trades"] is True
         assert score["insufficient_regime_trades"] is True
         assert score["insufficient_regime_trades_penalty"] > 0
+        assert score["positive_after_costs_bonus"] == 0.0
 
     def test_markdown_labels_exploratory_configs(self, tmp_path: Path) -> None:
         config = _sample_config(exclude_hours=(5,))
@@ -685,3 +717,194 @@ class TestRegimeFilterGrid:
         assert ranked[0]["config_id"] == filtered_config.config_id
         assert ranked[0]["cumulative_net_return_bps"] == pytest.approx(30.0)
         assert ranked[0]["filtered_paper_trades"] == 8
+
+
+class TestBinaryTradeableMinTradesEnforcement:
+    def test_resolve_count_prefers_accepted_edge_predictions(self) -> None:
+        count, field = resolve_min_trades_enforcement_count(
+            {
+                "accepted_edge_predictions": 3,
+                "accepted_trades_count": 10,
+                "filtered_paper_trades": 25,
+            },
+            label_mode="binary_tradeable_up",
+        )
+        assert count == 3
+        assert field == "accepted_edge_predictions"
+
+    def test_binary_tradeable_up_rejected_with_three_trades_min_five(self) -> None:
+        config = _sample_config(
+            coin="ETH",
+            label_mode="binary_tradeable_up",
+            trade_class="UP",
+            feature_set="candidate_e_depth_aware",
+        )
+        mock_runner = MagicMock(
+            return_value=_mock_walk_forward_report(
+                label_mode="binary_tradeable_up",
+                filtered_paper_trades=3,
+                accepted_edge_predictions=3,
+                positive_after_costs=True,
+                cumulative_net_return_bps=20.0,
+                average_net_return_bps=6.96,
+            )
+        )
+        result = evaluate_grid_config(
+            config,
+            min_trades_after_regime_filter=5,
+            walk_forward_runner=mock_runner,
+        )
+        assert result["status"] == "too_few_trades"
+        assert result["too_few_trades"] is True
+        assert result["positive_after_costs"] is False
+        assert result["positive_after_costs_bonus"] == 0.0
+        assert result["insufficient_regime_trades_penalty"] > 0
+        assert "accepted_edge_predictions=3 < min_trades_after_regime_filter=5" in result["rejection_reason"]
+        assert rank_grid_results([result]) == []
+
+    def test_binary_tradeable_up_allowed_with_ten_trades_min_five(self) -> None:
+        config = _sample_config(
+            coin="ETH",
+            label_mode="binary_tradeable_up",
+            trade_class="UP",
+            feature_set="candidate_e_depth_aware",
+        )
+        mock_runner = MagicMock(
+            return_value=_mock_walk_forward_report(
+                label_mode="binary_tradeable_up",
+                filtered_paper_trades=10,
+                accepted_edge_predictions=10,
+                positive_after_costs=True,
+                cumulative_net_return_bps=20.0,
+                average_net_return_bps=2.0,
+            )
+        )
+        result = evaluate_grid_config(
+            config,
+            min_trades_after_regime_filter=5,
+            walk_forward_runner=mock_runner,
+        )
+        assert result["status"] == "ok"
+        assert result["too_few_trades"] is False
+        assert result["positive_after_costs"] is True
+        assert result["positive_after_costs_bonus"] > 0
+        assert result["rejection_reason"] == ""
+        assert rank_grid_results([result]) == [result]
+
+    def test_sparse_binary_tradeable_does_not_outrank_sufficient_config(self) -> None:
+        sparse_config = _sample_config(
+            coin="ETH",
+            label_mode="binary_tradeable_up",
+            trade_class="UP",
+            feature_set="candidate_e_depth_aware",
+        )
+        sufficient_config = _sample_config(
+            coin="ETH",
+            label_mode="binary_tradeable_up",
+            trade_class="UP",
+            feature_set="candidate_e_depth_aware",
+            min_confidence=0.70,
+        )
+        sparse = _result_from_metrics(
+            sparse_config,
+            label_mode="binary_tradeable_up",
+            filtered_paper_trades=3,
+            accepted_edge_predictions=3,
+            positive_after_costs=True,
+            average_net_return_bps=6.96,
+            min_trades_after_regime_filter=5,
+        )
+        sufficient = _result_from_metrics(
+            sufficient_config,
+            label_mode="binary_tradeable_up",
+            filtered_paper_trades=10,
+            accepted_edge_predictions=10,
+            positive_after_costs=True,
+            average_net_return_bps=2.0,
+            min_trades_after_regime_filter=5,
+        )
+        ranked = rank_grid_results([sparse, sufficient])
+        assert ranked == [sufficient]
+        assert sparse["status"] == "too_few_trades"
+
+    def test_output_columns_include_min_trade_enforcement_fields(self, tmp_path: Path) -> None:
+        rejected_config = _sample_config(
+            coin="ETH",
+            label_mode="binary_tradeable_up",
+            trade_class="UP",
+            feature_set="candidate_e_depth_aware",
+            min_confidence=0.40,
+        )
+        allowed_config = _sample_config(
+            coin="ETH",
+            label_mode="binary_tradeable_up",
+            trade_class="UP",
+            feature_set="candidate_e_depth_aware",
+            min_confidence=0.70,
+        )
+        rejected = evaluate_grid_config(
+            rejected_config,
+            min_trades_after_regime_filter=5,
+            walk_forward_runner=MagicMock(
+                return_value=_mock_walk_forward_report(
+                    label_mode="binary_tradeable_up",
+                    filtered_paper_trades=3,
+                    accepted_edge_predictions=3,
+                    positive_after_costs=True,
+                )
+            ),
+        )
+        allowed = evaluate_grid_config(
+            allowed_config,
+            min_trades_after_regime_filter=5,
+            walk_forward_runner=MagicMock(
+                return_value=_mock_walk_forward_report(
+                    label_mode="binary_tradeable_up",
+                    filtered_paper_trades=10,
+                    accepted_edge_predictions=10,
+                    positive_after_costs=True,
+                )
+            ),
+        )
+        ranked = rank_grid_results([rejected, allowed])
+        report = build_grid_report(
+            grid_output={
+                "dry_run": False,
+                "planned_count": 2,
+                "total_combinations": 2,
+                "completed_count": 2,
+                "failed_count": 0,
+                "results": [rejected, allowed],
+                "failures": [],
+                "ranked": ranked,
+            },
+            run_timestamp="2026-07-14T08:00:00Z",
+            grid_params={"min_trades_after_regime_filter": 5},
+            top_n=2,
+        )
+        assert rejected["status"] == "too_few_trades"
+        assert allowed["status"] == "ok"
+
+        json_path = write_grid_report_json(report, output_dir=tmp_path)
+        payload = json.loads(json_path.read_text(encoding="utf-8"))
+        rejected_payload = next(
+            item for item in payload["results"] if item["config_id"] == rejected_config.config_id
+        )
+        assert rejected_payload["min_trades_after_regime_filter"] == 5
+        assert rejected_payload["accepted_edge_predictions"] == 3
+        assert rejected_payload["status"] == "too_few_trades"
+        assert "accepted_edge_predictions=3" in rejected_payload["rejection_reason"]
+
+        csv_path = write_grid_report_csv(report, output_dir=tmp_path)
+        with csv_path.open(encoding="utf-8") as handle:
+            row = next(csv.DictReader(handle))
+        assert row["min_trades_after_regime_filter"] == "5"
+        assert row["accepted_edge_predictions"] == "10"
+        assert row["status"] == "ok"
+        assert row["too_few_trades"] == "False"
+
+        md_path = write_grid_report_markdown(report, output_dir=tmp_path)
+        markdown = md_path.read_text(encoding="utf-8")
+        assert "min_trades_after_regime_filter: 5" in markdown
+        assert "accepted_edge_predictions: 10" in markdown
+        assert "status: ok" in markdown

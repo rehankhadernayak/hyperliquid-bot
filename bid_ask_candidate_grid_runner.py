@@ -178,6 +178,52 @@ def format_hours_label(hours: tuple[int, ...] | None) -> str:
     return "+".join(str(hour) for hour in hours)
 
 
+def _coerce_non_negative_int(value: Any) -> int | None:
+    """Return a non-negative int when value is present and valid."""
+    if value is None:
+        return None
+    try:
+        count = int(value)
+    except (TypeError, ValueError):
+        return None
+    if count < 0:
+        return None
+    return count
+
+
+def resolve_min_trades_enforcement_count(
+    metrics: dict[str, Any],
+    *,
+    label_mode: str,
+) -> tuple[int | None, str | None]:
+    """Resolve trade count and source field for min_trades_after_regime_filter."""
+    normalized_mode = str(label_mode)
+
+    if is_binary_tradeable_label_mode(normalized_mode):
+        for field in ("accepted_edge_predictions", "accepted_trades_count", "filtered_paper_trades"):
+            count = _coerce_non_negative_int(metrics.get(field))
+            if count is not None:
+                return count, field
+        return 0, "filtered_paper_trades"
+
+    if bool(metrics.get("regime_filters_enabled")):
+        count = _coerce_non_negative_int(metrics.get("trades_after_regime_filters"))
+        if count is not None:
+            return count, "trades_after_regime_filters"
+
+    return None, None
+
+
+def should_enforce_min_trades_after_regime_filter(
+    metrics: dict[str, Any],
+    *,
+    label_mode: str,
+) -> bool:
+    """Return True when min_trades_after_regime_filter should be enforced."""
+    count, _ = resolve_min_trades_enforcement_count(metrics, label_mode=label_mode)
+    return count is not None
+
+
 def _filter_runner_kwargs(
     runner: WalkForwardRunner,
     kwargs: dict[str, Any],
@@ -278,6 +324,7 @@ def build_grid_combinations(
 def compute_paper_score(
     metrics: dict[str, Any],
     *,
+    label_mode: str = "direction",
     min_trades_required: int = DEFAULT_MIN_TRADES_REQUIRED,
     min_trades_after_regime_filter: int = DEFAULT_MIN_TRADES_AFTER_REGIME_FILTER,
 ) -> dict[str, Any]:
@@ -288,27 +335,29 @@ def compute_paper_score(
     average_net_return_bps = float(metrics.get("average_net_return_bps", 0.0))
     stability_summary = metrics.get("stability_summary") or {}
     stability_warnings = list(metrics.get("stability_warnings") or [])
-    regime_filters_enabled = bool(metrics.get("regime_filters_enabled", False))
-    trades_after_regime_filters = metrics.get("trades_after_regime_filters")
 
     insufficient_trades = filtered_paper_trades < min_trades_required
     has_concentration_warning = bool(stability_summary.get("concentration_warning"))
     has_sparse_warning = bool(stability_summary.get("sparse_stability_warning"))
     warning_count = len(stability_warnings) + int(has_concentration_warning) + int(has_sparse_warning)
 
-    insufficient_regime_trades = False
+    enforcement_trade_count, enforcement_trade_count_field = resolve_min_trades_enforcement_count(
+        metrics,
+        label_mode=label_mode,
+    )
+    too_few_trades = False
     insufficient_regime_trades_penalty = 0.0
-    if regime_filters_enabled and trades_after_regime_filters is not None:
-        insufficient_regime_trades = (
-            int(trades_after_regime_filters) < min_trades_after_regime_filter
-        )
+    if enforcement_trade_count is not None:
+        too_few_trades = enforcement_trade_count < min_trades_after_regime_filter
         insufficient_regime_trades_penalty = (
-            PAPER_SCORE_INSUFFICIENT_REGIME_TRADES_PENALTY
-            if insufficient_regime_trades
-            else 0.0
+            PAPER_SCORE_INSUFFICIENT_REGIME_TRADES_PENALTY if too_few_trades else 0.0
         )
+    insufficient_regime_trades = too_few_trades
 
-    positive_bonus = PAPER_SCORE_POSITIVE_AFTER_COSTS_BONUS if positive_after_costs else 0.0
+    effective_positive_after_costs = positive_after_costs and not too_few_trades
+    positive_bonus = (
+        PAPER_SCORE_POSITIVE_AFTER_COSTS_BONUS if effective_positive_after_costs else 0.0
+    )
     baseline_bonus = PAPER_SCORE_BEATS_BASELINE_BONUS if beats_baseline else 0.0
     trade_bonus = filtered_paper_trades * PAPER_SCORE_TRADE_COUNT_WEIGHT
     average_return_bonus = max(average_net_return_bps, 0.0) * PAPER_SCORE_AVERAGE_NET_RETURN_WEIGHT
@@ -338,6 +387,9 @@ def compute_paper_score(
         "insufficient_regime_trades_penalty": insufficient_regime_trades_penalty,
         "insufficient_trades": insufficient_trades,
         "insufficient_regime_trades": insufficient_regime_trades,
+        "too_few_trades": too_few_trades,
+        "enforcement_trade_count": enforcement_trade_count,
+        "enforcement_trade_count_field": enforcement_trade_count_field,
         "stability_warning_count": warning_count,
         "real_execution_ready": False,
     }
@@ -346,7 +398,15 @@ def compute_paper_score(
 def extract_metrics_from_walk_forward(walk_forward_report: dict[str, Any]) -> dict[str, Any]:
     """Extract ranking metrics from a walk-forward evaluation report."""
     readiness = walk_forward_report.get("readiness") or {}
+    candidate_d_diagnostics = walk_forward_report.get("candidate_d_label_diagnostics") or {}
+    accepted_edge_predictions = walk_forward_report.get("accepted_edge_predictions")
+    if accepted_edge_predictions is None:
+        accepted_edge_predictions = candidate_d_diagnostics.get("accepted_edge_predictions")
+    accepted_trades_count = walk_forward_report.get("accepted_trades_count")
+    if accepted_trades_count is None:
+        accepted_trades_count = candidate_d_diagnostics.get("accepted_trades_count")
     return {
+        "label_mode": str(walk_forward_report.get("label_mode", "")),
         "beats_baseline_accuracy": bool(
             walk_forward_report.get(
                 "beats_baseline_accuracy",
@@ -357,6 +417,8 @@ def extract_metrics_from_walk_forward(walk_forward_report: dict[str, Any]) -> di
             walk_forward_report.get("accuracy_edge_vs_baseline", 0.0)
         ),
         "filtered_paper_trades": int(walk_forward_report.get("filtered_paper_trades", 0)),
+        "accepted_edge_predictions": accepted_edge_predictions,
+        "accepted_trades_count": accepted_trades_count,
         "cumulative_net_return_bps": float(
             walk_forward_report.get("cumulative_net_return_bps", 0.0)
         ),
@@ -426,9 +488,21 @@ def evaluate_grid_config(
         metrics["regime_filters_enabled"] = True
     score_details = compute_paper_score(
         metrics,
+        label_mode=config.label_mode,
         min_trades_required=min_trades_required,
         min_trades_after_regime_filter=min_trades_after_regime_filter,
     )
+    status = "too_few_trades" if score_details["too_few_trades"] else "ok"
+    rejection_reason = ""
+    if score_details["too_few_trades"]:
+        rejection_reason = (
+            f"{score_details['enforcement_trade_count_field']}="
+            f"{score_details['enforcement_trade_count']} < "
+            f"min_trades_after_regime_filter={min_trades_after_regime_filter}"
+        )
+    positive_after_costs = bool(metrics.get("positive_after_costs", False))
+    if score_details["too_few_trades"]:
+        positive_after_costs = False
     return {
         "config_id": config.config_id,
         "config": asdict(config),
@@ -436,8 +510,12 @@ def evaluate_grid_config(
         "include_hours": format_hours_label(config.include_hours),
         "max_cost_bps": config.max_cost_bps,
         "exploratory_overfit_warning": config.regime_filter_active,
+        "min_trades_after_regime_filter": min_trades_after_regime_filter,
+        "status": status,
+        "rejection_reason": rejection_reason,
         **metrics,
         **score_details,
+        "positive_after_costs": positive_after_costs,
         "paper_only": PAPER_ONLY,
         "execution_enabled": EXECUTION_ENABLED,
         "real_execution_ready": False,
@@ -446,8 +524,13 @@ def evaluate_grid_config(
 
 def rank_grid_results(results: list[dict[str, Any]]) -> list[dict[str, Any]]:
     """Rank grid results by paper_score descending, then trade count, then avg return."""
+    eligible = [
+        row
+        for row in results
+        if row.get("status") != "too_few_trades" and not row.get("too_few_trades", False)
+    ]
     return sorted(
-        results,
+        eligible,
         key=lambda row: (
             float(row.get("paper_score", 0.0)),
             int(row.get("filtered_paper_trades", 0)),
@@ -602,6 +685,11 @@ def write_grid_report_csv(
         "win_rate_after_costs",
         "stability_warning_count",
         "insufficient_trades",
+        "min_trades_after_regime_filter",
+        "accepted_edge_predictions",
+        "status",
+        "rejection_reason",
+        "too_few_trades",
         "real_execution_ready",
     ]
 
@@ -645,6 +733,11 @@ def write_grid_report_csv(
                     "win_rate_after_costs": row.get("win_rate_after_costs"),
                     "stability_warning_count": row.get("stability_warning_count"),
                     "insufficient_trades": row.get("insufficient_trades"),
+                    "min_trades_after_regime_filter": row.get("min_trades_after_regime_filter"),
+                    "accepted_edge_predictions": row.get("accepted_edge_predictions"),
+                    "status": row.get("status"),
+                    "rejection_reason": row.get("rejection_reason"),
+                    "too_few_trades": row.get("too_few_trades"),
                     "real_execution_ready": row.get("real_execution_ready"),
                 }
             )
@@ -687,14 +780,14 @@ def write_grid_report_markdown(
         "",
         "## Top Results",
         "",
-        "| Rank | Config | Exploratory | Paper Score | Trades | Avg Net (bps) | Positive | Beats Baseline |",
-        "| ---: | --- | --- | ---: | ---: | ---: | --- | --- |",
+        "| Rank | Config | Status | Exploratory | Paper Score | Trades | Avg Net (bps) | Positive | Beats Baseline |",
+        "| ---: | --- | --- | --- | ---: | ---: | ---: | --- | --- |",
     ]
 
     for index, row in enumerate(top_n, start=1):
         exploratory = "yes" if row.get("exploratory_overfit_warning") else "no"
         lines.append(
-            f"| {index} | {row.get('config_id', 'n/a')} | {exploratory} | "
+            f"| {index} | {row.get('config_id', 'n/a')} | {row.get('status', 'ok')} | {exploratory} | "
             f"{float(row.get('paper_score', 0.0)):.2f} | "
             f"{row.get('filtered_paper_trades', 0)} | "
             f"{float(row.get('average_net_return_bps', 0.0)):.4f} | "
@@ -703,7 +796,7 @@ def write_grid_report_markdown(
         )
 
     if not top_n:
-        lines.append("| - | - | - | - | - | - | - | - |")
+        lines.append("| - | - | - | - | - | - | - | - | - |")
 
     lines.extend(["", "## Best Result", ""])
     if best is None:
@@ -723,7 +816,11 @@ def write_grid_report_markdown(
                 f"- max_cost_bps: {best.get('max_cost_bps') if best.get('max_cost_bps') is not None else 'none'}",
                 f"- exploratory_overfit_warning: {str(best.get('exploratory_overfit_warning', False)).lower()}",
                 f"- paper_score: {float(best.get('paper_score', 0.0)):.2f}",
+                f"- min_trades_after_regime_filter: {best.get('min_trades_after_regime_filter', 'n/a')}",
                 f"- filtered_paper_trades: {best.get('filtered_paper_trades', 0)}",
+                f"- accepted_edge_predictions: {best.get('accepted_edge_predictions', 'n/a')}",
+                f"- status: {best.get('status', 'ok')}",
+                f"- rejection_reason: {best.get('rejection_reason') or 'none'}",
                 f"- average_net_return_bps: {float(best.get('average_net_return_bps', 0.0)):.4f}",
                 f"- real_execution_ready: false",
             ]
