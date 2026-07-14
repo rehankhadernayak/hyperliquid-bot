@@ -33,6 +33,8 @@ DATA_ROOT = Path("data/bid_ask_csv")
 PHASE3_AUDIT_PATH = Path("reports/bid_ask_research_scheduler/phase3_audit_latest.json")
 WALK_FORWARD_DIR = Path("reports/bid_ask_walk_forward")
 CANDIDATE_VALIDATION_DIR = Path("reports/bid_ask_candidate_validation")
+RESEARCH_STATUS_PATH = Path("reports/research_status/research_status_latest.json")
+RESEARCH_STATUS_MD_PATH = Path("reports/research_status/research_status_latest.md")
 RESEARCH_COINS = ("BTC", "ETH")
 HISTORICAL_SOURCE = "historical"
 PHASE3_TARGET_HOURS = 14 * 24
@@ -508,6 +510,122 @@ def _render_scatter_chart(df: pd.DataFrame, x: str, y: str, title: str, label: s
 # ---------------------------------------------------------------------------
 # Section renderers
 # ---------------------------------------------------------------------------
+def _load_research_status() -> dict[str, Any] | None:
+    return _load_json(RESEARCH_STATUS_PATH)
+
+
+def _data_status_summary_rows(status: dict[str, Any]) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    coins = (status.get("data_status") or {}).get("coins") or {}
+    for coin in RESEARCH_COINS:
+        coin_data = coins.get(coin) or {}
+        for interval in ("1s", "15s", "1m"):
+            row = coin_data.get(interval) or {}
+            validation = row.get("validation") or {}
+            rows.append(
+                {
+                    "coin": coin,
+                    "interval": interval,
+                    "file_exists": row.get("file_exists"),
+                    "rows": row.get("row_count"),
+                    "last_timestamp": row.get("last_timestamp") or "—",
+                    "validation_passed": validation.get("passed"),
+                    "missing_periods": validation.get("missing_periods_count"),
+                }
+            )
+    return rows
+
+
+def _render_research_status() -> None:
+    import streamlit as st
+
+    st.markdown("## Research Status")
+    st.caption(
+        "Consolidated research decision log from local artifacts — "
+        "read-only, no execution."
+    )
+
+    status = _load_research_status()
+    if status is None:
+        st.info(
+            "Research status report not built yet. "
+            "Run `python3 bid_ask_research_status_builder.py build` to generate it."
+        )
+        st.caption(f"Expected path: {RESEARCH_STATUS_PATH}")
+        if RESEARCH_STATUS_MD_PATH.is_file():
+            st.caption(f"Markdown available: {RESEARCH_STATUS_MD_PATH}")
+        return
+
+    safety = status.get("safety") or {}
+    st.markdown("### Safety")
+    s1, s2, s3, s4 = st.columns(4)
+    s1.metric("paper_only", str(safety.get("paper_only", status.get("paper_only"))).lower())
+    s2.metric(
+        "execution_enabled",
+        str(safety.get("execution_enabled", status.get("execution_enabled"))).lower(),
+    )
+    s3.metric(
+        "real_execution_ready",
+        str(safety.get("real_execution_ready", status.get("real_execution_ready"))).lower(),
+    )
+    s4.metric("generated_at", status.get("generated_at", "—"))
+    st.caption(status.get("research_only_note") or status.get("safety_statement", SAFETY_STATEMENT))
+
+    st.markdown("### Data Status Summary")
+    data_rows = _data_status_summary_rows(status)
+    if data_rows:
+        display = pd.DataFrame(data_rows)
+        display["validation_passed"] = display["validation_passed"].map(
+            lambda value: "PASS" if value is True else ("FAIL" if value is False else "—")
+        )
+        display["file_exists"] = display["file_exists"].map(
+            lambda value: "yes" if value is True else ("no" if value is False else "—")
+        )
+        st.dataframe(display, use_container_width=True, hide_index=True)
+
+    data_warnings = (status.get("data_status") or {}).get("warnings") or []
+    if data_warnings:
+        with st.expander(f"Data warnings ({len(data_warnings)})"):
+            for warning in data_warnings:
+                st.markdown(f"- {warning}")
+
+    st.markdown("### Candidate Timeline (B / C / D / E)")
+    timeline = status.get("candidate_timeline") or []
+    if timeline:
+        for entry in timeline:
+            candidate = entry.get("candidate", "—")
+            name = entry.get("name", "—")
+            entry_status = entry.get("status", "—")
+            summary = entry.get("summary", "")
+            st.markdown(f"**Candidate {candidate}** — `{name}` ({entry_status})")
+            st.caption(summary)
+    else:
+        st.info("No candidate timeline entries in research status report.")
+
+    st.markdown("### Current Blockers")
+    blockers = status.get("blockers") or []
+    if blockers:
+        for blocker in blockers:
+            st.markdown(f"- {blocker}")
+    else:
+        st.info("No blockers listed.")
+
+    st.markdown("### Next Actions")
+    next_actions = status.get("next_actions") or []
+    if next_actions:
+        for action in next_actions:
+            st.markdown(f"- {action}")
+    else:
+        st.info("No next actions listed.")
+
+    with st.expander("Research status artifact paths"):
+        st.text(f"JSON: {RESEARCH_STATUS_PATH}")
+        if RESEARCH_STATUS_MD_PATH.is_file():
+            st.text(f"Markdown: {RESEARCH_STATUS_MD_PATH}")
+        else:
+            st.text(f"Markdown: {RESEARCH_STATUS_MD_PATH} (not found)")
+
+
 def _render_header() -> None:
     import streamlit as st
 
@@ -797,6 +915,8 @@ def _render_debug(phase3: dict[str, Any] | None) -> None:
         csv_path = _latest_accepted_trades_csv()
         if csv_path:
             st.text(f"Latest accepted trades CSV: {csv_path}")
+        if RESEARCH_STATUS_PATH.is_file():
+            st.text(f"Research status JSON: {RESEARCH_STATUS_PATH}")
         for coin in RESEARCH_COINS:
             for interval in ("1s", "15s"):
                 validation = _latest_validation_report(coin, interval)
@@ -821,6 +941,8 @@ def main() -> None:
     candidate = _latest_candidate_validation()
 
     _render_header()
+    st.divider()
+    _render_research_status()
     st.divider()
     _render_kpi_cards(phase3, candidate)
     st.divider()

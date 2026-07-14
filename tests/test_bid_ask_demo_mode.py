@@ -18,6 +18,7 @@ from bid_ask_demo_mode import (
     DASHBOARD_LAUNCH_COMMAND,
     DEFAULT_OUTPUT_DIR,
     build_demo_packet,
+    build_research_status_summary,
     discover_artifacts,
     main,
     prepare_demo_mode,
@@ -89,6 +90,10 @@ def _write_walk_forward(reports_root: Path, coin: str, stamp: str) -> Path:
     return path
 
 
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def _write_candidate_validation(reports_root: Path, stamp: str) -> Path:
     path = (
         reports_root
@@ -102,6 +107,29 @@ def _write_candidate_validation(reports_root: Path, stamp: str) -> Path:
         "status": "not_market_ready",
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _write_research_status(reports_root: Path) -> Path:
+    path = reports_root / "research_status" / "research_status_latest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at": "2026-07-14T08:36:26Z",
+        "paper_only": True,
+        "execution_enabled": False,
+        "data_status": {"warnings": ["BTC 1s: missing seconds"]},
+        "candidate_timeline": [
+            {"candidate": "B", "status": "rejected", "summary": "Rejected after more data."},
+            {"candidate": "C", "status": "rejected/diagnostic", "summary": "Negative after costs."},
+            {"candidate": "D", "status": "diagnostic/useful but negative", "summary": "Useful labels only."},
+            {"candidate": "E", "status": "interesting but too sparse", "summary": "Sparse positive signal."},
+        ],
+        "blockers": ["Need more out-of-sample data."],
+        "next_actions": ["Continue backfill"],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    md_path = reports_root / "research_status" / "research_status_latest.md"
+    md_path.write_text("# Research Status\n", encoding="utf-8")
     return path
 
 
@@ -244,6 +272,58 @@ class TestSafetyWarningsIncluded:
             output_dir=output_dir,
         )
         assert any("Research-only" in warning for warning in packet["warnings"])
+
+
+class TestResearchStatusIncluded:
+    def test_demo_packet_includes_research_status_when_present(
+        self, fake_roots: tuple[Path, Path, Path]
+    ) -> None:
+        reports_root, data_root, output_dir = fake_roots
+        _write_research_status(reports_root)
+        packet = prepare_demo_mode(
+            reports_root=reports_root,
+            data_root=data_root,
+            output_dir=output_dir,
+        )
+        research = packet["research_status"]
+        assert research["available"] is True
+        assert research["markdown_path"].endswith("research_status_latest.md")
+        assert research["json_path"].endswith("research_status_latest.json")
+        assert packet["artifact_paths"]["research_status_markdown"].endswith(
+            "research_status_latest.md"
+        )
+        assert len(research["candidate_timeline"]) == 4
+
+        md_text = (output_dir / "demo_packet_latest.md").read_text(encoding="utf-8")
+        assert "## Current Research Status" in md_text
+        assert "research_status_latest.md" in md_text
+        assert "Candidate B" in md_text
+
+    def test_handles_missing_research_status_gracefully(
+        self, fake_roots: tuple[Path, Path, Path]
+    ) -> None:
+        reports_root, data_root, output_dir = fake_roots
+        packet = build_demo_packet(reports_root=reports_root, data_root=data_root)
+        research = packet["research_status"]
+        assert research["available"] is False
+        assert research["json_path"].endswith("research_status_latest.json")
+        assert any("Research status report not built yet" in warning for warning in packet["warnings"])
+
+        md_path = write_demo_packet_markdown(packet, output_dir=output_dir)
+        md_text = md_path.read_text(encoding="utf-8")
+        assert "## Current Research Status" in md_text
+        assert "not built yet" in md_text
+
+    def test_research_status_summary_helper(self, fake_roots: tuple[Path, Path, Path]) -> None:
+        reports_root, _, _ = fake_roots
+        missing = build_research_status_summary(reports_root)
+        assert missing["available"] is False
+
+        _write_research_status(reports_root)
+        present = build_research_status_summary(reports_root)
+        assert present["available"] is True
+        assert present["blocker_count"] == 1
+        assert present["next_action_count"] == 1
 
 
 class TestDashboardCommandIncluded:

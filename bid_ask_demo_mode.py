@@ -24,6 +24,8 @@ PHASE3_AUDIT_REL = Path("bid_ask_research_scheduler/phase3_audit_latest.json")
 DAILY_SUMMARY_GLOB = "bid_ask_daily/bid_ask_daily_summary_*.json"
 WALK_FORWARD_DIR_REL = Path("bid_ask_walk_forward")
 CANDIDATE_VALIDATION_DIR_REL = Path("bid_ask_candidate_validation")
+RESEARCH_STATUS_JSON_REL = Path("research_status/research_status_latest.json")
+RESEARCH_STATUS_MD_REL = Path("research_status/research_status_latest.md")
 
 RESEARCH_COINS = ("BTC", "ETH")
 HISTORICAL_SOURCE = "historical"
@@ -283,6 +285,47 @@ def discover_artifacts(
     }
 
 
+def _research_status_paths(reports_root: Path) -> tuple[Path, Path]:
+    return reports_root / RESEARCH_STATUS_JSON_REL, reports_root / RESEARCH_STATUS_MD_REL
+
+
+def build_research_status_summary(reports_root: Path) -> dict[str, Any]:
+    """Summarize the latest research status report for demo packets."""
+    json_path, md_path = _research_status_paths(reports_root)
+    payload = _load_json(json_path)
+    if payload is None:
+        return {
+            "available": False,
+            "json_path": str(json_path),
+            "markdown_path": str(md_path) if md_path.is_file() else None,
+        }
+
+    blockers = list(payload.get("blockers") or [])
+    next_actions = list(payload.get("next_actions") or [])
+    timeline = list(payload.get("candidate_timeline") or [])
+    data_warnings = list((payload.get("data_status") or {}).get("warnings") or [])
+
+    return {
+        "available": True,
+        "json_path": str(json_path),
+        "markdown_path": str(md_path) if md_path.is_file() else None,
+        "generated_at": payload.get("generated_at"),
+        "blocker_count": len(blockers),
+        "next_action_count": len(next_actions),
+        "data_warning_count": len(data_warnings),
+        "blockers_preview": blockers[:3],
+        "next_actions_preview": next_actions[:3],
+        "candidate_timeline": [
+            {
+                "candidate": entry.get("candidate"),
+                "status": entry.get("status"),
+                "summary": entry.get("summary"),
+            }
+            for entry in timeline
+        ],
+    }
+
+
 def build_current_kpis(
     artifacts: dict[str, Any],
     data_root: Path = DEFAULT_DATA_ROOT,
@@ -428,16 +471,16 @@ def build_demo_packet(
     """Assemble the full demo packet from local artifacts."""
     artifacts = discover_artifacts(reports_root=reports_root, data_root=data_root)
     kpis = build_current_kpis(artifacts, data_root=data_root)
+    research_status = build_research_status_summary(reports_root)
 
     artifact_paths = {
-        key: (value or {}).get("_report_path") if isinstance(value, dict) else None
-        for key, value in {
-            "phase3_audit": artifacts.get("phase3_audit"),
-            "daily_summary": artifacts.get("daily_summary"),
-            "candidate_validation": artifacts.get("candidate_validation"),
-            "walk_forward_btc": (artifacts.get("walk_forward") or {}).get("BTC"),
-            "walk_forward_eth": (artifacts.get("walk_forward") or {}).get("ETH"),
-        }.items()
+        "phase3_audit": (artifacts.get("phase3_audit") or {}).get("_report_path"),
+        "daily_summary": (artifacts.get("daily_summary") or {}).get("_report_path"),
+        "candidate_validation": (artifacts.get("candidate_validation") or {}).get("_report_path"),
+        "walk_forward_btc": ((artifacts.get("walk_forward") or {}).get("BTC") or {}).get("_report_path"),
+        "walk_forward_eth": ((artifacts.get("walk_forward") or {}).get("ETH") or {}).get("_report_path"),
+        "research_status_json": research_status.get("json_path"),
+        "research_status_markdown": research_status.get("markdown_path"),
     }
 
     warnings: list[str] = [
@@ -448,6 +491,8 @@ def build_demo_packet(
         warnings.append("Phase 3 audit report not found — KPIs may use CSV fallbacks.")
     if (artifacts.get("walk_forward") or {}).get("BTC") is None:
         warnings.append("Latest BTC walk-forward report not found — Candidate B uses fallback values.")
+    if not research_status.get("available"):
+        warnings.append("Research status report not built yet — run bid_ask_research_status_builder.py build.")
 
     return {
         "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
@@ -461,6 +506,7 @@ def build_demo_packet(
         "dashboard_launch_command": DASHBOARD_LAUNCH_COMMAND,
         "current_kpis": kpis,
         "candidate_b": build_candidate_b_explanation(artifacts),
+        "research_status": research_status,
         "safety_boundary": build_safety_boundary(),
         "milestone_journey": build_milestone_journey(),
         "architecture_text": ARCHITECTURE_TEXT,
@@ -538,6 +584,39 @@ def write_demo_packet_markdown(
     lines.append(f"- summary: {candidate['summary']}")
     lines.append(f"- main_takeaway: {candidate['main_takeaway']}")
     lines.append("")
+
+    lines.extend(["## Current Research Status", ""])
+    research = packet.get("research_status") or {}
+    if research.get("available"):
+        lines.append(f"- markdown_path: {research.get('markdown_path') or 'n/a'}")
+        lines.append(f"- json_path: {research.get('json_path')}")
+        lines.append(f"- generated_at: {research.get('generated_at')}")
+        lines.append(f"- blocker_count: {research.get('blocker_count')}")
+        lines.append(f"- next_action_count: {research.get('next_action_count')}")
+        lines.append(f"- data_warning_count: {research.get('data_warning_count')}")
+        lines.append("")
+        lines.append("**Candidate timeline (B/C/D/E)**")
+        for entry in research.get("candidate_timeline") or []:
+            lines.append(
+                f"- Candidate {entry.get('candidate')}: {entry.get('status')} — "
+                f"{entry.get('summary')}"
+            )
+        lines.append("")
+        if research.get("blockers_preview"):
+            lines.append("**Top blockers**")
+            for item in research["blockers_preview"]:
+                lines.append(f"- {item}")
+            lines.append("")
+        if research.get("next_actions_preview"):
+            lines.append("**Next actions**")
+            for item in research["next_actions_preview"]:
+                lines.append(f"- {item}")
+            lines.append("")
+    else:
+        lines.append("- Research status report not built yet.")
+        if research.get("markdown_path"):
+            lines.append(f"- expected markdown path: {research['markdown_path']}")
+        lines.append("")
 
     lines.extend(["## Safety Boundary", ""])
     safety = packet["safety_boundary"]

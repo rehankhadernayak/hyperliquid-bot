@@ -107,6 +107,10 @@ def _write_walk_forward_report(
     return path
 
 
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
 def _write_candidate_validation(
     reports_dir: Path,
     stamp: str,
@@ -128,6 +132,53 @@ def _write_candidate_validation(
         "execution_enabled": False,
     }
     path.write_text(json.dumps(payload), encoding="utf-8")
+    return path
+
+
+def _write_research_status(reports_root: Path) -> Path:
+    path = reports_root / "research_status" / "research_status_latest.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "generated_at": "2026-07-14T08:36:26Z",
+        "paper_only": True,
+        "execution_enabled": False,
+        "real_execution_ready": False,
+        "safety": {
+            "paper_only": True,
+            "execution_enabled": False,
+            "real_execution_ready": False,
+        },
+        "data_status": {
+            "warnings": ["BTC 1s: missing seconds", "ETH 15s: incomplete bars"],
+            "coins": {
+                "BTC": {
+                    "1s": {
+                        "file_exists": True,
+                        "row_count": 100,
+                        "last_timestamp": "2024-01-01T01:00:00Z",
+                        "validation": {"passed": True, "missing_periods_count": 1},
+                    }
+                },
+            },
+        },
+        "candidate_timeline": [
+            {
+                "candidate": "B",
+                "status": "rejected",
+                "summary": "Rejected after more data.",
+            },
+            {
+                "candidate": "E",
+                "status": "interesting but too sparse",
+                "summary": "Depth-aware signal too sparse.",
+            },
+        ],
+        "blockers": ["Data quality: BTC 1s missing", "Need more out-of-sample data."],
+        "next_actions": ["Continue backfill", "Rerun Candidate E after more data."],
+    }
+    path.write_text(json.dumps(payload), encoding="utf-8")
+    md_path = reports_root / "research_status" / "research_status_latest.md"
+    md_path.write_text("# Research Status\n", encoding="utf-8")
     return path
 
 
@@ -291,6 +342,36 @@ class TestRefreshDashboardArtifacts:
         scenarios = summary["candidate_b"]["scenarios"]
         assert len(scenarios) == 3
         assert all(row["source"] == "fallback" for row in scenarios)
+
+    def test_includes_research_status_when_present(self, workspace: dict[str, Path]) -> None:
+        _write_research_status(workspace["reports_root"])
+        summary = refresher.build_dashboard_summary(
+            reports_root=workspace["reports_root"],
+            data_root=workspace["data_root"],
+        )
+        research = summary["research_status"]
+        assert research["available"] is True
+        assert research["json_path"].endswith("research_status_latest.json")
+        assert research["markdown_path"].endswith("research_status_latest.md")
+        assert research["blocker_count"] == 2
+        assert research["next_action_count"] == 2
+        assert research["data_warning_count"] == 2
+        assert research["candidate_timeline_count"] == 2
+        assert research["safety"]["paper_only"] is True
+        assert research["safety"]["execution_enabled"] is False
+        assert research["safety"]["real_execution_ready"] is False
+        assert summary["source_paths"]["research_status_json"].endswith("research_status_latest.json")
+
+    def test_handles_missing_research_status_gracefully(self, workspace: dict[str, Path]) -> None:
+        summary = refresher.build_dashboard_summary(
+            reports_root=workspace["reports_root"],
+            data_root=workspace["data_root"],
+        )
+        research = summary["research_status"]
+        assert research["available"] is False
+        assert research["json_path"].endswith("research_status_latest.json")
+        assert summary["paper_only"] is True
+        assert summary["execution_enabled"] is False
 
 
 def _block_network_subprocess(monkeypatch: pytest.MonkeyPatch) -> None:

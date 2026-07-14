@@ -30,6 +30,8 @@ PHASE3_TARGET_HOURS = 14 * 24
 PHASE3_AUDIT_REL = Path("bid_ask_research_scheduler/phase3_audit_latest.json")
 WALK_FORWARD_REL = Path("bid_ask_walk_forward")
 CANDIDATE_VALIDATION_REL = Path("bid_ask_candidate_validation")
+RESEARCH_STATUS_JSON_REL = Path("research_status/research_status_latest.json")
+RESEARCH_STATUS_MD_REL = Path("research_status/research_status_latest.md")
 
 CANDIDATE_B_STRICT_NAME = "walk_forward_BTC_20260706T115051.json"
 CANDIDATE_B_RELAXED_25_NAME = "walk_forward_BTC_20260706T142556.json"
@@ -441,6 +443,58 @@ def _milestone_progress(
     return milestones
 
 
+def _research_status_paths(reports_root: Path) -> tuple[Path, Path]:
+    return reports_root / RESEARCH_STATUS_JSON_REL, reports_root / RESEARCH_STATUS_MD_REL
+
+
+def _summarize_research_status(reports_root: Path) -> dict[str, Any]:
+    json_path, md_path = _research_status_paths(reports_root)
+    payload = _load_json(json_path)
+    if payload is None:
+        return {
+            "available": False,
+            "json_path": str(json_path),
+            "markdown_path": str(md_path) if md_path.is_file() else None,
+        }
+
+    data_status = payload.get("data_status") or {}
+    blockers = list(payload.get("blockers") or [])
+    next_actions = list(payload.get("next_actions") or [])
+    timeline = list(payload.get("candidate_timeline") or [])
+    safety = payload.get("safety") or {}
+
+    return {
+        "available": True,
+        "json_path": str(json_path),
+        "markdown_path": str(md_path) if md_path.is_file() else None,
+        "generated_at": payload.get("generated_at"),
+        "paper_only": payload.get("paper_only"),
+        "execution_enabled": payload.get("execution_enabled"),
+        "real_execution_ready": payload.get("real_execution_ready"),
+        "blocker_count": len(blockers),
+        "next_action_count": len(next_actions),
+        "data_warning_count": len(data_status.get("warnings") or []),
+        "candidate_timeline_count": len(timeline),
+        "blockers_preview": blockers[:3],
+        "next_actions_preview": next_actions[:3],
+        "candidate_timeline_preview": [
+            {
+                "candidate": entry.get("candidate"),
+                "status": entry.get("status"),
+                "summary": entry.get("summary"),
+            }
+            for entry in timeline
+        ],
+        "safety": {
+            "paper_only": safety.get("paper_only", payload.get("paper_only")),
+            "execution_enabled": safety.get("execution_enabled", payload.get("execution_enabled")),
+            "real_execution_ready": safety.get(
+                "real_execution_ready", payload.get("real_execution_ready")
+            ),
+        },
+    }
+
+
 def _next_recommended_action(
     phase3: dict[str, Any] | None,
     candidate: dict[str, Any] | None,
@@ -522,6 +576,7 @@ def build_dashboard_summary(
         "latest_accepted_trades_csv_path": _latest_accepted_trades_csv(reports_root, candidate),
         "milestones": _milestone_progress(phase3, latest_walk_forward, candidate),
         "next_recommended_action": _next_recommended_action(phase3, candidate, validation),
+        "research_status": _summarize_research_status(reports_root),
         "source_paths": {
             "phase3_audit": str(phase3_path),
             "walk_forward_dir": str(_walk_forward_dir(reports_root)),
@@ -529,6 +584,8 @@ def build_dashboard_summary(
             "validation_reports_dir": str(data_root / "reports"),
             "historical_1s_dir": str(data_root / "historical_1s"),
             "historical_15s_dir": str(data_root / "historical_15s"),
+            "research_status_json": str(_research_status_paths(reports_root)[0]),
+            "research_status_markdown": str(_research_status_paths(reports_root)[1]),
         },
     }
     if phase3 is not None:
@@ -643,6 +700,27 @@ def write_dashboard_markdown(
 
     lines.extend(["", "## Next Recommended Action", ""])
     lines.append(str(summary.get("next_recommended_action", "")))
+
+    lines.extend(["", "## Research Status", ""])
+    research = summary.get("research_status") or {}
+    if research.get("available"):
+        lines.extend(
+            [
+                f"- json_path: {research.get('json_path')}",
+                f"- markdown_path: {research.get('markdown_path') or 'n/a'}",
+                f"- generated_at: {research.get('generated_at')}",
+                f"- blocker_count: {research.get('blocker_count')}",
+                f"- next_action_count: {research.get('next_action_count')}",
+                f"- data_warning_count: {research.get('data_warning_count')}",
+            ]
+        )
+        for entry in research.get("candidate_timeline_preview") or []:
+            lines.append(
+                f"- Candidate {entry.get('candidate')}: {entry.get('status')} — "
+                f"{entry.get('summary')}"
+            )
+    else:
+        lines.append("- Research status report not built yet.")
 
     output_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
     summary["markdown_report_path"] = str(output_path)
