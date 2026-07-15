@@ -4730,7 +4730,7 @@ class TestResearchSessionLaunchdTemplate:
         assert parsed.run_candidate_tests is True
         assert parsed.run_relaxed_candidate_test is True
         assert parsed.update_dashboard_artifacts is True
-        assert parsed.tick_timeout_minutes == 55
+        assert parsed.tick_timeout_minutes == 90
 
     def test_generated_launchd_template_includes_tick_timeout_minutes(
         self,
@@ -4747,4 +4747,108 @@ class TestResearchSessionLaunchdTemplate:
         for plist in (morning_plist, evening_plist):
             program_args = _extract_plist_program_arguments(plist)
             timeout_index = program_args.index("--tick-timeout-minutes")
-            assert program_args[timeout_index + 1] == "55"
+            assert program_args[timeout_index + 1] == "90"
+
+    def test_default_tick_timeout_is_90(self) -> None:
+        assert scheduler.DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES == 90
+
+    def test_long_autopilot_under_timeout_does_not_stop_session(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        start = datetime(2026, 7, 15, 0, 0, 0, tzinfo=timezone.utc)
+        elapsed_seconds = {"value": 0}
+
+        def now_fn() -> datetime:
+            return start + timedelta(seconds=elapsed_seconds["value"])
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: {"imported_historical_1s": {}},
+        )
+
+        def fake_autopilot(**kwargs: object) -> scheduler.AutopilotReport:
+            elapsed_seconds["value"] = 57 * 60
+            return scheduler.AutopilotReport(action="chunk_completed")
+
+        monkeypatch.setattr(scheduler, "cmd_autopilot_tick", fake_autopilot)
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            max_ticks=1,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            tick_now_fn=now_fn,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        tick = session["per_tick_summaries"][0]
+        stage_names = [event["name"] for event in tick["stage_events"]]
+        assert session["stop_reason"] is None
+        assert "post_audit_done" in stage_names
+        assert not any(str(failure).startswith("tick timeout") for failure in tick["failures"])
+        assert session["paper_only"] is True
+        assert session["execution_enabled"] is False
+        assert session["real_execution_ready"] is False
+
+    def test_slow_autopilot_emits_warning_without_failure(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch)
+        start = datetime(2026, 7, 15, 0, 0, 0, tzinfo=timezone.utc)
+        elapsed_seconds = {"value": 0}
+
+        def now_fn() -> datetime:
+            return start + timedelta(seconds=elapsed_seconds["value"])
+
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: {"imported_historical_1s": {}},
+        )
+
+        def fake_autopilot(**kwargs: object) -> scheduler.AutopilotReport:
+            elapsed_seconds["value"] = 51 * 60
+            return scheduler.AutopilotReport(action="chunk_completed")
+
+        monkeypatch.setattr(scheduler, "cmd_autopilot_tick", fake_autopilot)
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            max_ticks=1,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            tick_now_fn=now_fn,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        tick = session["per_tick_summaries"][0]
+        assert any(
+            scheduler.RESEARCH_SESSION_AUTOPILOT_SLOW_WARNING.split("{")[0] in warning
+            for warning in tick["warnings"]
+        )
+        assert not any(str(failure).startswith("tick timeout") for failure in tick["failures"])
+        assert session["stop_reason"] is None

@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.hyperliquid.research.session.evening</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/caffeinate</string>
+        <string>-d</string>
+        <string>-i</string>
+        <string>-m</string>
+        <string>-s</string>
+        <string>-u</string>
+        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+        <string>/Users/lysto_mac/hyperliquid-bot/bid_ask_research_scheduler.py</string>
+        <string>research-session</string>
+        <string>--duration-hours</string>
+        <string>8</string>
+        <string>--tick-interval-minutes</string>
+        <string>60</string>
+        <string>--tick-timeout-minutes</string>
+        <string>90</string>
+        <string>--requester-pays</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>/Users/lysto_mac/hyperliquid-bot</string>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>16</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>reports/bid_ask_research_scheduler/research_session_launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>reports/bid_ask_research_scheduler/research_session_launchd.err.log</string>
+</dict>
+</plist>

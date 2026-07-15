@@ -122,7 +122,12 @@ LAUNCHD_RESEARCH_SESSION_EVENING_PLIST = "com.hyperliquid.research.session.eveni
 LAUNCHD_RESEARCH_SESSION_SETUP_MD = "launchd_research_session_setup.md"
 DEFAULT_RESEARCH_SESSION_DURATION_HOURS = 8
 DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES = 60
-DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES = 55
+DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES = 90
+RESEARCH_SESSION_AUTOPILOT_SLOW_WARNING_MINUTES = 50
+RESEARCH_SESSION_AUTOPILOT_SLOW_WARNING = (
+    "autopilot_tick exceeded {threshold_minutes} minutes "
+    "({elapsed_minutes:.1f} min elapsed); session continues if under tick timeout"
+)
 DEFAULT_RESEARCH_SESSION_MORNING_HOUR = 8
 DEFAULT_RESEARCH_SESSION_EVENING_HOUR = 16
 DEFAULT_RESEARCH_SESSION_OUTPUT_DIR = Path("launchd")
@@ -4270,6 +4275,19 @@ class ResearchSessionTickStageTracker:
             return None
         return failure
 
+    def autopilot_tick_elapsed_seconds(self) -> float | None:
+        start = next(
+            (event for event in self.stage_events if event["name"] == "autopilot_tick_start"),
+            None,
+        )
+        done = next(
+            (event for event in self.stage_events if event["name"] == "autopilot_tick_done"),
+            None,
+        )
+        if start is None or done is None:
+            return None
+        return float(done["elapsed_seconds"]) - float(start["elapsed_seconds"])
+
 
 def _resolve_research_session_coins(
     state_path: Path,
@@ -4621,6 +4639,22 @@ def _execute_research_session_tick(
         runs_dir=runs_dir,
     )
     tracker.record_stage("autopilot_tick_done")
+    autopilot_elapsed = tracker.autopilot_tick_elapsed_seconds()
+    if (
+        autopilot_elapsed is not None
+        and autopilot_elapsed > RESEARCH_SESSION_AUTOPILOT_SLOW_WARNING_MINUTES * 60
+    ):
+        slow_warning = RESEARCH_SESSION_AUTOPILOT_SLOW_WARNING.format(
+            threshold_minutes=RESEARCH_SESSION_AUTOPILOT_SLOW_WARNING_MINUTES,
+            elapsed_minutes=autopilot_elapsed / 60.0,
+        )
+        tick_warnings.append(slow_warning)
+        print(
+            "[research-session] "
+            f"tick={tick_index} "
+            f"warning: {slow_warning}",
+            flush=True,
+        )
     if _timeout_before("post_audit_start"):
         return _finish_tick(pre_audit=pre_audit, autopilot_report=autopilot_report)
 
