@@ -16,6 +16,7 @@ from bid_ask_schema import (
     FORBIDDEN_MODULE_NAMES,
     FORBIDDEN_SOURCE_PATTERNS,
     PAPER_ONLY,
+    timestamp_ms_to_iso,
 )
 from bid_ask_validator import bid_ask_csv_path
 
@@ -52,6 +53,7 @@ def _write_1s_csv(
     lines = [",".join(columns)]
     for index in range(rows):
         ts = start_ms + index * 1000
+        iso = timestamp_ms_to_iso(ts)
         bid = 100.0 + index
         ask = 100.5 + index
         mid = (bid + ask) / 2.0
@@ -60,7 +62,7 @@ def _write_1s_csv(
         bid_size = "2.0" if include_sizes else ""
         ask_size = "1.0" if include_sizes else ""
         lines.append(
-            f"{ts},2024-01-01T00:00:00Z,{coin},{bid},{ask},{mid},{spread},{spread_bps},"
+            f"{ts},{iso},{coin},{bid},{ask},{mid},{spread},{spread_bps},"
             f"{bid_size},{ask_size},0.0,session,bbo"
         )
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -102,11 +104,12 @@ def _write_resampled_csv(
     for index in range(rows):
         start = start_ms + index * step_ms
         end = start + step_ms - 1
+        iso = timestamp_ms_to_iso(start)
         mid = 100.0 + index
         row = [
             str(start),
             str(end),
-            "2024-01-01T00:00:00Z",
+            iso,
             coin,
             str(mid),
             str(mid + 0.5),
@@ -195,6 +198,8 @@ class TestCoverage:
         assert btc_1s["row_count"] == rows
         assert btc_1s["first_timestamp_ms"] == BASE_MS
         assert btc_1s["latest_timestamp_ms"] == BASE_MS + (rows - 1) * 1000
+        assert btc_1s["first_timestamp_iso"] == timestamp_ms_to_iso(BASE_MS)
+        assert btc_1s["latest_timestamp_iso"] == timestamp_ms_to_iso(BASE_MS + (rows - 1) * 1000)
         assert btc_1s["coverage_hours"] == pytest.approx((rows - 1) / 3600, rel=1e-3)
 
     def test_missing_files_handled(self, workspace: dict[str, Path]) -> None:
@@ -206,9 +211,124 @@ class TestCoverage:
                 assert entry["file_exists"] is False
                 assert entry["row_count"] == 0
                 assert entry["coverage_hours"] == 0.0
+                assert entry["first_timestamp_ms"] is None
+                assert entry["latest_timestamp_ms"] is None
+                assert entry["first_timestamp_iso"] is None
+                assert entry["latest_timestamp_iso"] is None
                 assert entry["next_milestone"] == "3_days"
 
         assert any("CSV missing" in warning for warning in report["data_quality_warnings"])
+
+
+class TestTimestampExport:
+    def test_timestamp_ms_export(self, workspace: dict[str, Path]) -> None:
+        data_root = workspace["data_root"]
+        path = bid_ask_csv_path("BTC", "1s", data_root, source="historical")
+        _write_1s_csv(path, rows=5, start_ms=BASE_MS)
+
+        stats = tracker._analyze_csv(path, interval="1s")
+
+        assert stats["first_timestamp_ms"] == BASE_MS
+        assert stats["latest_timestamp_ms"] == BASE_MS + 4000
+        assert stats["first_timestamp_iso"] == timestamp_ms_to_iso(BASE_MS)
+        assert stats["latest_timestamp_iso"] == timestamp_ms_to_iso(BASE_MS + 4000)
+        assert stats["coverage_hours"] == pytest.approx(0.001, rel=1e-3)
+
+    def test_timestamp_iso_fallback_when_ms_missing(self, workspace: dict[str, Path]) -> None:
+        data_root = workspace["data_root"]
+        path = bid_ask_csv_path("BTC", "1s", data_root, source="historical")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        first_iso = "2024-06-01T12:00:00.123000Z"
+        latest_iso = "2024-06-01T12:00:04.123000Z"
+        lines = [
+            "timestamp_ms,timestamp_iso,coin,best_bid,best_ask,mid_price,spread,spread_bps",
+            f",{first_iso},BTC,100,101,100.5,1,10",
+            f",{latest_iso},BTC,101,102,101.5,1,10",
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        stats = tracker._analyze_csv(path, interval="1s")
+
+        assert stats["first_timestamp_iso"] == first_iso
+        assert stats["latest_timestamp_iso"] == latest_iso
+        assert stats["first_timestamp_ms"] == tracker._parse_iso_to_ms(first_iso)
+        assert stats["latest_timestamp_ms"] == tracker._parse_iso_to_ms(latest_iso)
+        assert stats["coverage_hours"] > 0.0
+
+    def test_mixed_invalid_timestamps_ignored(self, workspace: dict[str, Path]) -> None:
+        data_root = workspace["data_root"]
+        path = bid_ask_csv_path("BTC", "1s", data_root, source="historical")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        valid_ms = BASE_MS + 2000
+        valid_iso = timestamp_ms_to_iso(valid_ms)
+        lines = [
+            "timestamp_ms,timestamp_iso,coin,best_bid,best_ask,mid_price,spread,spread_bps",
+            ",,BTC,100,101,100.5,1,10",
+            "NaN,not-an-iso,BTC,100,101,100.5,1,10",
+            f" ,{valid_iso},BTC,100,101,100.5,1,10",
+            f"{valid_ms},{valid_iso},BTC,101,102,101.5,1,10",
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        stats = tracker._analyze_csv(path, interval="1s")
+
+        assert stats["row_count"] == 4
+        assert stats["first_timestamp_ms"] == valid_ms
+        assert stats["latest_timestamp_ms"] == valid_ms
+        assert stats["first_timestamp_iso"] == valid_iso
+        assert stats["latest_timestamp_iso"] == valid_iso
+        assert stats["coverage_hours"] == 0.0
+
+    def test_missing_timestamp_columns(self, workspace: dict[str, Path]) -> None:
+        data_root = workspace["data_root"]
+        path = bid_ask_csv_path("BTC", "1s", data_root, source="historical")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            "coin,best_bid,best_ask,mid_price,spread,spread_bps\nBTC,100,101,100.5,1,10\n",
+            encoding="utf-8",
+        )
+
+        stats = tracker._analyze_csv(path, interval="1s")
+
+        assert stats["row_count"] == 1
+        assert stats["first_timestamp_ms"] is None
+        assert stats["latest_timestamp_ms"] is None
+        assert stats["first_timestamp_iso"] is None
+        assert stats["latest_timestamp_iso"] is None
+        assert stats["coverage_hours"] == 0.0
+
+    def test_resampled_end_timestamp_ms_used_for_latest(self, workspace: dict[str, Path]) -> None:
+        data_root = workspace["data_root"]
+        path = bid_ask_csv_path("BTC", "15s", data_root, source="historical")
+        _write_resampled_csv(path, interval_seconds=15, rows=3, start_ms=BASE_MS)
+
+        stats = tracker._analyze_csv(path, interval="15s")
+
+        assert stats["first_timestamp_ms"] == BASE_MS
+        assert stats["latest_timestamp_ms"] == BASE_MS + 2 * 15_000 + 14_999
+        assert stats["first_timestamp_iso"] == timestamp_ms_to_iso(BASE_MS)
+        assert stats["latest_timestamp_iso"] == timestamp_ms_to_iso(BASE_MS + 2 * 15_000)
+        assert stats["coverage_hours"] == pytest.approx(0.012, rel=1e-3)
+
+    def test_coverage_hours_unchanged_with_iso_only_rows(self, workspace: dict[str, Path]) -> None:
+        data_root = workspace["data_root"]
+        path = bid_ask_csv_path("ETH", "1s", data_root, source="historical")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        start_iso = "2024-01-01T00:00:00Z"
+        end_iso = "2024-01-04T00:00:00Z"
+        lines = [
+            "timestamp_ms,timestamp_iso,coin,best_bid,best_ask,mid_price,spread,spread_bps",
+            f",{start_iso},ETH,100,101,100.5,1,10",
+            f",{end_iso},ETH,101,102,101.5,1,10",
+        ]
+        path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+        report = tracker.build_backfill_milestone_report(data_root=data_root)
+        entry = report["coverage"]["ETH"]["1s"]
+
+        assert entry["coverage_hours"] == pytest.approx(72.0, rel=1e-3)
+        assert entry["first_timestamp_iso"] == start_iso
+        assert entry["latest_timestamp_iso"] == end_iso
 
 
 class TestMilestones:

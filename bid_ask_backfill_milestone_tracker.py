@@ -22,6 +22,7 @@ from bid_ask_schema import (
     SAFETY_STATEMENT,
     TIMESTAMP_ISO,
     TIMESTAMP_MS,
+    timestamp_ms_to_iso,
 )
 from bid_ask_validator import bid_ask_csv_path
 
@@ -89,42 +90,63 @@ def _parse_iso_to_ms(iso: str) -> int | None:
         return None
 
 
-def _fmt_ts_ms(ts_ms: int | None) -> str | None:
-    if ts_ms is None:
+def _is_blank_timestamp_value(raw: str | None) -> bool:
+    if raw is None:
+        return True
+    text = str(raw).strip()
+    return not text or text.lower() in {"nan", "null", "none"}
+
+
+def _parse_timestamp_ms(raw: str | None) -> int | None:
+    if _is_blank_timestamp_value(raw):
         return None
-    return datetime.fromtimestamp(ts_ms / 1000, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    try:
+        value = float(str(raw).strip())
+        if value != value:
+            return None
+        return int(value)
+    except (TypeError, ValueError, OverflowError):
+        return None
 
 
-def _row_timestamp_ms(row: dict[str, str], *, interval: str) -> int | None:
+def _parse_timestamp_iso(raw: str | None) -> str | None:
+    if _is_blank_timestamp_value(raw):
+        return None
+    text = str(raw).strip()
+    if _parse_iso_to_ms(text) is None:
+        return None
+    return text
+
+
+def _row_first_timestamp(row: dict[str, str], *, interval: str) -> tuple[int | None, str | None]:
     if interval == "1s":
-        primary = row.get(TIMESTAMP_MS)
-        fallback = row.get(TIMESTAMP_ISO)
+        primary_raw = row.get(TIMESTAMP_MS)
     else:
-        primary = row.get("start_timestamp_ms")
-        fallback = row.get(TIMESTAMP_ISO)
+        primary_raw = row.get("start_timestamp_ms")
 
-    if primary:
-        try:
-            return int(float(primary))
-        except (TypeError, ValueError):
-            pass
+    iso_raw = row.get(TIMESTAMP_ISO)
+    iso = _parse_timestamp_iso(iso_raw)
 
-    if fallback:
-        return _parse_iso_to_ms(fallback)
-    return None
+    ts_ms = _parse_timestamp_ms(primary_raw)
+    if ts_ms is not None:
+        return ts_ms, iso or timestamp_ms_to_iso(ts_ms)
+
+    if iso is not None:
+        return _parse_iso_to_ms(iso), iso
+    return None, None
 
 
-def _row_latest_timestamp_ms(row: dict[str, str], *, interval: str) -> int | None:
+def _row_latest_timestamp(row: dict[str, str], *, interval: str) -> tuple[int | None, str | None]:
     if interval == "1s":
-        return _row_timestamp_ms(row, interval=interval)
+        return _row_first_timestamp(row, interval=interval)
 
     end_raw = row.get("end_timestamp_ms")
-    if end_raw:
-        try:
-            return int(float(end_raw))
-        except (TypeError, ValueError):
-            pass
-    return _row_timestamp_ms(row, interval=interval)
+    end_ms = _parse_timestamp_ms(end_raw)
+    if end_ms is not None:
+        iso = _parse_timestamp_iso(row.get(TIMESTAMP_ISO))
+        return end_ms, iso or timestamp_ms_to_iso(end_ms)
+
+    return _row_first_timestamp(row, interval=interval)
 
 
 def _has_usable_depth_value(raw: str | None) -> bool:
@@ -146,8 +168,8 @@ def _analyze_csv(path: Path, *, interval: str) -> dict[str, Any]:
         "row_count": 0,
         "first_timestamp_ms": None,
         "latest_timestamp_ms": None,
-        "first_timestamp": None,
-        "latest_timestamp": None,
+        "first_timestamp_iso": None,
+        "latest_timestamp_iso": None,
         "coverage_hours": 0.0,
         "bid_size_present": False,
         "ask_size_present": False,
@@ -159,6 +181,8 @@ def _analyze_csv(path: Path, *, interval: str) -> dict[str, Any]:
 
     first_ts: int | None = None
     latest_ts: int | None = None
+    first_iso: str | None = None
+    latest_iso: str | None = None
     has_bid_size = False
     has_ask_size = False
     header_has_bid = False
@@ -174,15 +198,17 @@ def _analyze_csv(path: Path, *, interval: str) -> dict[str, Any]:
             for row in reader:
                 result["row_count"] += 1
 
-                row_first = _row_timestamp_ms(row, interval=interval)
-                row_latest = _row_latest_timestamp_ms(row, interval=interval)
+                row_first_ms, row_first_iso = _row_first_timestamp(row, interval=interval)
+                row_latest_ms, row_latest_iso = _row_latest_timestamp(row, interval=interval)
 
-                if row_first is not None:
-                    if first_ts is None or row_first < first_ts:
-                        first_ts = row_first
-                if row_latest is not None:
-                    if latest_ts is None or row_latest > latest_ts:
-                        latest_ts = row_latest
+                if row_first_ms is not None:
+                    if first_ts is None or row_first_ms < first_ts:
+                        first_ts = row_first_ms
+                        first_iso = row_first_iso
+                if row_latest_ms is not None:
+                    if latest_ts is None or row_latest_ms > latest_ts:
+                        latest_ts = row_latest_ms
+                        latest_iso = row_latest_iso
 
                 if header_has_bid and _has_usable_depth_value(row.get(BID_SIZE)):
                     has_bid_size = True
@@ -193,8 +219,8 @@ def _analyze_csv(path: Path, *, interval: str) -> dict[str, Any]:
 
     result["first_timestamp_ms"] = first_ts
     result["latest_timestamp_ms"] = latest_ts
-    result["first_timestamp"] = _fmt_ts_ms(first_ts)
-    result["latest_timestamp"] = _fmt_ts_ms(latest_ts)
+    result["first_timestamp_iso"] = first_iso or (timestamp_ms_to_iso(first_ts) if first_ts is not None else None)
+    result["latest_timestamp_iso"] = latest_iso or (timestamp_ms_to_iso(latest_ts) if latest_ts is not None else None)
 
     if first_ts is not None and latest_ts is not None and latest_ts >= first_ts:
         result["coverage_hours"] = round((latest_ts - first_ts) / 3_600_000, 3)
@@ -290,8 +316,8 @@ def _coin_interval_coverage(coin: str, interval: str, data_root: Path) -> dict[s
         "row_count": csv_stats["row_count"],
         "first_timestamp_ms": csv_stats["first_timestamp_ms"],
         "latest_timestamp_ms": csv_stats["latest_timestamp_ms"],
-        "first_timestamp": csv_stats["first_timestamp"],
-        "latest_timestamp": csv_stats["latest_timestamp"],
+        "first_timestamp_iso": csv_stats["first_timestamp_iso"],
+        "latest_timestamp_iso": csv_stats["latest_timestamp_iso"],
         "coverage_hours": csv_stats["coverage_hours"],
         "validator_report_available": validation is not None,
         "validator_report_path": (validation or {}).get("_report_path"),
@@ -491,8 +517,8 @@ def write_milestone_markdown(
             entry = report["coverage"][coin][interval]
             lines.append(
                 f"| {coin} | {interval} | {entry.get('row_count', 0)} | "
-                f"{entry.get('first_timestamp') or 'n/a'} | "
-                f"{entry.get('latest_timestamp') or 'n/a'} | "
+                f"{entry.get('first_timestamp_iso') or 'n/a'} | "
+                f"{entry.get('latest_timestamp_iso') or 'n/a'} | "
                 f"{entry.get('coverage_hours', 0.0)} |"
             )
 
