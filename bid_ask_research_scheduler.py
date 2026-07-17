@@ -128,6 +128,13 @@ RESEARCH_SESSION_AUTOPILOT_SLOW_WARNING = (
     "autopilot_tick exceeded {threshold_minutes} minutes "
     "({elapsed_minutes:.1f} min elapsed); session continues if under tick timeout"
 )
+DEFAULT_AUTOPILOT_TICK_MAX_FILES = 6
+DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS = 1
+DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES = 50
+AUTOPILOT_TICK_BUDGET_SKIPPED_MESSAGE = (
+    "Autopilot tick deferred: remaining backfill exceeds per-tick budget; "
+    "will continue on next tick"
+)
 DEFAULT_RESEARCH_SESSION_MORNING_HOUR = 8
 DEFAULT_RESEARCH_SESSION_EVENING_HOUR = 16
 DEFAULT_RESEARCH_SESSION_OUTPUT_DIR = Path("launchd")
@@ -328,6 +335,13 @@ class AutopilotReport:
     chunk_size_hours: int = DEFAULT_CHUNK_SIZE_HOURS
     estimated_files: int = 0
     requested_files: int = 0
+    requested_files_this_tick: int = 0
+    completed_files_this_tick: int = 0
+    skipped_due_to_tick_budget: int = 0
+    tick_budget_reason: str | None = None
+    tick_max_files: int | None = None
+    tick_max_chunks: int | None = None
+    tick_budget_minutes: int | None = None
     files_requested: int = 0
     files_downloaded: int = 0
     files_downloaded_new: int = 0
@@ -381,6 +395,13 @@ class AutopilotReport:
             "chunk_size_hours": self.chunk_size_hours,
             "estimated_files": self.estimated_files,
             "requested_files": self.requested_files,
+            "requested_files_this_tick": self.requested_files_this_tick,
+            "completed_files_this_tick": self.completed_files_this_tick,
+            "skipped_due_to_tick_budget": self.skipped_due_to_tick_budget,
+            "tick_budget_reason": self.tick_budget_reason,
+            "tick_max_files": self.tick_max_files,
+            "tick_max_chunks": self.tick_max_chunks,
+            "tick_budget_minutes": self.tick_budget_minutes,
             "files_requested": self.files_requested,
             "files_downloaded": self.files_downloaded,
             "files_downloaded_new": self.files_downloaded_new,
@@ -546,6 +567,72 @@ def _utc_today_yyyymmdd() -> str:
 
 def _estimate_chunk_files(num_coins: int, chunk_size_hours: int) -> int:
     return num_coins * chunk_size_hours
+
+
+def _resolve_autopilot_tick_limits(
+    *,
+    tick_max_files: int | None,
+    tick_max_chunks: int | None,
+    tick_budget_minutes: int | None,
+) -> tuple[int, int, int]:
+    """Resolve per-tick backfill caps used to keep autopilot ticks under ~45-60 minutes."""
+    resolved_files = (
+        DEFAULT_AUTOPILOT_TICK_MAX_FILES if tick_max_files is None else tick_max_files
+    )
+    resolved_chunks = (
+        DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS if tick_max_chunks is None else tick_max_chunks
+    )
+    resolved_minutes = (
+        DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES
+        if tick_budget_minutes is None
+        else tick_budget_minutes
+    )
+    if resolved_files < 1:
+        raise ValueError("tick_max_files must be at least 1")
+    if resolved_chunks < 1:
+        raise ValueError("tick_max_chunks must be at least 1")
+    if resolved_minutes < 1:
+        raise ValueError("tick_budget_minutes must be at least 1")
+    return resolved_files, resolved_chunks, resolved_minutes
+
+
+def _truncate_hours_for_tick_file_budget(
+    hours: list[str],
+    *,
+    num_coins: int,
+    tick_max_files: int,
+) -> tuple[list[str], int, int]:
+    """Return hour subset, requested files, and deferred files for this tick."""
+    if not hours or num_coins < 1 or tick_max_files < 1:
+        return [], 0, len(hours) * max(num_coins, 0)
+    max_hours = tick_max_files // num_coins
+    if max_hours < 1:
+        return [], 0, len(hours) * num_coins
+    truncated = list(hours[:max_hours])
+    requested = len(truncated) * num_coins
+    full_requested = len(hours) * num_coins
+    skipped = max(0, full_requested - requested)
+    return truncated, requested, skipped
+
+
+def _populate_autopilot_tick_budget_fields(
+    report: AutopilotReport,
+    *,
+    tick_max_files: int,
+    tick_max_chunks: int,
+    tick_budget_minutes: int,
+    requested_files_this_tick: int,
+    skipped_due_to_tick_budget: int = 0,
+    tick_budget_reason: str | None = None,
+) -> None:
+    report.tick_max_files = tick_max_files
+    report.tick_max_chunks = tick_max_chunks
+    report.tick_budget_minutes = tick_budget_minutes
+    report.requested_files_this_tick = requested_files_this_tick
+    report.skipped_due_to_tick_budget = skipped_due_to_tick_budget
+    report.tick_budget_reason = tick_budget_reason
+    report.requested_files = requested_files_this_tick
+    report.estimated_files = requested_files_this_tick
 
 
 def compute_effective_daily_file_capacity(
@@ -2078,6 +2165,10 @@ def write_autopilot_report(
         f"- coins: {', '.join(report.coins) or 'none'}",
         f"- chunk_size_hours: {report.chunk_size_hours}",
         f"- requested_files: {report.requested_files}",
+        f"- requested_files_this_tick: {report.requested_files_this_tick}",
+        f"- completed_files_this_tick: {report.completed_files_this_tick}",
+        f"- skipped_due_to_tick_budget: {report.skipped_due_to_tick_budget}",
+        f"- tick_budget_reason: {report.tick_budget_reason}",
         f"- files_requested: {report.files_requested}",
         f"- estimated_files: {report.estimated_files}",
         f"- files_downloaded: {report.files_downloaded}",
@@ -3139,6 +3230,7 @@ def cmd_daily_cycle(
     daily_summary_dir: Path = bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
     s3_client: Any | None = None,
     defer_batch_completion: bool = False,
+    skip_training: bool = False,
 ) -> SchedulerReport:
     """Run one bounded daily research cycle and update scheduler state."""
     state = load_state(state_path)
@@ -3199,25 +3291,26 @@ def cmd_daily_cycle(
     report.failures.extend(validate_report.failures)
     report.details["resample_validate"] = validate_report.to_dict()
 
-    train_report = orchestrator.cmd_train_evaluate(
-        coins=normalized_coins,
-        source="historical",
-        interval=train_interval,
-        horizon=horizon,
-        data_root=data_root,
-        report_dir=orchestrator_report_dir,
-    )
-    report.workflows_run.append("train-evaluate-historical")
-    report.row_counts.update(train_report.row_counts)
-    report.warnings.extend(train_report.warnings)
-    report.failures.extend(train_report.failures)
-    _apply_train_metadata(report, train_report)
-    report.details["train_evaluate_historical"] = train_report.to_dict()
+    if not skip_training:
+        train_report = orchestrator.cmd_train_evaluate(
+            coins=normalized_coins,
+            source="historical",
+            interval=train_interval,
+            horizon=horizon,
+            data_root=data_root,
+            report_dir=orchestrator_report_dir,
+        )
+        report.workflows_run.append("train-evaluate-historical")
+        report.row_counts.update(train_report.row_counts)
+        report.warnings.extend(train_report.warnings)
+        report.failures.extend(train_report.failures)
+        _apply_train_metadata(report, train_report)
+        report.details["train_evaluate_historical"] = train_report.to_dict()
 
     state = load_state(state_path)
     state.last_training_at = _utc_now_iso()
 
-    if include_combined:
+    if include_combined and not skip_training:
         combined_report = orchestrator.cmd_combined_dataset(
             coins=normalized_coins,
             intervals=["1s", "15s", "1m"],
@@ -3457,6 +3550,7 @@ def cmd_auto_backfill_next(
     daily_summary_dir: Path = bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
     s3_client: Any | None = None,
     chunk_selection: dict[str, Any] | None = None,
+    skip_training: bool = False,
 ) -> SchedulerReport:
     """Run one bounded historical chunk: backfill, validate, train, update state, exit."""
     orchestrator.reject_all_time(all_time=False)
@@ -3562,6 +3656,7 @@ def cmd_auto_backfill_next(
         daily_summary_dir=daily_summary_dir,
         s3_client=s3_client,
         defer_batch_completion=True,
+        skip_training=skip_training,
     )
 
     report.workflows_run.extend(cycle_report.workflows_run)
@@ -3962,6 +4057,12 @@ def cmd_autopilot_tick(
     daily_summary_dir: Path = bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
     s3_client: Any | None = None,
     today_override: str | None = None,
+    tick_max_files: int | None = None,
+    tick_max_chunks: int | None = None,
+    tick_budget_minutes: int | None = None,
+    research_session_mode: bool = False,
+    tick_start_time: datetime | None = None,
+    now_fn: Any | None = None,
 ) -> AutopilotReport:
     """Run one bounded autopilot tick: check limits, auto-backfill-next, update state, exit."""
     orchestrator.reject_all_time(all_time=False)
@@ -3974,16 +4075,31 @@ def cmd_autopilot_tick(
         requester_pays=requester_pays,
     )
     normalized_coins = _effective_scheduler_coins(state, coins)
+    num_coins = len(normalized_coins)
     today = today_override or _utc_today_yyyymmdd()
-    requested_files = _estimate_chunk_files(len(normalized_coins), chunk_size_hours)
+    resolved_tick_max_files, resolved_tick_max_chunks, resolved_tick_budget_minutes = (
+        _resolve_autopilot_tick_limits(
+            tick_max_files=tick_max_files,
+            tick_max_chunks=tick_max_chunks,
+            tick_budget_minutes=tick_budget_minutes,
+        )
+    )
+    full_chunk_files = _estimate_chunk_files(num_coins, chunk_size_hours)
 
     report = AutopilotReport(
         coins=normalized_coins,
         chunk_size_hours=chunk_size_hours,
-        estimated_files=requested_files,
-        requested_files=requested_files,
+        estimated_files=full_chunk_files,
+        requested_files=full_chunk_files,
         train_interval=train_interval,
         horizon=horizon,
+    )
+    _populate_autopilot_tick_budget_fields(
+        report,
+        tick_max_files=resolved_tick_max_files,
+        tick_max_chunks=resolved_tick_max_chunks,
+        tick_budget_minutes=resolved_tick_budget_minutes,
+        requested_files_this_tick=0,
     )
     _populate_aws_access_report_fields(
         report,
@@ -4014,14 +4130,23 @@ def cmd_autopilot_tick(
         state.autopilot = autopilot
         save_state(state, state_path)
 
-    _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files)
+    now = now_fn or (lambda: datetime.now(timezone.utc))
+    if tick_start_time is not None:
+        elapsed_minutes = (now() - tick_start_time).total_seconds() / 60.0
+        if elapsed_minutes >= resolved_tick_budget_minutes:
+            report.action = "tick_budget_skipped"
+            report.tick_budget_reason = (
+                f"Tick wall-clock budget already consumed ({elapsed_minutes:.1f} min "
+                f">= {resolved_tick_budget_minutes} min) before backfill start"
+            )
+            report.warnings.append(AUTOPILOT_TICK_BUDGET_SKIPPED_MESSAGE)
+            report.next_recommended_action = (
+                "Remaining backfill deferred to next tick; rerun autopilot-tick or research-session"
+            )
+            state.autopilot = autopilot
+            return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
-    limit_reason = _autopilot_would_exceed_daily_limits(autopilot, requested_files)
-    if limit_reason:
-        report.action = "limit_skipped"
-        report.warnings.append(limit_reason)
-        state.autopilot = autopilot
-        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+    _populate_autopilot_report_limits(report, autopilot, requested_files=full_chunk_files)
 
     state.autopilot = autopilot
     save_state(state, state_path)
@@ -4053,12 +4178,70 @@ def cmd_autopilot_tick(
         state.autopilot = autopilot
         return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
 
+    selected_hours = list(chunk_selection.get("selected_hours") or [])
+    selected_date = chunk_selection.get("selected_date")
+    if selected_date:
+        completed_hours = _hours_completed_for_date(state, selected_date)
+        selected_hours = [hour for hour in selected_hours if hour not in completed_hours]
+    truncated_hours, requested_files_this_tick, skipped_files = _truncate_hours_for_tick_file_budget(
+        selected_hours,
+        num_coins=num_coins,
+        tick_max_files=resolved_tick_max_files,
+    )
+    tick_budget_reason: str | None = None
+    if skipped_files > 0 and truncated_hours:
+        tick_budget_reason = (
+            f"Truncated chunk hours from {len(selected_hours)} to {len(truncated_hours)} "
+            f"to stay within tick_max_files={resolved_tick_max_files}"
+        )
+        report.warnings.append(tick_budget_reason)
+    _populate_autopilot_tick_budget_fields(
+        report,
+        tick_max_files=resolved_tick_max_files,
+        tick_max_chunks=resolved_tick_max_chunks,
+        tick_budget_minutes=resolved_tick_budget_minutes,
+        requested_files_this_tick=requested_files_this_tick,
+        skipped_due_to_tick_budget=skipped_files,
+        tick_budget_reason=tick_budget_reason,
+    )
+
+    if not truncated_hours:
+        report.action = "tick_budget_skipped"
+        report.tick_budget_reason = (
+            f"Planned chunk requires {len(selected_hours) * num_coins} files but "
+            f"tick_max_files={resolved_tick_max_files}; deferring to next tick"
+        )
+        report.warnings.append(AUTOPILOT_TICK_BUDGET_SKIPPED_MESSAGE)
+        report.next_recommended_action = (
+            "Remaining backfill deferred to next tick; rerun autopilot-tick or research-session"
+        )
+        state.autopilot = autopilot
+        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+
+    limit_reason = _autopilot_would_exceed_daily_limits(autopilot, requested_files_this_tick)
+    if limit_reason:
+        report.action = "limit_skipped"
+        report.warnings.append(limit_reason)
+        state.autopilot = autopilot
+        return _finalize_autopilot_report(report, state, state_path=state_path, runs_dir=runs_dir)
+
+    bounded_chunk_selection = dict(chunk_selection)
+    bounded_chunk_selection["selected_hours"] = truncated_hours
+    bounded_chunk_selection["tick_budget_truncated"] = truncated_hours != selected_hours
+    report.historical_hours = truncated_hours
+
+    effective_max_files = max_files
+    if effective_max_files is None:
+        effective_max_files = resolved_tick_max_files
+    else:
+        effective_max_files = min(effective_max_files, resolved_tick_max_files)
+
     pre_coverage = _historical_1s_coverage_by_coin(normalized_coins, data_root)
 
     backfill_report = cmd_auto_backfill_next(
         coins=normalized_coins,
         chunk_size_hours=chunk_size_hours,
-        max_files=max_files,
+        max_files=effective_max_files,
         allow_more=allow_more,
         aws_profile=resolved_aws_profile,
         requester_pays=resolved_requester_pays,
@@ -4071,7 +4254,8 @@ def cmd_autopilot_tick(
         runs_dir=runs_dir,
         daily_summary_dir=daily_summary_dir,
         s3_client=s3_client,
-        chunk_selection=chunk_selection,
+        chunk_selection=bounded_chunk_selection,
+        skip_training=research_session_mode,
     )
 
     state = load_state(state_path)
@@ -4113,9 +4297,16 @@ def cmd_autopilot_tick(
             batch_payload=batch_payload,
         )
     report.details["import_progress"] = import_progress
-    _populate_autopilot_import_fields(report, import_progress, requested_files=requested_files)
+    _populate_autopilot_import_fields(
+        report,
+        import_progress,
+        requested_files=requested_files_this_tick,
+    )
+    report.completed_files_this_tick = (
+        report.files_downloaded_new + report.files_skipped_existing
+    )
 
-    _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files)
+    _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files_this_tick)
 
     if any(AUTO_BACKFILL_COMPLETE_MESSAGE in w for w in backfill_report.warnings):
         report.action = "backfill_complete"
@@ -4170,12 +4361,12 @@ def cmd_autopilot_tick(
         autopilot.files_downloaded_today += files_downloaded_new
         autopilot.failed_runs_in_row = 0
         autopilot.last_run_date = today
-        _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files)
+        _populate_autopilot_report_limits(report, autopilot, requested_files=requested_files_this_tick)
         _record_autopilot_success_day(autopilot, today)
         ramped = _maybe_ramp_autopilot_limits(
             autopilot,
             chunk_size_hours=chunk_size_hours,
-            num_coins=len(normalized_coins),
+            num_coins=num_coins,
         )
         report.action = "chunk_completed"
         if ramped:
@@ -4183,7 +4374,15 @@ def cmd_autopilot_tick(
                 f"Ramp applied: daily_chunk_limit={autopilot.daily_chunk_limit}, "
                 f"daily_file_limit={autopilot.daily_file_limit}"
             )
-        report.next_recommended_action = backfill_report.next_recommended_action
+        if skipped_files > 0:
+            report.next_recommended_action = (
+                "python3 bid_ask_research_scheduler.py autopilot-tick "
+                f"--coins {' '.join(normalized_coins)} "
+                f"--chunk-size-hours {chunk_size_hours} "
+                f"(remaining {skipped_files} file(s) deferred to next tick)"
+            )
+        else:
+            report.next_recommended_action = backfill_report.next_recommended_action
     elif chunk_succeeded:
         report.action = "no_import_progress"
         report.warnings.append(NO_IMPORT_PROGRESS_MESSAGE)
@@ -4384,6 +4583,10 @@ def _build_research_session_tick_summary(
         "started_at": started_at,
         "ended_at": ended_at,
         "autopilot_action": autopilot_report.action,
+        "requested_files_this_tick": autopilot_report.requested_files_this_tick,
+        "completed_files_this_tick": autopilot_report.completed_files_this_tick,
+        "skipped_due_to_tick_budget": autopilot_report.skipped_due_to_tick_budget,
+        "tick_budget_reason": autopilot_report.tick_budget_reason,
         "files_downloaded_new": autopilot_report.files_downloaded_new,
         "files_skipped_existing": autopilot_report.files_skipped_existing,
         "files_failed": autopilot_report.files_failed,
@@ -4432,6 +4635,9 @@ def format_research_session_markdown(session: dict[str, Any]) -> str:
         f"- duration_hours: {session.get('duration_hours')}",
         f"- tick_interval_minutes: {session.get('tick_interval_minutes')}",
         f"- tick_timeout_minutes: {session.get('tick_timeout_minutes')}",
+        f"- tick_max_files: {session.get('tick_max_files')}",
+        f"- tick_max_chunks: {session.get('tick_max_chunks')}",
+        f"- tick_budget_minutes: {session.get('tick_budget_minutes')}",
         f"- ticks_planned: {session.get('ticks_planned')}",
         f"- ticks_completed: {session.get('ticks_completed')}",
         f"- coins: {', '.join(session.get('coins') or [])}",
@@ -4454,6 +4660,10 @@ def format_research_session_markdown(session: dict[str, Any]) -> str:
                 f"- started_at: {tick.get('started_at')}",
                 f"- ended_at: {tick.get('ended_at')}",
                 f"- autopilot_action: {tick.get('autopilot_action')}",
+                f"- requested_files_this_tick: {tick.get('requested_files_this_tick')}",
+                f"- completed_files_this_tick: {tick.get('completed_files_this_tick')}",
+                f"- skipped_due_to_tick_budget: {tick.get('skipped_due_to_tick_budget')}",
+                f"- tick_budget_reason: {tick.get('tick_budget_reason')}",
                 f"- files_downloaded_new: {tick.get('files_downloaded_new')}",
                 f"- files_skipped_existing: {tick.get('files_skipped_existing')}",
                 f"- files_failed: {tick.get('files_failed')}",
@@ -4558,6 +4768,9 @@ def _execute_research_session_tick(
     audit_json_path: Path | None = None,
     audit_markdown_path: Path | None = None,
     tick_timeout_minutes: int | None = DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES,
+    tick_max_files: int | None = DEFAULT_AUTOPILOT_TICK_MAX_FILES,
+    tick_max_chunks: int | None = DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS,
+    tick_budget_minutes: int | None = DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES,
     now_fn: Any | None = None,
 ) -> dict[str, Any]:
     started_at = _utc_now_iso()
@@ -4637,6 +4850,12 @@ def _execute_research_session_tick(
         orchestrator_report_dir=orchestrator_report_dir,
         state_path=state_path,
         runs_dir=runs_dir,
+        tick_max_files=tick_max_files,
+        tick_max_chunks=tick_max_chunks,
+        tick_budget_minutes=tick_budget_minutes,
+        research_session_mode=True,
+        tick_start_time=tracker.tick_started_at,
+        now_fn=now_fn,
     )
     tracker.record_stage("autopilot_tick_done")
     autopilot_elapsed = tracker.autopilot_tick_elapsed_seconds()
@@ -4779,6 +4998,9 @@ def cmd_research_session(
     duration_hours: float = DEFAULT_RESEARCH_SESSION_DURATION_HOURS,
     tick_interval_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_INTERVAL_MINUTES,
     tick_timeout_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES,
+    tick_max_files: int | None = DEFAULT_AUTOPILOT_TICK_MAX_FILES,
+    tick_max_chunks: int | None = DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS,
+    tick_budget_minutes: int | None = DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES,
     coins: list[str] | None = None,
     source: str = "historical",
     aws_profile: str | None = None,
@@ -4832,6 +5054,17 @@ def cmd_research_session(
         "duration_hours": duration_hours,
         "tick_interval_minutes": tick_interval_minutes,
         "tick_timeout_minutes": tick_timeout_minutes,
+        "tick_max_files": (
+            DEFAULT_AUTOPILOT_TICK_MAX_FILES if tick_max_files is None else tick_max_files
+        ),
+        "tick_max_chunks": (
+            DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS if tick_max_chunks is None else tick_max_chunks
+        ),
+        "tick_budget_minutes": (
+            DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES
+            if tick_budget_minutes is None
+            else tick_budget_minutes
+        ),
         "ticks_planned": ticks_planned,
         "ticks_completed": 0,
         "coins": normalized_coins,
@@ -4912,6 +5145,9 @@ def cmd_research_session(
             audit_json_path=audit_json_path,
             audit_markdown_path=audit_markdown_path,
             tick_timeout_minutes=tick_timeout_minutes,
+            tick_max_files=tick_max_files,
+            tick_max_chunks=tick_max_chunks,
+            tick_budget_minutes=tick_budget_minutes,
             now_fn=tick_now_fn,
         )
         per_tick_summaries.append(tick_summary)
@@ -5027,6 +5263,9 @@ def _build_research_session_program_arguments(
     duration_hours: float,
     tick_interval_minutes: int,
     tick_timeout_minutes: int = DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES,
+    tick_max_files: int = DEFAULT_AUTOPILOT_TICK_MAX_FILES,
+    tick_max_chunks: int = DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS,
+    tick_budget_minutes: int = DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES,
     use_caffeinate: bool,
     caffeinate_flags: str = DEFAULT_CAFFEINATE_FLAGS,
 ) -> list[str]:
@@ -5040,6 +5279,12 @@ def _build_research_session_program_arguments(
         str(tick_interval_minutes),
         "--tick-timeout-minutes",
         str(tick_timeout_minutes),
+        "--tick-max-files",
+        str(tick_max_files),
+        "--tick-max-chunks",
+        str(tick_max_chunks),
+        "--tick-budget-minutes",
+        str(tick_budget_minutes),
     ]
     _append_research_session_bool_flags(session_args)
     if use_caffeinate:
@@ -5978,6 +6223,30 @@ def build_parser() -> argparse.ArgumentParser:
         type=Path,
         default=bid_ask_daily_summary.DEFAULT_OUTPUT_DIR,
     )
+    autopilot_tick.add_argument(
+        "--tick-max-files",
+        type=int,
+        default=None,
+        help=(
+            f"Per-tick file cap (default: {DEFAULT_AUTOPILOT_TICK_MAX_FILES}); "
+            "truncates chunk hours when needed"
+        ),
+    )
+    autopilot_tick.add_argument(
+        "--tick-max-chunks",
+        type=int,
+        default=None,
+        help=f"Per-tick chunk cap (default: {DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS})",
+    )
+    autopilot_tick.add_argument(
+        "--tick-budget-minutes",
+        type=int,
+        default=None,
+        help=(
+            f"Per-tick wall-clock budget in minutes (default: "
+            f"{DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES})"
+        ),
+    )
 
     research_session = subparsers.add_parser(
         "research-session",
@@ -5997,6 +6266,30 @@ def build_parser() -> argparse.ArgumentParser:
         "--tick-timeout-minutes",
         type=int,
         default=DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES,
+    )
+    research_session.add_argument(
+        "--tick-max-files",
+        type=int,
+        default=None,
+        help=(
+            f"Per-tick file cap (default: {DEFAULT_AUTOPILOT_TICK_MAX_FILES}); "
+            "truncates chunk hours when needed"
+        ),
+    )
+    research_session.add_argument(
+        "--tick-max-chunks",
+        type=int,
+        default=None,
+        help=f"Per-tick chunk cap (default: {DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS})",
+    )
+    research_session.add_argument(
+        "--tick-budget-minutes",
+        type=int,
+        default=None,
+        help=(
+            f"Per-tick wall-clock budget in minutes (default: "
+            f"{DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES})"
+        ),
     )
     research_session.add_argument("--coins", nargs="+", default=None)
     research_session.add_argument("--source", default="historical")
@@ -6470,6 +6763,9 @@ def main(argv: list[str] | None = None) -> int:
                 state_path=args.state_path,
                 runs_dir=args.runs_dir,
                 daily_summary_dir=args.daily_summary_dir,
+                tick_max_files=args.tick_max_files,
+                tick_max_chunks=args.tick_max_chunks,
+                tick_budget_minutes=args.tick_budget_minutes,
             )
             print(f"Autopilot tick: action={report.action}")
             if report.warnings:
@@ -6488,6 +6784,9 @@ def main(argv: list[str] | None = None) -> int:
                 duration_hours=args.duration_hours,
                 tick_interval_minutes=args.tick_interval_minutes,
                 tick_timeout_minutes=args.tick_timeout_minutes,
+                tick_max_files=args.tick_max_files,
+                tick_max_chunks=args.tick_max_chunks,
+                tick_budget_minutes=args.tick_budget_minutes,
                 coins=args.coins,
                 source=args.source,
                 aws_profile=args.aws_profile,

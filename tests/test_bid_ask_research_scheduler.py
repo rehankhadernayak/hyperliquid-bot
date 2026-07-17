@@ -41,6 +41,7 @@ def _init_state(
     end: str = "20230930",
     start_hour: int = 0,
     end_hour: int = 23,
+    coins: list[str] | None = None,
 ) -> Path:
     state_path = tmp_path / "state.json"
     scheduler.cmd_init_state(
@@ -48,7 +49,7 @@ def _init_state(
         historical_end_date=end,
         historical_start_hour=start_hour,
         historical_end_hour=end_hour,
-        coins=["BTC", "ETH", "SOL"],
+        coins=coins or ["BTC", "ETH", "SOL"],
         state_path=state_path,
     )
     return state_path
@@ -1595,6 +1596,7 @@ class TestAutopilotTick:
             state_path=state_path,
             runs_dir=tmp_path / "runs",
             today_override="20230916",
+            tick_max_files=9,
         )
 
         assert report.action == "limit_skipped"
@@ -1616,12 +1618,14 @@ class TestAutopilotTick:
             state_path=state_path,
             runs_dir=runs_dir,
             today_override="20230916",
+            tick_max_files=9,
         )
         report = scheduler.cmd_autopilot_tick(
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=runs_dir,
             today_override="20230916",
+            tick_max_files=9,
         )
 
         assert report.action == "limit_skipped"
@@ -4852,3 +4856,271 @@ class TestResearchSessionLaunchdTemplate:
         )
         assert not any(str(failure).startswith("tick timeout") for failure in tick["failures"])
         assert session["stop_reason"] is None
+
+
+class TestAutopilotTickBudget:
+    def test_large_pending_backfill_split_across_ticks(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11, coins=["BTC", "ETH"])
+        _enable_autopilot(state_path, daily_chunk_limit=4, daily_file_limit=24)
+        captured: list[dict[str, object]] = []
+
+        def fake_advance_past_covered_chunks(
+            state: scheduler.SchedulerState,
+            **kwargs: object,
+        ) -> dict[str, object]:
+            return {
+                "selected_date": "20230916",
+                "selected_hours": ["9", "10", "11"],
+                "no_uncovered_chunk_found": False,
+                "state_changed": False,
+            }
+
+        monkeypatch.setattr(
+            scheduler,
+            "_advance_past_covered_chunks",
+            fake_advance_past_covered_chunks,
+        )
+
+        def fake_auto_backfill(**kwargs: object) -> scheduler.SchedulerReport:
+            captured.append(dict(kwargs))
+            chunk_selection = dict(kwargs.get("chunk_selection") or {})
+            selected_hours = list(chunk_selection.get("selected_hours") or [])
+            state_path_arg = kwargs.get("state_path")
+            if isinstance(state_path_arg, Path) and selected_hours:
+                state = scheduler.load_state(state_path_arg)
+                state.completed_batches.append(
+                    {
+                        "date": "20230916",
+                        "hours": selected_hours,
+                        "completed_at": scheduler._utc_now_iso(),
+                    }
+                )
+                scheduler.save_state(state, state_path_arg)
+            return scheduler.SchedulerReport(
+                workflows_run=["auto-backfill-next", "daily-cycle"],
+                historical_date="20230916",
+                historical_hours=selected_hours,
+                details={
+                    "resample_validate": {"warnings": [], "failures": []},
+                    "historical_backfill": {
+                        "details": {
+                            "orchestrator_batch": {
+                                "download": {
+                                    "file_results": [
+                                        {"download_status": "downloaded"}
+                                        for _ in selected_hours
+                                        for _ in ["BTC", "ETH"]
+                                    ],
+                                },
+                                "import": [
+                                    {"coin": "BTC", "import_status": "imported", "rows_written": 1},
+                                    {"coin": "ETH", "import_status": "imported", "rows_written": 1},
+                                ],
+                            }
+                        }
+                    },
+                    "import_progress": {
+                        "any_import_progress": True,
+                        "files_downloaded_new": len(selected_hours) * 2,
+                        "files_skipped_existing": 0,
+                        "files_imported": len(selected_hours) * 2,
+                        "import_failures": [],
+                        "import_progress_by_coin": {"BTC": True, "ETH": True},
+                        "rows_added_by_coin": {"BTC": 1, "ETH": 1},
+                        "timestamp_advanced_by_coin": {"BTC": True, "ETH": True},
+                    },
+                    "chunk_selection": chunk_selection,
+                    "scheduler_report_paths": {"json": "x.json", "markdown": "x.md"},
+                },
+            )
+
+        monkeypatch.setattr(scheduler, "cmd_auto_backfill_next", fake_auto_backfill)
+
+        first = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+            tick_max_files=4,
+        )
+        second = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+            tick_max_files=4,
+        )
+
+        assert first.action == "chunk_completed"
+        assert first.requested_files_this_tick == 4
+        assert first.skipped_due_to_tick_budget == 2
+        assert first.historical_hours == ["9", "10"]
+        assert second.action == "chunk_completed"
+        assert second.requested_files_this_tick == 2
+        assert second.historical_hours == ["11"]
+        assert len(captured) == 2
+        first_hours = list((captured[0].get("chunk_selection") or {}).get("selected_hours") or [])
+        second_hours = list((captured[1].get("chunk_selection") or {}).get("selected_hours") or [])
+        assert first_hours == ["9", "10"]
+        assert second_hours == ["11"]
+
+    def test_tick_budget_prevents_oversized_autopilot_work(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11, coins=["BTC", "ETH"])
+        _enable_autopilot(state_path)
+        captured: list[dict[str, object]] = []
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_auto_backfill_next",
+            lambda **kwargs: captured.append(dict(kwargs)) or scheduler.SchedulerReport(
+                workflows_run=["auto-backfill-next"],
+                historical_date="20230916",
+                historical_hours=["9"],
+            ),
+        )
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+            tick_max_files=1,
+        )
+
+        assert report.action == "tick_budget_skipped"
+        assert report.requested_files_this_tick == 0
+        assert report.skipped_due_to_tick_budget == 6
+        assert report.tick_budget_reason is not None
+        assert len(captured) == 0
+
+    def test_under_budget_tick_completes_normally(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11, coins=["BTC", "ETH"])
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=6)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+            tick_max_files=6,
+        )
+
+        assert report.action == "chunk_completed"
+        assert report.requested_files_this_tick == 6
+        assert report.skipped_due_to_tick_budget == 0
+        assert report.completed_files_this_tick == 6
+
+    def test_report_includes_budget_fields(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11, coins=["BTC", "ETH"])
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=4)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+            tick_max_files=4,
+        )
+
+        assert report.requested_files_this_tick == 4
+        assert report.completed_files_this_tick == 4
+        assert report.skipped_due_to_tick_budget == 2
+        assert report.tick_max_files == 4
+        assert report.tick_max_chunks == scheduler.DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS
+        assert report.tick_budget_minutes == scheduler.DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES
+        state = scheduler.load_state(state_path)
+        saved = json.loads(Path(state.autopilot.last_autopilot_report_path).read_text(encoding="utf-8"))
+        assert saved["requested_files_this_tick"] == 4
+        assert saved["completed_files_this_tick"] == 4
+        assert saved["skipped_due_to_tick_budget"] == 2
+        assert saved["tick_budget_reason"] is not None
+
+    def test_tick_budget_skipped_allows_post_audit_stages(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path)
+        _enable_autopilot(state_path)
+        start = datetime(2026, 7, 16, 0, 0, 0, tzinfo=timezone.utc)
+        elapsed_seconds = {"value": 0}
+
+        def now_fn() -> datetime:
+            return start + timedelta(seconds=elapsed_seconds["value"])
+
+        def fake_autopilot(**kwargs: object) -> scheduler.AutopilotReport:
+            elapsed_seconds["value"] = 55 * 60
+            return scheduler.AutopilotReport(
+                action="tick_budget_skipped",
+                tick_budget_reason="budget exhausted before backfill",
+                skipped_due_to_tick_budget=6,
+            )
+
+        monkeypatch.setattr(scheduler, "cmd_autopilot_tick", fake_autopilot)
+        monkeypatch.setattr(
+            scheduler,
+            "cmd_phase_backfill_audit",
+            lambda **kwargs: {"imported_historical_1s": {}},
+        )
+        _block_network_subprocess(monkeypatch)
+
+        session = scheduler.cmd_research_session(
+            duration_hours=1,
+            tick_interval_minutes=60,
+            max_ticks=1,
+            run_candidate_tests=False,
+            run_relaxed_candidate_test=False,
+            update_dashboard_artifacts=False,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            sessions_dir=tmp_path / "sessions",
+            data_root=tmp_path / "data",
+            tick_now_fn=now_fn,
+            sleep_fn=lambda _seconds: None,
+        )
+
+        tick = session["per_tick_summaries"][0]
+        stage_names = [event["name"] for event in tick["stage_events"]]
+        assert session["stop_reason"] is None
+        assert "post_audit_done" in stage_names
+        assert tick["autopilot_action"] == "tick_budget_skipped"
+        assert not any(str(failure).startswith("tick timeout") for failure in tick["failures"])
+
+    def test_safety_flags_unchanged_with_tick_budget(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11, coins=["BTC", "ETH"])
+        _enable_autopilot(state_path)
+        _mock_auto_backfill_next(monkeypatch, downloaded_files=4)
+
+        report = scheduler.cmd_autopilot_tick(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            today_override="20230916",
+            tick_max_files=4,
+        )
+
+        assert report.paper_only is True
+        assert report.execution_enabled is False
+        assert report.real_execution_ready is False
+        assert "secret_access_key" not in json.dumps(report.to_dict()).lower()
