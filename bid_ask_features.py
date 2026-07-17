@@ -15,7 +15,13 @@ import pandas as pd
 from bid_ask_resampler import INTERVAL_SECONDS
 
 SUPPORTED_FEATURE_SETS = frozenset(
-    {"basic", "microstructure", "candidate_c_core", "candidate_e_depth_aware"}
+    {
+        "basic",
+        "microstructure",
+        "candidate_c_core",
+        "candidate_e_depth_aware",
+        "candidate_f_regime_depth",
+    }
 )
 
 MID_PRICE_COLUMN = "close_mid"
@@ -52,6 +58,35 @@ CANDIDATE_E_DEPTH_AWARE_EXTRA_COLUMNS = (
 
 CANDIDATE_E_DEPTH_AWARE_COLUMNS = CANDIDATE_C_CORE_COLUMNS + CANDIDATE_E_DEPTH_AWARE_EXTRA_COLUMNS
 
+CANDIDATE_F_REGIME_DEPTH_EXTRA_COLUMNS = (
+    "realized_volatility_5m_bps",
+    "realized_volatility_15m_bps",
+    "volatility_ratio_5m_15m",
+    "spread_volatility_interaction",
+    "microprice_volatility_interaction",
+    "imbalance_volatility_interaction",
+    "low_volatility_regime",
+    "high_volatility_regime",
+    "tight_spread_regime",
+    "wide_spread_regime",
+)
+
+CANDIDATE_F_REGIME_DEPTH_COLUMNS = (
+    CANDIDATE_E_DEPTH_AWARE_COLUMNS + CANDIDATE_F_REGIME_DEPTH_EXTRA_COLUMNS
+)
+
+REGIME_QUANTILE_WINDOW = 240
+REGIME_QUANTILE_MIN_PERIODS = 120
+REALIZED_VOL_5M_WINDOW = 20
+REALIZED_VOL_15M_WINDOW = 60
+
+REGIME_BREAKDOWN_COLUMNS = (
+    "low_volatility_regime",
+    "high_volatility_regime",
+    "tight_spread_regime",
+    "wide_spread_regime",
+)
+
 FUTURE_FEATURE_COLUMNS = frozenset(
     {
         "future_return_bps",
@@ -61,6 +96,7 @@ FUTURE_FEATURE_COLUMNS = frozenset(
 
 MIN_CANDIDATE_C_CORE_FEATURE_COUNT = 5
 MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT = 5
+MIN_CANDIDATE_F_REGIME_DEPTH_FEATURE_COUNT = 5
 REQUIRED_DEPTH_SIZE_COLUMNS = ("bid_size", "ask_size")
 
 
@@ -118,13 +154,13 @@ def _safe_fill_series(series: pd.Series) -> pd.Series:
     return series.ffill().bfill().fillna(0.0)
 
 
-def _require_depth_size_columns(df: pd.DataFrame) -> None:
+def _require_depth_size_columns(df: pd.DataFrame, *, feature_set: str = "candidate_e_depth_aware") -> None:
     """Raise if bid_size/ask_size are unavailable for depth-aware features."""
     missing = [column for column in REQUIRED_DEPTH_SIZE_COLUMNS if column not in df.columns]
     if missing:
         raise ValueError(
             "Missing bid_size/ask_size columns required for "
-            f"candidate_e_depth_aware depth features: {missing}"
+            f"{feature_set} depth features: {missing}"
         )
 
     bid_size = df["bid_size"]
@@ -132,7 +168,23 @@ def _require_depth_size_columns(df: pd.DataFrame) -> None:
     if bid_size.isna().all() or ask_size.isna().all():
         raise ValueError(
             "bid_size/ask_size contain no usable data; "
-            "candidate_e_depth_aware requires resampled depth columns"
+            f"{feature_set} requires resampled depth columns"
+        )
+
+
+def _require_candidate_f_base_columns(df: pd.DataFrame) -> None:
+    """Raise if spread/imbalance columns are unavailable for Candidate F regime features."""
+    _require_depth_size_columns(df, feature_set="candidate_f_regime_depth")
+
+    if resolve_spread_column(df) is None:
+        raise ValueError(
+            "Missing spread column (avg_spread_bps/spread_bps) required for "
+            "candidate_f_regime_depth spread and regime features"
+        )
+    if resolve_imbalance_column(df) is None:
+        raise ValueError(
+            "Missing imbalance column (avg_bbo_imbalance/bbo_imbalance) required for "
+            "candidate_f_regime_depth imbalance interaction features"
         )
 
 
@@ -287,6 +339,100 @@ def create_candidate_e_depth_aware_features(
     return out, sorted(set(skipped))
 
 
+def _rolling_quantile(series: pd.Series, quantile: float, window: int, min_periods: int) -> pd.Series:
+    return series.rolling(window=window, min_periods=min_periods).quantile(quantile)
+
+
+def create_candidate_f_regime_depth_features(
+    df: pd.DataFrame,
+    *,
+    interval: str = "15s",
+) -> tuple[pd.DataFrame, list[str]]:
+    """Build candidate_f_regime_depth features from resampled bid/ask bars."""
+    if df.empty:
+        return df.copy(), []
+
+    _require_candidate_f_base_columns(df)
+    out, skipped = create_candidate_e_depth_aware_features(df, interval=interval)
+
+    mid_column = resolve_mid_price_column(out)
+    if mid_column is None:
+        raise ValueError(
+            "Missing mid price column (close_mid/avg_mid); "
+            "required for candidate_f_regime_depth volatility features"
+        )
+    mid = out[mid_column].astype(float)
+    return_1 = _return_bps(mid, 1)
+
+    out["realized_volatility_5m_bps"] = return_1.rolling(
+        window=REALIZED_VOL_5M_WINDOW,
+        min_periods=REALIZED_VOL_5M_WINDOW,
+    ).std()
+    out["realized_volatility_15m_bps"] = return_1.rolling(
+        window=REALIZED_VOL_15M_WINDOW,
+        min_periods=REALIZED_VOL_15M_WINDOW,
+    ).std()
+    out["volatility_ratio_5m_15m"] = out["realized_volatility_5m_bps"] / out[
+        "realized_volatility_15m_bps"
+    ].replace(0, np.nan)
+
+    if "spread_bps" not in out.columns:
+        raise ValueError(
+            "Missing spread_bps required for candidate_f_regime_depth interaction/regime features"
+        )
+    if "bbo_imbalance" not in out.columns:
+        raise ValueError(
+            "Missing bbo_imbalance required for candidate_f_regime_depth interaction features"
+        )
+    if "microprice_mid_deviation_bps" not in out.columns:
+        raise ValueError(
+            "Missing microprice_mid_deviation_bps required for "
+            "candidate_f_regime_depth interaction features"
+        )
+
+    spread = out["spread_bps"].astype(float)
+    vol_5m = out["realized_volatility_5m_bps"]
+    out["spread_volatility_interaction"] = spread * vol_5m
+    out["microprice_volatility_interaction"] = out["microprice_mid_deviation_bps"] * vol_5m
+    out["imbalance_volatility_interaction"] = out["bbo_imbalance"] * vol_5m
+
+    vol_q25 = _rolling_quantile(
+        vol_5m,
+        0.25,
+        REGIME_QUANTILE_WINDOW,
+        REGIME_QUANTILE_MIN_PERIODS,
+    )
+    vol_q75 = _rolling_quantile(
+        vol_5m,
+        0.75,
+        REGIME_QUANTILE_WINDOW,
+        REGIME_QUANTILE_MIN_PERIODS,
+    )
+    spread_q25 = _rolling_quantile(
+        spread,
+        0.25,
+        REGIME_QUANTILE_WINDOW,
+        REGIME_QUANTILE_MIN_PERIODS,
+    )
+    spread_q75 = _rolling_quantile(
+        spread,
+        0.75,
+        REGIME_QUANTILE_WINDOW,
+        REGIME_QUANTILE_MIN_PERIODS,
+    )
+
+    out["low_volatility_regime"] = (vol_5m < vol_q25).astype(float)
+    out["high_volatility_regime"] = (vol_5m > vol_q75).astype(float)
+    out["tight_spread_regime"] = (spread < spread_q25).astype(float)
+    out["wide_spread_regime"] = (spread > spread_q75).astype(float)
+
+    for column in CANDIDATE_F_REGIME_DEPTH_COLUMNS:
+        if column in out.columns:
+            out[column] = _safe_fill_series(out[column])
+
+    return out, sorted(set(skipped))
+
+
 def build_candidate_c_core_metadata(
     *,
     feature_columns: tuple[str, ...],
@@ -331,6 +477,30 @@ def build_candidate_e_depth_aware_metadata(
         metadata["feature_warning"] = (
             f"too_few_features: only {len(columns)} columns available "
             f"(expected at least {MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT})"
+        )
+    return metadata
+
+
+def build_candidate_f_regime_depth_metadata(
+    *,
+    feature_columns: tuple[str, ...],
+    skipped_candidate_c_core_features: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build report metadata for candidate_f_regime_depth feature selection."""
+    columns = list(feature_columns)
+    skipped = list(skipped_candidate_c_core_features or [])
+    metadata: dict[str, Any] = {
+        "feature_set": "candidate_f_regime_depth",
+        "feature_columns": columns,
+        "feature_count": len(columns),
+        "skipped_microstructure_features": [],
+        "skipped_candidate_c_core_features": skipped,
+        "feature_warning": None,
+    }
+    if len(columns) < MIN_CANDIDATE_F_REGIME_DEPTH_FEATURE_COUNT:
+        metadata["feature_warning"] = (
+            f"too_few_features: only {len(columns)} columns available "
+            f"(expected at least {MIN_CANDIDATE_F_REGIME_DEPTH_FEATURE_COUNT})"
         )
     return metadata
 

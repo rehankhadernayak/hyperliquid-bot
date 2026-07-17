@@ -17,6 +17,11 @@ from typing import Any
 import numpy as np
 import pandas as pd
 
+from bid_ask_features import (
+    CANDIDATE_F_REGIME_DEPTH_COLUMNS,
+    CANDIDATE_F_REGIME_DEPTH_EXTRA_COLUMNS,
+    create_candidate_f_regime_depth_features,
+)
 from bid_ask_resampler import (
     INTERVAL_SECONDS,
     REQUIRED_RESAMPLED_COLUMNS,
@@ -81,6 +86,7 @@ FEATURE_FAMILIES: dict[str, tuple[str, ...]] = {
         "total_top_size",
         "size_imbalance",
     ),
+    "volatility_regime_depth": CANDIDATE_F_REGIME_DEPTH_EXTRA_COLUMNS,
 }
 
 
@@ -236,6 +242,15 @@ def compute_candidate_features(
         skipped.extend(FEATURE_FAMILIES["liquidity_size"])
 
     return out, sorted(set(skipped))
+
+
+def compute_candidate_f_regime_features(
+    df: pd.DataFrame,
+    *,
+    interval: str,
+) -> tuple[pd.DataFrame, list[str]]:
+    """Build Candidate F regime-depth audit features from a resampled bid/ask frame."""
+    return create_candidate_f_regime_depth_features(df, interval=interval)
 
 
 def add_future_returns(
@@ -513,21 +528,33 @@ def build_feature_audit_report(
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     warmup_bars: int = DEFAULT_WARMUP_BARS,
     generated_at: str | None = None,
+    feature_set: str = "candidate_c_core",
 ) -> dict[str, Any]:
     generated = generated_at or _utc_now_iso()
     raw_df, csv_path = load_resampled_csv(coin, interval, data_root, source=source)
-    featured_df, skipped_features = compute_candidate_features(
-        raw_df,
-        interval=interval,
-        fee_bps=fee_bps,
-        slippage_bps=slippage_bps,
-    )
+    normalized_feature_set = str(feature_set).strip().lower()
+    if normalized_feature_set == "candidate_f_regime_depth":
+        featured_df, skipped_features = compute_candidate_f_regime_features(
+            raw_df,
+            interval=interval,
+        )
+    else:
+        featured_df, skipped_features = compute_candidate_features(
+            raw_df,
+            interval=interval,
+            fee_bps=fee_bps,
+            slippage_bps=slippage_bps,
+        )
     featured_df = add_future_returns(featured_df, horizons=horizons)
     featured_df = add_labels(featured_df, horizon=horizons[0], threshold_bps=threshold_bps)
 
     audit_columns = [
         column
-        for column in _all_audit_feature_columns()
+        for column in (
+            _all_audit_feature_columns()
+            if normalized_feature_set != "candidate_f_regime_depth"
+            else list(CANDIDATE_F_REGIME_DEPTH_COLUMNS)
+        )
         if column in featured_df.columns and column not in skipped_features
     ]
 
@@ -568,6 +595,7 @@ def build_feature_audit_report(
         "fee_bps": fee_bps,
         "slippage_bps": slippage_bps,
         "warmup_bars": warmup_bars,
+        "feature_set": normalized_feature_set,
         "feature_families": {
             family: [column for column in columns if column in audit_columns]
             for family, columns in FEATURE_FAMILIES.items()
@@ -701,6 +729,7 @@ def run_feature_audit(
     fee_bps: float = DEFAULT_FEE_BPS,
     slippage_bps: float = DEFAULT_SLIPPAGE_BPS,
     warmup_bars: int = DEFAULT_WARMUP_BARS,
+    feature_set: str = "candidate_c_core",
     json_name: str | None = None,
     markdown_name: str | None = None,
     generated_at: str | None = None,
@@ -722,6 +751,7 @@ def run_feature_audit(
         fee_bps=fee_bps,
         slippage_bps=slippage_bps,
         warmup_bars=warmup_bars,
+        feature_set=feature_set,
         generated_at=generated,
     )
 

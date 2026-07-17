@@ -385,3 +385,27 @@ class TestSafety:
             output_dir=workspace["output_dir"],
             generated_at="2026-07-09T10:00:00Z",
         )
+
+
+class TestCandidateFRegimeFeatureAudit:
+    def test_feature_audit_reports_candidate_f_regime_features(
+        self, workspace: dict[str, Path]
+    ) -> None:
+        csv_path = workspace["data_root"] / "historical_15s" / "BTC_15s.csv"
+        _write_resampled_csv(csv_path, rows=300, include_sizes=True)
+
+        report = audit.build_feature_audit_report(
+            coin="BTC",
+            interval="15s",
+            source="historical",
+            data_root=workspace["data_root"],
+            reports_root=workspace["reports_root"],
+            feature_set="candidate_f_regime_depth",
+            generated_at="2026-07-09T10:00:00Z",
+        )
+
+        assert report["feature_set"] == "candidate_f_regime_depth"
+        assert "realized_volatility_5m_bps" in report["feature_stats"]
+        assert "low_volatility_regime" in report["feature_stats"]
+        assert "wide_spread_regime" in report["feature_stats"]
+        assert report["feature_families"]["volatility_regime_depth"]

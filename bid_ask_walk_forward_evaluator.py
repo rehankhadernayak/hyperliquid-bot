@@ -19,11 +19,15 @@ import pandas as pd
 from bid_ask_features import (
     CANDIDATE_C_CORE_COLUMNS,
     CANDIDATE_E_DEPTH_AWARE_COLUMNS,
+    CANDIDATE_F_REGIME_DEPTH_COLUMNS,
     MIN_CANDIDATE_C_CORE_FEATURE_COUNT,
     MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT,
+    MIN_CANDIDATE_F_REGIME_DEPTH_FEATURE_COUNT,
+    REGIME_BREAKDOWN_COLUMNS,
     SUPPORTED_FEATURE_SETS,
     create_candidate_c_core_features,
     create_candidate_e_depth_aware_features,
+    create_candidate_f_regime_depth_features,
     parse_feature_set,
 )
 from bid_ask_model_io import build_artifact_payload, save_model_artifact
@@ -296,6 +300,8 @@ def get_walk_forward_feature_columns(feature_set: str) -> tuple[str, ...]:
         return CANDIDATE_C_CORE_COLUMNS
     if mode == "candidate_e_depth_aware":
         return CANDIDATE_E_DEPTH_AWARE_COLUMNS
+    if mode == "candidate_f_regime_depth":
+        return CANDIDATE_F_REGIME_DEPTH_COLUMNS
     return FEATURE_COLUMNS + MICROSTRUCTURE_EXTRA_COLUMNS
 
 
@@ -554,6 +560,11 @@ def build_feature_metadata(
             f"too_few_features: only {len(columns)} columns available "
             f"(expected at least {MIN_CANDIDATE_E_DEPTH_AWARE_FEATURE_COUNT})"
         )
+    elif mode == "candidate_f_regime_depth" and len(columns) < MIN_CANDIDATE_F_REGIME_DEPTH_FEATURE_COUNT:
+        metadata["feature_warning"] = (
+            f"too_few_features: only {len(columns)} columns available "
+            f"(expected at least {MIN_CANDIDATE_F_REGIME_DEPTH_FEATURE_COUNT})"
+        )
     return metadata
 
 
@@ -628,6 +639,24 @@ def create_walk_forward_features(
         feature_columns = tuple(
             column
             for column in CANDIDATE_E_DEPTH_AWARE_COLUMNS
+            if column in featured_df.columns and column not in core_skipped
+        )
+        metadata = build_feature_metadata(
+            feature_set=mode,
+            feature_columns=feature_columns,
+            skipped_candidate_c_core_features=skipped,
+        )
+        return featured_df, metadata
+
+    if mode == "candidate_f_regime_depth":
+        featured_df, core_skipped = create_candidate_f_regime_depth_features(
+            prepared_df,
+            interval=interval,
+        )
+        skipped = sorted(set(skipped) | set(core_skipped))
+        feature_columns = tuple(
+            column
+            for column in CANDIDATE_F_REGIME_DEPTH_COLUMNS
             if column in featured_df.columns and column not in core_skipped
         )
         metadata = build_feature_metadata(
@@ -1556,6 +1585,30 @@ def _normalize_predicted_class(prediction: str) -> str:
     return "FLAT"
 
 
+def _regime_fields_from_row(row: pd.Series) -> dict[str, float]:
+    """Extract Candidate F regime flags from a labeled feature row when present."""
+    fields: dict[str, float] = {}
+    for column in REGIME_BREAKDOWN_COLUMNS:
+        if column in row.index and pd.notna(row[column]):
+            fields[column] = float(row[column])
+    return fields
+
+
+def compute_regime_breakdown_diagnostics(
+    accepted_trade_records: list[dict[str, Any]],
+) -> dict[str, dict[str, Any]]:
+    """Break down accepted paper trades by Candidate F regime flags (active==1)."""
+    diagnostics: dict[str, dict[str, Any]] = {}
+    for column in REGIME_BREAKDOWN_COLUMNS:
+        active_records = [
+            record
+            for record in accepted_trade_records
+            if float(record.get(column, 0.0)) >= 0.5
+        ]
+        diagnostics[column] = aggregate_stability_bucket_metrics(active_records)
+    return diagnostics
+
+
 def aggregate_class_trade_diagnostics(
     accepted_trade_records: list[dict[str, Any]],
 ) -> dict[str, dict[str, Any]]:
@@ -2354,6 +2407,7 @@ def simulate_binary_tradeable_paper_returns(
                 "predicted_edge_probability": edge_probability,
                 "true_edge_label": actual_label,
                 "estimated_cost_bps": estimated_cost_bps,
+                **_regime_fields_from_row(row),
             }
         )
 
@@ -2496,6 +2550,7 @@ def simulate_paper_signal_returns(
                 "cost_bps": total_cost_bps,
                 "net_return_bps": net,
                 "spread_bps": spread_bps,
+                **_regime_fields_from_row(row),
             }
         )
 
@@ -3750,6 +3805,15 @@ def build_walk_forward_report(
         )
         report["false_edge_rate"] = report["candidate_d_label_diagnostics"].get("false_edge_rate")
 
+    if any(
+        column in record
+        for record in accepted_trade_records
+        for column in REGIME_BREAKDOWN_COLUMNS
+    ):
+        report["regime_breakdown_diagnostics"] = compute_regime_breakdown_diagnostics(
+            accepted_trade_records
+        )
+
     return report
 
 
@@ -4323,7 +4387,7 @@ def _build_arg_parser() -> argparse.ArgumentParser:
         "--feature-set",
         default=DEFAULT_FEATURE_SET,
         choices=sorted(SUPPORTED_FEATURE_SETS),
-        help="Feature set: basic (default), microstructure, candidate_c_core, or candidate_e_depth_aware",
+        help="Feature set: basic (default), microstructure, candidate_c_core, candidate_e_depth_aware, or candidate_f_regime_depth",
     )
     parser.add_argument(
         "--train-bars",

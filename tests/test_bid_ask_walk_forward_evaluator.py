@@ -16,6 +16,9 @@ from bid_ask_features import (
     CANDIDATE_C_CORE_COLUMNS,
     CANDIDATE_E_DEPTH_AWARE_COLUMNS,
     CANDIDATE_E_DEPTH_AWARE_EXTRA_COLUMNS,
+    CANDIDATE_F_REGIME_DEPTH_COLUMNS,
+    CANDIDATE_F_REGIME_DEPTH_EXTRA_COLUMNS,
+    REGIME_BREAKDOWN_COLUMNS,
     assert_no_future_feature_columns,
 )
 from bid_ask_train import FEATURE_COLUMNS, create_features, create_labels
@@ -49,6 +52,7 @@ from bid_ask_walk_forward_evaluator import (
     build_walk_forward_report,
     compute_label_distribution,
     compute_readiness_flags,
+    compute_regime_breakdown_diagnostics,
     compute_stability_diagnostics,
     compute_stability_summary,
     cost_aware_label_warnings,
@@ -380,6 +384,7 @@ class TestFeatureSets:
         assert parse_feature_set("microstructure") == "microstructure"
         assert parse_feature_set("candidate_c_core") == "candidate_c_core"
         assert parse_feature_set("candidate_e_depth_aware") == "candidate_e_depth_aware"
+        assert parse_feature_set("candidate_f_regime_depth") == "candidate_f_regime_depth"
         with pytest.raises(ValueError):
             parse_feature_set("invalid")
 
@@ -613,6 +618,158 @@ class TestCandidateEDepthAwareFeatures:
         assert report["feature_set"] == "candidate_e_depth_aware"
         assert report["feature_columns"] == list(CANDIDATE_E_DEPTH_AWARE_COLUMNS)
         assert report["feature_count"] == len(CANDIDATE_E_DEPTH_AWARE_COLUMNS)
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+
+
+class TestCandidateFRegimeDepthFeatures:
+    def test_candidate_f_regime_depth_feature_set_creates_expected_columns(self) -> None:
+        rows = _make_resampled_rows(count=300, include_sizes=True)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, meta = create_walk_forward_features(
+            raw_df,
+            feature_set="candidate_f_regime_depth",
+            interval="15s",
+        )
+
+        assert meta["feature_set"] == "candidate_f_regime_depth"
+        assert meta["feature_columns"] == list(CANDIDATE_F_REGIME_DEPTH_COLUMNS)
+        assert meta["feature_count"] == len(CANDIDATE_F_REGIME_DEPTH_COLUMNS)
+        for column in CANDIDATE_E_DEPTH_AWARE_COLUMNS:
+            assert column in featured.columns
+        for column in CANDIDATE_F_REGIME_DEPTH_EXTRA_COLUMNS:
+            assert column in featured.columns
+
+    def test_candidate_f_regime_depth_fails_without_size_columns(self) -> None:
+        rows = _make_resampled_rows(count=40)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+
+        with pytest.raises(ValueError, match="bid_size/ask_size"):
+            create_walk_forward_features(
+                raw_df,
+                feature_set="candidate_f_regime_depth",
+                interval="15s",
+            )
+
+    def test_candidate_f_regime_depth_excludes_future_return_columns(self) -> None:
+        rows = _make_resampled_rows(count=300, include_sizes=True)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        _, meta = create_walk_forward_features(
+            raw_df,
+            feature_set="candidate_f_regime_depth",
+            interval="15s",
+        )
+        assert_no_future_feature_columns(meta["feature_columns"])
+
+    def test_candidate_f_regime_depth_rolling_features_are_causal(self) -> None:
+        rows = _make_resampled_rows(count=300, mid_start=100.0, mid_step=1.0, include_sizes=True)
+        raw_df = pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
+        featured, _ = create_walk_forward_features(
+            raw_df,
+            feature_set="candidate_f_regime_depth",
+            interval="15s",
+        )
+
+        altered = raw_df.copy()
+        altered.loc[altered.index[-1], "close_mid"] = (
+            altered.loc[altered.index[-1], "close_mid"] * 2
+        )
+        altered_featured, _ = create_walk_forward_features(
+            altered,
+            feature_set="candidate_f_regime_depth",
+            interval="15s",
+        )
+
+        for column in CANDIDATE_F_REGIME_DEPTH_COLUMNS:
+            pd.testing.assert_series_equal(
+                featured[column].iloc[:-1],
+                altered_featured[column].iloc[:-1],
+                check_names=False,
+            )
+
+    def test_cli_parses_candidate_f_regime_depth_feature_set(self) -> None:
+        parser = _build_arg_parser()
+        args = parser.parse_args(["--feature-set", "candidate_f_regime_depth"])
+        assert args.feature_set == "candidate_f_regime_depth"
+
+    def test_get_walk_forward_feature_columns_candidate_f_regime_depth(self) -> None:
+        assert (
+            get_walk_forward_feature_columns("candidate_f_regime_depth")
+            == CANDIDATE_F_REGIME_DEPTH_COLUMNS
+        )
+
+    def test_regime_breakdown_diagnostics(self) -> None:
+        records = [
+            {
+                "net_return_bps": 5.0,
+                "cost_bps": 2.0,
+                "confidence": 0.8,
+                "low_volatility_regime": 1.0,
+                "high_volatility_regime": 0.0,
+                "tight_spread_regime": 1.0,
+                "wide_spread_regime": 0.0,
+            },
+            {
+                "net_return_bps": -3.0,
+                "cost_bps": 2.0,
+                "confidence": 0.7,
+                "low_volatility_regime": 1.0,
+                "high_volatility_regime": 0.0,
+                "tight_spread_regime": 0.0,
+                "wide_spread_regime": 1.0,
+            },
+            {
+                "net_return_bps": 2.0,
+                "cost_bps": 2.0,
+                "confidence": 0.6,
+                "low_volatility_regime": 0.0,
+                "high_volatility_regime": 1.0,
+                "tight_spread_regime": 0.0,
+                "wide_spread_regime": 0.0,
+            },
+        ]
+        diagnostics = compute_regime_breakdown_diagnostics(records)
+
+        assert set(diagnostics.keys()) == set(REGIME_BREAKDOWN_COLUMNS)
+        assert diagnostics["low_volatility_regime"]["trades"] == 2
+        assert diagnostics["low_volatility_regime"]["cumulative_net_return_bps"] == pytest.approx(2.0)
+        assert diagnostics["low_volatility_regime"]["average_net_return_bps"] == pytest.approx(1.0)
+        assert diagnostics["low_volatility_regime"]["win_rate_after_costs"] == pytest.approx(0.5)
+        assert diagnostics["high_volatility_regime"]["trades"] == 1
+        assert diagnostics["high_volatility_regime"]["cumulative_net_return_bps"] == pytest.approx(2.0)
+        assert diagnostics["tight_spread_regime"]["trades"] == 1
+        assert diagnostics["wide_spread_regime"]["trades"] == 1
+
+    def test_candidate_f_regime_depth_walk_forward_runs_on_synthetic_data(
+        self, data_root: Path
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(
+            path, _make_resampled_rows(count=300, mid_step=1.5, include_sizes=True)
+        )
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.1,
+            train_bars=25,
+            test_bars=10,
+            step_bars=10,
+            feature_set="candidate_f_regime_depth",
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=1,
+        )
+
+        assert report["feature_set"] == "candidate_f_regime_depth"
+        assert report["feature_columns"] == list(CANDIDATE_F_REGIME_DEPTH_COLUMNS)
+        assert report["feature_count"] == len(CANDIDATE_F_REGIME_DEPTH_COLUMNS)
         assert report["paper_only"] is True
         assert report["execution_enabled"] is False
         assert report["real_execution_ready"] is False
