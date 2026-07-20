@@ -6,6 +6,7 @@ import ast
 import json
 from datetime import datetime
 from pathlib import Path
+from unittest.mock import patch
 
 import pandas as pd
 import pytest
@@ -24,6 +25,7 @@ from bid_ask_features import (
 from bid_ask_train import FEATURE_COLUMNS, create_features, create_labels
 from bid_ask_walk_forward_evaluator import (
     ACCEPTED_TRADES_CSV_COLUMNS,
+    ALL_WINDOWS_SKIPPED_ONE_CLASS_REJECTION,
     DEFAULT_ACCEPTED_TRADES_LIMIT,
     DEFAULT_DIAGNOSTICS_DETAIL,
     DEFAULT_FEATURE_SET,
@@ -35,10 +37,12 @@ from bid_ask_walk_forward_evaluator import (
     DEFAULT_REPORTS_DIR,
     DEFAULT_STABILITY_MIN_TRADES_PER_BUCKET,
     MICROSTRUCTURE_EXTRA_COLUMNS,
+    ONE_CLASS_TRAINING_WINDOW_REASON,
     REGIME_OVERFIT_WARNING,
     SAFETY_NOTE,
     TradeFilterConfig,
     _build_arg_parser,
+    _training_label_class_counts,
     aggregate_accepted_trade_metrics,
     aggregate_class_trade_diagnostics,
     aggregate_coin_class_trade_diagnostics,
@@ -62,6 +66,7 @@ from bid_ask_walk_forward_evaluator import (
     create_walk_forward_labels,
     evaluate_coin_walk_forward,
     evaluate_trade_filter,
+    evaluate_walk_forward_window,
     filter_accepted_trades_by_regime,
     finalize_accepted_trades_csv,
     generate_walk_forward_windows,
@@ -88,7 +93,9 @@ from bid_ask_walk_forward_evaluator import (
     simulate_binary_tradeable_paper_returns,
     simulate_paper_signal_returns,
     summarize_label_required_edge_bps,
+    train_walk_forward_sklearn_model,
     walk_forward_feature_matrix,
+    walk_forward_rows_ready_for_model,
     write_walk_forward_json,
     write_walk_forward_markdown,
     _trade_record_utc_hour,
@@ -1537,6 +1544,234 @@ class TestBinaryTradeableWalkForward:
             assert column in saved.columns
         if not saved.empty:
             assert saved["label_mode"].iloc[0] == "binary_tradeable_down"
+
+
+def _make_mixed_flat_then_trend_rows(
+    *,
+    flat_count: int = 30,
+    trend_count: int = 50,
+    trend_step: float = 10.0,
+    include_sizes: bool = False,
+) -> list[dict]:
+    flat_rows = _make_resampled_rows(
+        count=flat_count,
+        mid_step=0.0,
+        mid_start=100.0,
+        include_sizes=include_sizes,
+    )
+    trend_start_ms = flat_rows[-1]["end_timestamp_ms"] + 1
+    trend_rows = _make_resampled_rows(
+        count=trend_count,
+        mid_step=trend_step,
+        mid_start=100.0,
+        start_ms=trend_start_ms,
+        include_sizes=include_sizes,
+    )
+    return flat_rows + trend_rows
+
+
+class TestOneClassTrainingWindows:
+    @patch("bid_ask_walk_forward_evaluator._SKLEARN_AVAILABLE", True)
+    @patch("bid_ask_walk_forward_evaluator.train_walk_forward_sklearn_model")
+    def test_one_class_training_window_skipped_and_does_not_call_fit(
+        self,
+        mock_train,
+        data_root: Path,
+        reports_dir: Path,
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=60, mid_step=0.0, include_sizes=True))
+
+        result = evaluate_coin_walk_forward(
+            coin="BTC",
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=50.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=2.0,
+            slippage_bps=1.0,
+            default_spread_bps=2.0,
+            trade_filter=_permissive_filter(),
+            data_root=data_root,
+            save_window_models=False,
+            models_dir=reports_dir / "models",
+            label_mode="binary_tradeable_up",
+            feature_set="candidate_f_regime_depth",
+        )
+
+        skipped = [
+            window
+            for window in result["windows"]
+            if window.get("reason") == ONE_CLASS_TRAINING_WINDOW_REASON
+        ]
+        assert skipped, "expected at least one one-class skipped window"
+        assert skipped[0]["status"] == "skipped"
+        assert skipped[0]["class_counts"] == {"0": 20}
+        mock_train.assert_not_called()
+
+    @patch("bid_ask_walk_forward_evaluator._SKLEARN_AVAILABLE", True)
+    def test_all_windows_one_class_writes_rejected_report_not_crash(
+        self,
+        data_root: Path,
+        reports_dir: Path,
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=60, mid_step=0.0, include_sizes=True))
+
+        report = run_walk_forward_evaluation(
+            coins=["BTC"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=50.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            label_mode="binary_tradeable_up",
+            feature_set="candidate_f_regime_depth",
+            trade_classes=frozenset({"UP"}),
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            reports_dir=reports_dir,
+            save_reports=True,
+            min_windows=1,
+            min_trades=0,
+        )
+
+        assert report["status"] == "rejected"
+        assert report["rejection_reason"] == ALL_WINDOWS_SKIPPED_ONE_CLASS_REJECTION
+        assert report["completed_windows"] == 0
+        assert report["one_class_training_windows_count"] >= 1
+        assert report["skipped_window_reasons"][ONE_CLASS_TRAINING_WINDOW_REASON] >= 1
+        assert report["accepted_trades_count"] == 0
+        assert report["cumulative_net_return_bps"] == 0.0
+        assert report["average_net_return_bps"] == 0.0
+        assert report["win_rate"] is None
+        assert report["paper_only"] is True
+        assert report["execution_enabled"] is False
+        assert report["real_execution_ready"] is False
+        assert Path(report["json_report_path"]).is_file()
+        assert any(
+            "one_class_training_windows" in warning for warning in report["warnings"]
+        )
+
+    @patch("bid_ask_walk_forward_evaluator._SKLEARN_AVAILABLE", True)
+    @patch("bid_ask_walk_forward_evaluator.train_walk_forward_sklearn_model")
+    def test_mixed_valid_and_skipped_windows_continue(
+        self,
+        mock_train,
+        data_root: Path,
+        reports_dir: Path,
+    ) -> None:
+        mock_train.return_value = {
+            "available": True,
+            "model": None,
+            "scaler": None,
+            "model_type": "mock",
+            "message": None,
+        }
+        path = resampled_csv_path("ETH", "15s", data_root)
+        _write_resampled_csv(
+            path,
+            _make_mixed_flat_then_trend_rows(
+                flat_count=25,
+                trend_count=55,
+                trend_step=8.0,
+                include_sizes=True,
+            ),
+        )
+
+        report = run_walk_forward_evaluation(
+            coins=["ETH"],
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=0.5,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            label_mode="binary_tradeable_up",
+            feature_set="candidate_e_depth_aware",
+            trade_classes=frozenset({"UP"}),
+            min_confidence=0.0,
+            horizon_return_scale_bps=1000.0,
+            data_root=data_root,
+            save_reports=False,
+            min_windows=1,
+            min_trades=0,
+        )
+
+        assert report["completed_windows"] >= 1
+        assert report["one_class_training_windows_count"] >= 1
+        assert report["skipped_window_reasons"][ONE_CLASS_TRAINING_WINDOW_REASON] >= 1
+        assert report["status"] != "rejected"
+
+    @patch("bid_ask_walk_forward_evaluator._SKLEARN_AVAILABLE", True)
+    def test_train_walk_forward_sklearn_model_reports_class_counts_for_one_class(
+        self,
+    ) -> None:
+        pytest.importorskip("sklearn")
+        train_df = pd.DataFrame(
+            {
+                "label": ["0"] * 10,
+                "future_return_bps": [0.0] * 10,
+                "return_1": [0.0] * 10,
+                "return_15s_bps": [0.0] * 10,
+                "spread_bps": [2.0] * 10,
+                "avg_spread_bps": [2.0] * 10,
+                "volatility_bps": [1.0] * 10,
+                "avg_bbo_imbalance": [0.1] * 10,
+            }
+        )
+        feature_columns = tuple(
+            column for column in FEATURE_COLUMNS if column in train_df.columns
+        )
+        with patch("sklearn.ensemble.RandomForestClassifier.fit") as mock_fit:
+            result = train_walk_forward_sklearn_model(train_df, feature_columns)
+        mock_fit.assert_not_called()
+        assert result["reason"] == ONE_CLASS_TRAINING_WINDOW_REASON
+        assert result["class_counts"] == {"0": 10}
+        assert result["model"] is None
+
+    @patch("bid_ask_walk_forward_evaluator._SKLEARN_AVAILABLE", True)
+    def test_direction_label_mode_one_class_window_skipped(
+        self,
+        data_root: Path,
+        reports_dir: Path,
+    ) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        _write_resampled_csv(path, _make_resampled_rows(count=60, mid_step=0.0, include_sizes=True))
+
+        result = evaluate_coin_walk_forward(
+            coin="BTC",
+            interval="15s",
+            source="local",
+            horizon=2,
+            threshold_bps=1000.0,
+            train_bars=20,
+            test_bars=10,
+            step_bars=10,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            default_spread_bps=0.0,
+            trade_filter=_permissive_filter(),
+            data_root=data_root,
+            save_window_models=False,
+            models_dir=reports_dir / "models",
+            label_mode="direction",
+        )
+
+        skipped = [
+            window
+            for window in result["windows"]
+            if window.get("reason") == ONE_CLASS_TRAINING_WINDOW_REASON
+        ]
+        assert skipped
+        assert _training_label_class_counts(["FLAT"] * 5) == {"FLAT": 5}
 
 
 class TestComputeReadinessFlags:

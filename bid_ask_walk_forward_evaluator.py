@@ -52,6 +52,9 @@ SAFETY_NOTE = (
     "Simulated returns do not prove profitability. No real orders are placed."
 )
 
+ONE_CLASS_TRAINING_WINDOW_REASON = "one_class_training_window"
+ALL_WINDOWS_SKIPPED_ONE_CLASS_REJECTION = "all_windows_skipped_one_class_training"
+
 DEFAULT_DATA_ROOT = Path("data/bid_ask_csv")
 DEFAULT_REPORTS_DIR = Path("reports/bid_ask_walk_forward")
 DEFAULT_MODELS_DIR = Path("models/bid_ask_walk_forward")
@@ -714,6 +717,68 @@ def walk_forward_rows_ready_for_model(
     return df.dropna(subset=required).reset_index(drop=True)
 
 
+def _training_label_class_counts(labels: pd.Series | list[Any]) -> dict[str, int]:
+    """Count non-null training labels by class."""
+    series = pd.Series(labels)
+    counts: dict[str, int] = {}
+    for label in series.dropna():
+        key = str(label)
+        counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+def _aggregate_skipped_window_reasons(
+    window_results: list[dict[str, Any]],
+) -> dict[str, int]:
+    """Count skipped walk-forward windows grouped by skip reason."""
+    reasons: dict[str, int] = {}
+    for item in window_results:
+        if item.get("status") == "completed":
+            continue
+        reason = str(item.get("reason", "unknown"))
+        reasons[reason] = reasons.get(reason, 0) + 1
+    return reasons
+
+
+def _all_windows_skipped_one_class_training(
+    *,
+    total_windows: int,
+    completed_windows: int,
+    skipped_window_reasons: dict[str, int],
+) -> bool:
+    """True when every attempted window was skipped for one-class training labels."""
+    if total_windows <= 0 or completed_windows > 0:
+        return False
+    one_class_count = int(
+        skipped_window_reasons.get(ONE_CLASS_TRAINING_WINDOW_REASON, 0)
+    )
+    return one_class_count == total_windows
+
+
+def _apply_all_windows_one_class_rejection(report: dict[str, Any]) -> None:
+    """Mark a report rejected when no window could be trained due to label sparsity."""
+    report["status"] = "rejected"
+    report["rejection_reason"] = ALL_WINDOWS_SKIPPED_ONE_CLASS_REJECTION
+    report["accepted_trades_count"] = 0
+    report["cumulative_net_return_bps"] = 0.0
+    report["average_net_return_bps"] = 0.0
+    report["win_rate"] = None
+    report["win_rate_after_costs"] = None
+    report["paper_only"] = PAPER_ONLY
+    report["execution_enabled"] = EXECUTION_ENABLED
+    report["real_execution_ready"] = False
+    readiness = report.get("readiness") or {}
+    readiness["real_execution_ready"] = False
+    readiness["ready_for_more_research"] = False
+    report["readiness"] = readiness
+    report["real_execution_ready"] = False
+    report["ready_for_more_research"] = False
+    report.setdefault("warnings", []).append(
+        "all_windows_skipped_one_class_training: every walk-forward training window "
+        "contained only one label class; no sklearn model could be fit"
+    )
+
+
 def train_walk_forward_sklearn_model(
     train_df: pd.DataFrame,
     feature_columns: tuple[str, ...],
@@ -728,6 +793,7 @@ def train_walk_forward_sklearn_model(
 
     X_train = walk_forward_feature_matrix(train_df, feature_columns)
     y_train = train_df["label"].tolist()
+    class_counts = _training_label_class_counts(y_train)
     if len(X_train) == 0:
         return {
             "available": True,
@@ -735,21 +801,27 @@ def train_walk_forward_sklearn_model(
             "message": "no training rows available for sklearn model",
         }
 
+    if len(class_counts) < 2:
+        return {
+            "available": True,
+            "model": None,
+            "scaler": None,
+            "message": ONE_CLASS_TRAINING_WINDOW_REASON,
+            "reason": ONE_CLASS_TRAINING_WINDOW_REASON,
+            "class_counts": class_counts,
+        }
+
     from sklearn.ensemble import RandomForestClassifier
-    from sklearn.linear_model import LogisticRegression
     from sklearn.preprocessing import StandardScaler
 
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X_train)
 
-    if len(set(y_train)) < 2:
-        model: Any = LogisticRegression(max_iter=1000)
-    else:
-        model = RandomForestClassifier(
-            n_estimators=50,
-            random_state=42,
-            class_weight="balanced_subsample",
-        )
+    model = RandomForestClassifier(
+        n_estimators=50,
+        random_state=42,
+        class_weight="balanced_subsample",
+    )
 
     model.fit(X_scaled, y_train)
     return {
@@ -2908,6 +2980,21 @@ def evaluate_walk_forward_window(
             "test_end": test_end,
         }
 
+    train_class_counts = _training_label_class_counts(train_df["label"])
+    if _SKLEARN_AVAILABLE and len(train_class_counts) < 2:
+        return {
+            "window_index": window_index,
+            "status": "skipped",
+            "reason": ONE_CLASS_TRAINING_WINDOW_REASON,
+            "class_counts": train_class_counts,
+            "train_start": train_start,
+            "train_end": train_end,
+            "test_start": test_start,
+            "test_end": test_end,
+            "train_rows": len(train_df),
+            "test_rows": len(test_df),
+        }
+
     baseline = train_baseline_model(train_df)
     sklearn_result = train_walk_forward_sklearn_model(train_df, feature_columns)
 
@@ -3261,6 +3348,24 @@ def evaluate_coin_walk_forward(
 
     completed = [item for item in window_results if item.get("status") == "completed"]
     skipped = [item for item in window_results if item.get("status") != "completed"]
+    skipped_window_reasons = _aggregate_skipped_window_reasons(window_results)
+    one_class_training_windows_count = int(
+        skipped_window_reasons.get(ONE_CLASS_TRAINING_WINDOW_REASON, 0)
+    )
+    skipped_windows_count = len(skipped)
+
+    if one_class_training_windows_count > 0:
+        warnings.append(
+            f"one_class_training_windows: {one_class_training_windows_count} "
+            f"walk-forward window(s) skipped because training labels contained "
+            f"only one class for {coin}"
+        )
+
+    all_one_class_rejection = _all_windows_skipped_one_class_training(
+        total_windows=len(windows),
+        completed_windows=len(completed),
+        skipped_window_reasons=skipped_window_reasons,
+    )
 
     model_accuracies = [float(item["model_accuracy"]) for item in completed]
     baseline_accuracies = [float(item["baseline_accuracy"]) for item in completed]
@@ -3378,14 +3483,24 @@ def evaluate_coin_walk_forward(
 
     source_path = str(resampled_csv_path(coin, interval, data_root, source=normalized_source))
 
-    return {
+    if all_one_class_rejection:
+        coin_status = "rejected"
+    elif completed:
+        coin_status = "completed"
+    else:
+        coin_status = "skipped"
+
+    coin_result: dict[str, Any] = {
         "coin": coin,
-        "status": "completed" if completed else "skipped",
+        "status": coin_status,
         "source_path": source_path,
         "model_ready_rows": len(model_df),
         "total_windows": len(windows),
         "completed_windows": len(completed),
-        "skipped_windows": len(skipped),
+        "skipped_windows": skipped_windows_count,
+        "skipped_windows_count": skipped_windows_count,
+        "skipped_window_reasons": skipped_window_reasons,
+        "one_class_training_windows_count": one_class_training_windows_count,
         "model_accuracy_mean": model_accuracy_mean,
         "baseline_accuracy_mean": baseline_accuracy_mean,
         "accuracy_edge_vs_baseline": accuracy_edge_vs_baseline,
@@ -3424,6 +3539,11 @@ def evaluate_coin_walk_forward(
         **label_meta,
         **feature_meta,
     }
+
+    if all_one_class_rejection:
+        _apply_all_windows_one_class_rejection(coin_result)
+
+    return coin_result
 
 
 def _aggregate_label_distribution(
@@ -3524,6 +3644,27 @@ def build_walk_forward_report(
     total_windows = sum(int(item.get("total_windows", 0)) for item in per_coin_results)
     completed_windows = sum(int(item.get("completed_windows", 0)) for item in per_coin_results)
     skipped_windows = sum(int(item.get("skipped_windows", 0)) for item in per_coin_results)
+    skipped_windows_count = skipped_windows
+    all_window_results = [
+        window
+        for item in per_coin_results
+        for window in item.get("windows", [])
+    ]
+    skipped_window_reasons = _aggregate_skipped_window_reasons(all_window_results)
+    one_class_training_windows_count = int(
+        skipped_window_reasons.get(ONE_CLASS_TRAINING_WINDOW_REASON, 0)
+    )
+    if one_class_training_windows_count > 0:
+        warnings.append(
+            f"one_class_training_windows: {one_class_training_windows_count} "
+            "aggregate walk-forward window(s) skipped because training labels "
+            "contained only one class"
+        )
+    all_one_class_rejection = _all_windows_skipped_one_class_training(
+        total_windows=total_windows,
+        completed_windows=completed_windows,
+        skipped_window_reasons=skipped_window_reasons,
+    )
     total_paper_signals = sum(int(item.get("total_paper_signals", 0)) for item in per_coin_results)
     raw_predictions = sum(int(item.get("raw_predictions", 0)) for item in per_coin_results)
     filtered_paper_trades = sum(int(item.get("filtered_paper_trades", 0)) for item in per_coin_results)
@@ -3740,6 +3881,9 @@ def build_walk_forward_report(
         "total_windows": total_windows,
         "completed_windows": completed_windows,
         "skipped_windows": skipped_windows,
+        "skipped_windows_count": skipped_windows_count,
+        "skipped_window_reasons": skipped_window_reasons,
+        "one_class_training_windows_count": one_class_training_windows_count,
         "model_accuracy_mean": model_accuracy_mean,
         "baseline_accuracy_mean": baseline_accuracy_mean,
         "accuracy_edge_vs_baseline": accuracy_edge_vs_baseline,
@@ -3813,6 +3957,13 @@ def build_walk_forward_report(
         report["regime_breakdown_diagnostics"] = compute_regime_breakdown_diagnostics(
             accepted_trade_records
         )
+
+    if all_one_class_rejection:
+        _apply_all_windows_one_class_rejection(report)
+    elif completed_windows > 0:
+        report["status"] = "completed"
+    elif total_windows > 0:
+        report["status"] = "skipped"
 
     return report
 
@@ -3934,6 +4085,12 @@ def write_walk_forward_markdown(
             f"- total_windows: {report.get('total_windows', 0)}",
             f"- completed_windows: {report.get('completed_windows', 0)}",
             f"- skipped_windows: {report.get('skipped_windows', 0)}",
+            f"- skipped_windows_count: {report.get('skipped_windows_count', 0)}",
+            f"- one_class_training_windows_count: "
+            f"{report.get('one_class_training_windows_count', 0)}",
+            f"- skipped_window_reasons: {report.get('skipped_window_reasons', {})}",
+            f"- status: {report.get('status', 'n/a')}",
+            f"- rejection_reason: {report.get('rejection_reason', 'n/a')}",
             f"- model_accuracy_mean: {report.get('model_accuracy_mean', 0.0):.4f}",
             f"- baseline_accuracy_mean: {report.get('baseline_accuracy_mean', 0.0):.4f}",
             f"- accuracy_edge_vs_baseline: {report.get('accuracy_edge_vs_baseline', 0.0):.4f}",
@@ -3956,7 +4113,7 @@ def write_walk_forward_markdown(
             f"- average_net_return_difference_abs: {report.get('average_net_return_difference_abs', 0.0):.6f}",
             f"- net_return_consistency_check: {str(report.get('net_return_consistency_check', True)).lower()}",
             f"- max_drawdown_bps: {report.get('max_drawdown_bps', 0.0):.4f}",
-            f"- win_rate_after_costs: {report.get('win_rate_after_costs', 0.0):.4f}",
+            f"- win_rate_after_costs: {report.get('win_rate_after_costs', 0.0)}",
             f"- longest_losing_streak: {report.get('longest_losing_streak', 0)}",
             "",
         ]
