@@ -52,5 +52,5 @@ Session duration: **8** hours; tick interval: **60** minutes.
 ## Manual caffeinated session (without launchd)
 
 ```bash
-/usr/bin/caffeinate -d -i -m -s -u /Library/Frameworks/Python.framework/Versions/3.14/bin/python3 /Users/lysto_mac/hyperliquid-bot/bid_ask_research_scheduler.py research-session --duration-hours 8 --tick-interval-minutes 60 --tick-timeout-minutes 90 --requester-pays
+/usr/bin/caffeinate -d -i -m -s -u /Users/lysto_mac/hyperliquid-bot/.venv314/bin/python3 /Users/lysto_mac/hyperliquid-bot/bid_ask_research_scheduler.py research-session --duration-hours 8 --tick-interval-minutes 60 --tick-timeout-minutes 90 --tick-max-files 6 --tick-max-chunks 1 --tick-budget-minutes 50 --requester-pays
 ```

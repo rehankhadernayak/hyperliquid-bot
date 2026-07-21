@@ -4686,17 +4686,7 @@ class TestResearchSessionLaunchdTemplate:
         )
 
         program_args = _extract_plist_program_arguments(morning_plist)
-        store_true_flags = {
-            "--requester-pays",
-            "--no-requester-pays",
-            "--dry-run",
-        }
-        for index, token in enumerate(program_args):
-            if token in store_true_flags and index + 1 < len(program_args):
-                next_token = program_args[index + 1].lower()
-                assert next_token not in {"true", "false"}, (
-                    f"{token} must not be followed by {next_token!r} in {program_args}"
-                )
+        scheduler._assert_research_session_program_arguments_no_stray_booleans(program_args)
 
         assert "--requester-pays" in program_args
         assert "true" not in program_args
@@ -4722,19 +4712,63 @@ class TestResearchSessionLaunchdTemplate:
 
         program_args = _extract_plist_program_arguments(morning_plist)
         scheduler_script = program_args[1]
-        research_session_args = program_args[2:]
 
         assert program_args[0] == "/usr/bin/python3"
         assert Path(scheduler_script).name == "bid_ask_research_scheduler.py"
-        assert research_session_args[0] == "research-session"
 
-        parsed = scheduler.build_parser().parse_args(research_session_args)
+        parsed = scheduler.validate_research_session_program_arguments(program_args)
         assert parsed.command == "research-session"
         assert parsed.requester_pays is True
         assert parsed.run_candidate_tests is True
         assert parsed.run_relaxed_candidate_test is True
         assert parsed.update_dashboard_artifacts is True
-        assert parsed.tick_timeout_minutes == 90
+        assert parsed.tick_timeout_minutes == scheduler.DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES
+        assert parsed.tick_max_files == scheduler.DEFAULT_AUTOPILOT_TICK_MAX_FILES
+        assert parsed.tick_max_chunks == scheduler.DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS
+        assert parsed.tick_budget_minutes == scheduler.DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES
+
+    def test_generated_launchd_template_includes_bounded_tick_budget_args(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        output_dir = tmp_path / "launchd"
+        morning_plist, evening_plist, _ = scheduler.cmd_write_research_session_launchd_template(
+            output_dir=output_dir,
+            project_dir=tmp_path,
+            python_path="/usr/bin/python3",
+            use_caffeinate=False,
+        )
+
+        expected = {
+            "--tick-max-files": str(scheduler.DEFAULT_AUTOPILOT_TICK_MAX_FILES),
+            "--tick-max-chunks": str(scheduler.DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS),
+            "--tick-budget-minutes": str(scheduler.DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES),
+            "--tick-timeout-minutes": str(scheduler.DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES),
+        }
+        for plist in (morning_plist, evening_plist):
+            program_args = _extract_plist_program_arguments(plist)
+            parsed = scheduler.validate_research_session_program_arguments(program_args)
+            for flag, value in expected.items():
+                flag_index = program_args.index(flag)
+                assert program_args[flag_index + 1] == value
+            assert parsed.tick_max_files == scheduler.DEFAULT_AUTOPILOT_TICK_MAX_FILES
+            assert parsed.tick_max_chunks == scheduler.DEFAULT_AUTOPILOT_TICK_MAX_CHUNKS
+            assert parsed.tick_budget_minutes == scheduler.DEFAULT_AUTOPILOT_TICK_BUDGET_MINUTES
+            assert parsed.tick_timeout_minutes == scheduler.DEFAULT_RESEARCH_SESSION_TICK_TIMEOUT_MINUTES
+
+    def test_repo_launchd_plists_include_bounded_tick_budget_args(self) -> None:
+        launchd_dir = Path(__file__).resolve().parent.parent / "launchd"
+        for plist_name in (
+            scheduler.LAUNCHD_RESEARCH_SESSION_MORNING_PLIST,
+            scheduler.LAUNCHD_RESEARCH_SESSION_EVENING_PLIST,
+        ):
+            program_args = _extract_plist_program_arguments(launchd_dir / plist_name)
+            parsed = scheduler.validate_research_session_program_arguments(program_args)
+            assert parsed.tick_max_files == 6
+            assert parsed.tick_max_chunks == 1
+            assert parsed.tick_budget_minutes == 50
+            assert parsed.tick_timeout_minutes == 90
+            scheduler._assert_research_session_program_arguments_no_stray_booleans(program_args)
 
     def test_generated_launchd_template_includes_tick_timeout_minutes(
         self,

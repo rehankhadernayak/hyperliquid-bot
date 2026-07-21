@@ -5292,6 +5292,41 @@ def _build_research_session_program_arguments(
     return session_args
 
 
+_RESEARCH_SESSION_STORE_TRUE_FLAGS = frozenset(
+    {"--requester-pays", "--no-requester-pays", "--dry-run"}
+)
+
+
+def _assert_research_session_program_arguments_no_stray_booleans(
+    program_args: list[str],
+) -> None:
+    """Reject launchd args with standalone true/false or store_true flag misuse."""
+    for index, token in enumerate(program_args):
+        if token in _RESEARCH_SESSION_STORE_TRUE_FLAGS and index + 1 < len(program_args):
+            next_token = program_args[index + 1].lower()
+            if next_token in {"true", "false"}:
+                raise ValueError(
+                    f"{token} must not be followed by {next_token!r} in {program_args}"
+                )
+    if "true" in program_args or "false" in program_args:
+        raise ValueError(
+            "standalone true/false tokens are not allowed in launchd ProgramArguments: "
+            f"{program_args}"
+        )
+
+
+def validate_research_session_program_arguments(
+    program_args: list[str],
+) -> argparse.Namespace:
+    """Validate launchd ProgramArguments against the research-session parser."""
+    _assert_research_session_program_arguments_no_stray_booleans(program_args)
+    try:
+        research_idx = program_args.index("research-session")
+    except ValueError as exc:
+        raise ValueError("research-session subcommand missing from program_args") from exc
+    return build_parser().parse_args(program_args[research_idx:])
+
+
 def cmd_write_research_session_launchd_template(
     *,
     label_prefix: str = DEFAULT_RESEARCH_SESSION_LABEL_PREFIX,
@@ -5329,6 +5364,7 @@ def cmd_write_research_session_launchd_template(
         use_caffeinate=caffeinate_enabled,
         caffeinate_flags=caffeinate_flags,
     )
+    validate_research_session_program_arguments(cmd_parts)
 
     stdout_log = DEFAULT_STATE_DIR / "research_session_launchd.out.log"
     stderr_log = DEFAULT_STATE_DIR / "research_session_launchd.err.log"

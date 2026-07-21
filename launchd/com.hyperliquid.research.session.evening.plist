@@ -12,7 +12,7 @@
         <string>-m</string>
         <string>-s</string>
         <string>-u</string>
-        <string>/Library/Frameworks/Python.framework/Versions/3.14/bin/python3</string>
+        <string>/Users/lysto_mac/hyperliquid-bot/.venv314/bin/python3</string>
         <string>/Users/lysto_mac/hyperliquid-bot/bid_ask_research_scheduler.py</string>
         <string>research-session</string>
         <string>--duration-hours</string>
@@ -21,6 +21,12 @@
         <string>60</string>
         <string>--tick-timeout-minutes</string>
         <string>90</string>
+        <string>--tick-max-files</string>
+        <string>6</string>
+        <string>--tick-max-chunks</string>
+        <string>1</string>
+        <string>--tick-budget-minutes</string>
+        <string>50</string>
         <string>--requester-pays</string>
     </array>
     <key>WorkingDirectory</key>
