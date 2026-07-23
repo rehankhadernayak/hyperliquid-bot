@@ -156,10 +156,16 @@ def _make_trade_rows(
         if include_regime:
             row.update(
                 {
-                    "low_volatility_regime": 1.0,
-                    "high_volatility_regime": 0.0,
-                    "tight_spread_regime": 1.0,
-                    "wide_spread_regime": 0.0,
+                    "realized_volatility_5m_bps": 12.0,
+                    "realized_volatility_15m_bps": 10.0,
+                    "volatility_ratio_5m_15m": 1.2,
+                    "spread_volatility_interaction": 24.0,
+                    "microprice_volatility_interaction": 3.0,
+                    "imbalance_volatility_interaction": 0.5,
+                    "low_volatility_regime": 1.0 if index % 2 == 0 else 0.0,
+                    "high_volatility_regime": 0.0 if index % 2 == 0 else 1.0,
+                    "tight_spread_regime": 1.0 if index < count - 1 else 0.0,
+                    "wide_spread_regime": 0.0 if index < count - 1 else 1.0,
                 }
             )
         rows.append(row)
@@ -311,7 +317,43 @@ class TestTradeAnalysis:
         df = pd.DataFrame(rows)
         analysis = analyze_accepted_trades_robustness(df)
         assert "low_volatility_regime" in analysis["by_regime"]
-        assert analysis["by_regime"]["low_volatility_regime"]["count"] == 3
+        assert analysis["by_regime"]["low_volatility_regime"]["count"] == 2
+        assert analysis["by_regime"]["high_volatility_regime"]["count"] == 1
+
+    def test_volatility_and_spread_regime_summaries(self) -> None:
+        rows = _make_trade_rows(4, net_values=[2.0, 4.0, -1.0, 3.0], include_regime=True)
+        analysis = analyze_accepted_trades_robustness(pd.DataFrame(rows))
+
+        assert analysis["by_volatility_regime"]["low_volatility_regime"]["count"] == 2
+        assert analysis["by_volatility_regime"]["low_volatility_regime"]["cumulative_net_bps"] == pytest.approx(1.0)
+        assert analysis["by_volatility_regime"]["low_volatility_regime"]["avg_net_bps"] == pytest.approx(0.5)
+        assert analysis["by_volatility_regime"]["high_volatility_regime"]["count"] == 2
+        assert analysis["by_volatility_regime"]["high_volatility_regime"]["cumulative_net_bps"] == pytest.approx(7.0)
+
+        assert analysis["by_spread_regime"]["tight_spread_regime"]["count"] == 3
+        assert analysis["by_spread_regime"]["tight_spread_regime"]["cumulative_net_bps"] == pytest.approx(5.0)
+        assert analysis["by_spread_regime"]["wide_spread_regime"]["count"] == 1
+        assert analysis["by_spread_regime"]["wide_spread_regime"]["cumulative_net_bps"] == pytest.approx(3.0)
+
+        assert analysis["dominant_volatility_regime"] in {
+            "low_volatility_regime",
+            "high_volatility_regime",
+        }
+        assert analysis["dominant_volatility_regime_trade_fraction"] == pytest.approx(0.5)
+        assert analysis["dominant_spread_regime"] == "tight_spread_regime"
+        assert analysis["dominant_spread_regime_trade_fraction"] == pytest.approx(0.75)
+        assert analysis["dominant_regime"] == "tight_spread_regime"
+        assert analysis["dominant_regime_trade_fraction"] == pytest.approx(0.75)
+
+    def test_regime_summaries_absent_without_columns(self) -> None:
+        analysis = analyze_accepted_trades_robustness(
+            pd.DataFrame(_make_trade_rows(2, net_values=[1.0, 2.0]))
+        )
+        assert analysis["by_regime"] == {}
+        assert analysis["by_volatility_regime"] == {}
+        assert analysis["by_spread_regime"] == {}
+        assert analysis["dominant_regime"] is None
+        assert analysis["dominant_regime_trade_fraction"] == 0.0
 
     def test_by_hour_and_day_aggregation(self) -> None:
         rows = [

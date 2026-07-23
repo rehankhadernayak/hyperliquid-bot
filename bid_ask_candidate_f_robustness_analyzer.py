@@ -15,7 +15,11 @@ from typing import Any
 
 import pandas as pd
 
-from bid_ask_features import REGIME_BREAKDOWN_COLUMNS
+from bid_ask_features import (
+    REGIME_BREAKDOWN_COLUMNS,
+    SPREAD_REGIME_COLUMNS,
+    VOLATILITY_REGIME_COLUMNS,
+)
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, PAPER_ONLY, SAFETY_STATEMENT
 
 CANDIDATE_F_FEATURE_SET = "candidate_f_regime_depth"
@@ -315,7 +319,12 @@ def _parse_timestamp_iso(value: object) -> datetime | None:
 
 def _aggregate_bucket(records: list[dict[str, Any]]) -> dict[str, Any]:
     if not records:
-        return {"count": 0, "sum_net_bps": 0.0, "avg_net_bps": 0.0}
+        return {
+            "count": 0,
+            "sum_net_bps": 0.0,
+            "avg_net_bps": 0.0,
+            "cumulative_net_bps": 0.0,
+        }
     net_returns = [float(record["net_return_bps"]) for record in records]
     total = float(sum(net_returns))
     count = len(net_returns)
@@ -323,7 +332,43 @@ def _aggregate_bucket(records: list[dict[str, Any]]) -> dict[str, Any]:
         "count": count,
         "sum_net_bps": total,
         "avg_net_bps": total / count,
+        "cumulative_net_bps": total,
     }
+
+
+def _regime_bucket_metrics(working: pd.DataFrame, column: str) -> dict[str, Any]:
+    if column not in working.columns:
+        return {
+            "count": 0,
+            "sum_net_bps": 0.0,
+            "avg_net_bps": 0.0,
+            "cumulative_net_bps": 0.0,
+        }
+    active = working[pd.to_numeric(working[column], errors="coerce") >= 0.5]
+    return _aggregate_bucket(active.to_dict(orient="records"))
+
+
+def _regime_group_summary(
+    working: pd.DataFrame,
+    columns: tuple[str, ...],
+) -> dict[str, dict[str, Any]]:
+    summary: dict[str, dict[str, Any]] = {}
+    for column in columns:
+        if column not in working.columns:
+            continue
+        summary[column] = _regime_bucket_metrics(working, column)
+    return summary
+
+
+def _dominant_regime(
+    regime_counts: dict[str, int],
+    *,
+    trade_count: int,
+) -> tuple[str | None, float]:
+    if not regime_counts or trade_count <= 0:
+        return None, 0.0
+    dominant = max(regime_counts, key=regime_counts.get)
+    return dominant, regime_counts[dominant] / trade_count
 
 
 def _trade_summary(row: pd.Series) -> dict[str, Any]:
@@ -423,8 +468,33 @@ def analyze_accepted_trades_robustness(df: pd.DataFrame) -> dict[str, Any]:
     for column in REGIME_BREAKDOWN_COLUMNS:
         if column not in working.columns:
             continue
-        active = working[pd.to_numeric(working[column], errors="coerce") >= 0.5]
-        by_regime[column] = _aggregate_bucket(active.to_dict(orient="records"))
+        by_regime[column] = _regime_bucket_metrics(working, column)
+
+    by_volatility_regime = _regime_group_summary(working, VOLATILITY_REGIME_COLUMNS)
+    by_spread_regime = _regime_group_summary(working, SPREAD_REGIME_COLUMNS)
+
+    volatility_regime_counts = {
+        column: int(metrics["count"]) for column, metrics in by_volatility_regime.items()
+    }
+    spread_regime_counts = {
+        column: int(metrics["count"]) for column, metrics in by_spread_regime.items()
+    }
+    all_regime_counts = {
+        column: int(metrics["count"]) for column, metrics in by_regime.items()
+    }
+
+    dominant_volatility_regime, dominant_volatility_regime_trade_fraction = _dominant_regime(
+        volatility_regime_counts,
+        trade_count=trade_count,
+    )
+    dominant_spread_regime, dominant_spread_regime_trade_fraction = _dominant_regime(
+        spread_regime_counts,
+        trade_count=trade_count,
+    )
+    dominant_regime, dominant_regime_trade_fraction = _dominant_regime(
+        all_regime_counts,
+        trade_count=trade_count,
+    )
 
     return {
         "trade_count": trade_count,
@@ -439,6 +509,14 @@ def analyze_accepted_trades_robustness(df: pd.DataFrame) -> dict[str, Any]:
         "by_utc_hour": dict(sorted(by_utc_hour.items())),
         "by_day": dict(sorted(by_day.items())),
         "by_regime": by_regime,
+        "by_volatility_regime": by_volatility_regime,
+        "by_spread_regime": by_spread_regime,
+        "dominant_regime": dominant_regime,
+        "dominant_regime_trade_fraction": dominant_regime_trade_fraction,
+        "dominant_volatility_regime": dominant_volatility_regime,
+        "dominant_volatility_regime_trade_fraction": dominant_volatility_regime_trade_fraction,
+        "dominant_spread_regime": dominant_spread_regime,
+        "dominant_spread_regime_trade_fraction": dominant_spread_regime_trade_fraction,
         "dominant_utc_hour": dominant_hour,
         "dominant_utc_hour_trade_fraction": max_hour_trade_fraction,
     }
@@ -709,11 +787,42 @@ def write_robustness_markdown(
             for regime, metrics in sorted(by_regime.items()):
                 lines.append(
                     f"- {regime}: count={metrics.get('count', 0)}, "
-                    f"sum={_format_bps(float(metrics.get('sum_net_bps') or 0.0))}, "
+                    f"cumulative={_format_bps(float(metrics.get('cumulative_net_bps') or metrics.get('sum_net_bps') or 0.0))}, "
                     f"avg={_format_bps(float(metrics.get('avg_net_bps') or 0.0))}"
                 )
         else:
             lines.append("- regime columns not present in accepted-trades CSV")
+        by_volatility = trade.get("by_volatility_regime") or {}
+        if by_volatility:
+            lines.append("- by volatility regime:")
+            for regime, metrics in sorted(by_volatility.items()):
+                lines.append(
+                    f"  - {regime}: count={metrics.get('count', 0)}, "
+                    f"cumulative={_format_bps(float(metrics.get('cumulative_net_bps') or metrics.get('sum_net_bps') or 0.0))}, "
+                    f"avg={_format_bps(float(metrics.get('avg_net_bps') or 0.0))}"
+                )
+            lines.append(
+                f"- dominant volatility regime: {trade.get('dominant_volatility_regime', 'n/a')} "
+                f"({_format_pct(float(trade.get('dominant_volatility_regime_trade_fraction') or 0.0))} of trades)"
+            )
+        by_spread = trade.get("by_spread_regime") or {}
+        if by_spread:
+            lines.append("- by spread regime:")
+            for regime, metrics in sorted(by_spread.items()):
+                lines.append(
+                    f"  - {regime}: count={metrics.get('count', 0)}, "
+                    f"cumulative={_format_bps(float(metrics.get('cumulative_net_bps') or metrics.get('sum_net_bps') or 0.0))}, "
+                    f"avg={_format_bps(float(metrics.get('avg_net_bps') or 0.0))}"
+                )
+            lines.append(
+                f"- dominant spread regime: {trade.get('dominant_spread_regime', 'n/a')} "
+                f"({_format_pct(float(trade.get('dominant_spread_regime_trade_fraction') or 0.0))} of trades)"
+            )
+        if trade.get("dominant_regime"):
+            lines.append(
+                f"- dominant regime (overall): {trade.get('dominant_regime', 'n/a')} "
+                f"({_format_pct(float(trade.get('dominant_regime_trade_fraction') or 0.0))} of trades)"
+            )
         by_hour = trade.get("by_utc_hour") or {}
         if by_hour:
             lines.append("- by UTC hour:")

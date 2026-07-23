@@ -87,6 +87,18 @@ REGIME_BREAKDOWN_COLUMNS = (
     "wide_spread_regime",
 )
 
+VOLATILITY_REGIME_COLUMNS = (
+    "low_volatility_regime",
+    "high_volatility_regime",
+)
+
+SPREAD_REGIME_COLUMNS = (
+    "tight_spread_regime",
+    "wide_spread_regime",
+)
+
+ACCEPTED_TRADES_CANDIDATE_F_DIAGNOSTIC_COLUMNS = CANDIDATE_F_REGIME_DEPTH_EXTRA_COLUMNS
+
 FUTURE_FEATURE_COLUMNS = frozenset(
     {
         "future_return_bps",

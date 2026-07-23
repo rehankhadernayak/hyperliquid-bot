@@ -17,6 +17,7 @@ import numpy as np
 import pandas as pd
 
 from bid_ask_features import (
+    ACCEPTED_TRADES_CANDIDATE_F_DIAGNOSTIC_COLUMNS,
     CANDIDATE_C_CORE_COLUMNS,
     CANDIDATE_E_DEPTH_AWARE_COLUMNS,
     CANDIDATE_F_REGIME_DEPTH_COLUMNS,
@@ -1658,12 +1659,24 @@ def _normalize_predicted_class(prediction: str) -> str:
 
 
 def _regime_fields_from_row(row: pd.Series) -> dict[str, float]:
-    """Extract Candidate F regime flags from a labeled feature row when present."""
+    """Extract Candidate F diagnostic fields from a labeled feature row when present."""
     fields: dict[str, float] = {}
-    for column in REGIME_BREAKDOWN_COLUMNS:
+    for column in ACCEPTED_TRADES_CANDIDATE_F_DIAGNOSTIC_COLUMNS:
         if column in row.index and pd.notna(row[column]):
             fields[column] = float(row[column])
     return fields
+
+
+def resolve_accepted_trades_csv_columns(
+    accepted_trade_records: list[dict[str, Any]],
+) -> tuple[str, ...]:
+    """Return base CSV columns plus optional Candidate F diagnostics when present."""
+    optional_columns = [
+        column
+        for column in ACCEPTED_TRADES_CANDIDATE_F_DIAGNOSTIC_COLUMNS
+        if any(column in record for record in accepted_trade_records)
+    ]
+    return ACCEPTED_TRADES_CSV_COLUMNS + tuple(optional_columns)
 
 
 def compute_regime_breakdown_diagnostics(
@@ -2890,11 +2903,12 @@ def write_accepted_trades_csv(
     output_path = reports_dir / f"accepted_trades_{coins_label}_{stamp}.csv"
 
     limited_records = accepted_trade_records[: max(0, limit)]
+    csv_columns = resolve_accepted_trades_csv_columns(limited_records)
     rows = [
-        {column: record.get(column, "") for column in ACCEPTED_TRADES_CSV_COLUMNS}
+        {column: record.get(column, "") for column in csv_columns}
         for record in limited_records
     ]
-    pd.DataFrame(rows, columns=list(ACCEPTED_TRADES_CSV_COLUMNS)).to_csv(
+    pd.DataFrame(rows, columns=list(csv_columns)).to_csv(
         output_path, index=False
     )
     report["accepted_trades_csv_path"] = str(output_path)

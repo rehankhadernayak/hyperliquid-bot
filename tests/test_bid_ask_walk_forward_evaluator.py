@@ -14,6 +14,7 @@ import pytest
 from bid_ask_resampler import RESAMPLED_COLUMNS, resampled_csv_path
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 from bid_ask_features import (
+    ACCEPTED_TRADES_CANDIDATE_F_DIAGNOSTIC_COLUMNS,
     CANDIDATE_C_CORE_COLUMNS,
     CANDIDATE_E_DEPTH_AWARE_COLUMNS,
     CANDIDATE_E_DEPTH_AWARE_EXTRA_COLUMNS,
@@ -88,6 +89,7 @@ from bid_ask_walk_forward_evaluator import (
     is_binary_tradeable_label_mode,
     is_candidate_d_diagnostics_only,
     regime_filters_enabled,
+    resolve_accepted_trades_csv_columns,
     resolve_coins,
     run_walk_forward_evaluation,
     simulate_binary_tradeable_paper_returns,
@@ -98,6 +100,7 @@ from bid_ask_walk_forward_evaluator import (
     walk_forward_rows_ready_for_model,
     write_walk_forward_json,
     write_walk_forward_markdown,
+    write_accepted_trades_csv,
     _trade_record_utc_hour,
 )
 
@@ -3095,6 +3098,82 @@ class TestTradeDiagnostics:
         assert report["accepted_trades_count"] == 1
         saved = pd.read_csv(csv_path)
         assert list(saved.columns) == list(ACCEPTED_TRADES_CSV_COLUMNS)
+
+    def test_finalize_accepted_trades_csv_includes_candidate_f_diagnostics_when_present(
+        self, reports_dir: Path
+    ) -> None:
+        report = {
+            "generated_at": "2024-06-10T00:00:00+00:00",
+            "coins": ["BTC"],
+            "filtered_paper_trades": 1,
+        }
+        records = [
+            {
+                **_synthetic_accepted_trade(),
+                "realized_volatility_5m_bps": 12.5,
+                "realized_volatility_15m_bps": 10.0,
+                "volatility_ratio_5m_15m": 1.25,
+                "spread_volatility_interaction": 25.0,
+                "microprice_volatility_interaction": 3.5,
+                "imbalance_volatility_interaction": 0.8,
+                "low_volatility_regime": 1.0,
+                "high_volatility_regime": 0.0,
+                "tight_spread_regime": 1.0,
+                "wide_spread_regime": 0.0,
+            }
+        ]
+
+        finalize_accepted_trades_csv(
+            report,
+            records,
+            reports_dir=reports_dir,
+            save_accepted_trades=True,
+        )
+
+        saved = pd.read_csv(Path(report["accepted_trades_csv_path"]))
+        expected_columns = ACCEPTED_TRADES_CSV_COLUMNS + ACCEPTED_TRADES_CANDIDATE_F_DIAGNOSTIC_COLUMNS
+        assert list(saved.columns) == list(expected_columns)
+        assert saved.loc[0, "realized_volatility_5m_bps"] == pytest.approx(12.5)
+        assert saved.loc[0, "low_volatility_regime"] == pytest.approx(1.0)
+
+    def test_resolve_accepted_trades_csv_columns_backward_compatible(self) -> None:
+        base_only = [_synthetic_accepted_trade()]
+        assert resolve_accepted_trades_csv_columns(base_only) == ACCEPTED_TRADES_CSV_COLUMNS
+
+        with_diagnostics = [{**_synthetic_accepted_trade(), "low_volatility_regime": 1.0}]
+        assert resolve_accepted_trades_csv_columns(with_diagnostics) == (
+            ACCEPTED_TRADES_CSV_COLUMNS + ("low_volatility_regime",)
+        )
+
+    def test_write_accepted_trades_csv_exports_candidate_f_diagnostics(
+        self, reports_dir: Path
+    ) -> None:
+        report = {
+            "generated_at": "2024-06-10T00:00:00+00:00",
+            "coins": ["BTC"],
+        }
+        records = [
+            {
+                **_synthetic_accepted_trade(),
+                **{
+                    column: float(index + 1)
+                    for index, column in enumerate(ACCEPTED_TRADES_CANDIDATE_F_DIAGNOSTIC_COLUMNS)
+                },
+            }
+        ]
+
+        csv_path = write_accepted_trades_csv(
+            records,
+            reports_dir=reports_dir,
+            report=report,
+        )
+        assert csv_path is not None
+        saved = pd.read_csv(csv_path)
+        assert list(saved.columns) == list(
+            ACCEPTED_TRADES_CSV_COLUMNS + ACCEPTED_TRADES_CANDIDATE_F_DIAGNOSTIC_COLUMNS
+        )
+        assert saved.loc[0, "realized_volatility_5m_bps"] == pytest.approx(1.0)
+        assert saved.loc[0, "wide_spread_regime"] == pytest.approx(10.0)
 
     def test_diagnostics_detail_basic_strips_trade_records(self) -> None:
         report = {
