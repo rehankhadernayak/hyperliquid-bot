@@ -22,6 +22,7 @@ from bid_ask_schema import (
     SAFETY_STATEMENT,
     TIMESTAMP_ISO,
     TIMESTAMP_MS,
+    configure_csv_field_size_limit,
     timestamp_ms_to_iso,
 )
 from bid_ask_validator import bid_ask_csv_path
@@ -189,6 +190,7 @@ def _analyze_csv(path: Path, *, interval: str) -> dict[str, Any]:
     header_has_ask = False
 
     try:
+        configure_csv_field_size_limit()
         with path.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             fieldnames = reader.fieldnames or []

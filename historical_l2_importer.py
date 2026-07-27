@@ -31,6 +31,7 @@ from bid_ask_schema import (
     TIMESTAMP_ISO,
     TIMESTAMP_MS,
     build_bid_ask_row,
+    configure_csv_field_size_limit,
     timestamp_ms_to_iso,
     validate_bid_ask,
 )
@@ -314,6 +315,7 @@ def read_historical_bid_ask_csv(csv_path: Path | str) -> list[dict[str, Any]]:
         raise FileNotFoundError(f"CSV file not found: {path}")
 
     rows: list[dict[str, Any]] = []
+    configure_csv_field_size_limit()
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
@@ -439,6 +441,7 @@ def summarize_historical_coverage(csv_path: Path | str) -> HistoricalCoverageSum
     invalid_bid_ask_rows = 0
     seen: dict[int, int] = {}
 
+    configure_csv_field_size_limit()
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:

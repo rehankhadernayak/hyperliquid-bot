@@ -68,6 +68,23 @@ def _write_1s_csv(
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
+def _write_1s_csv_with_large_session_field(
+    path: Path,
+    *,
+    field_size: int = 140_000,
+    timestamp_ms: int = BASE_MS,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    large_session = "x" * field_size
+    iso = timestamp_ms_to_iso(timestamp_ms)
+    lines = [
+        "timestamp_ms,timestamp_iso,coin,best_bid,best_ask,mid_price,spread,spread_bps,"
+        "bid_size,ask_size,bbo_imbalance,source_session_id,source_channel",
+        f'{timestamp_ms},{iso},BTC,100.0,100.5,100.25,0.5,49.9,2.0,1.0,0.0,"{large_session}",bbo',
+    ]
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def _write_resampled_csv(
     path: Path,
     *,
@@ -510,3 +527,43 @@ class TestSafety:
             data_root=workspace["data_root"],
             output_dir=workspace["output_dir"],
         )
+
+
+class TestLargeCsvFieldLimit:
+    def test_analyze_csv_reads_field_larger_than_default_limit(
+        self,
+        workspace: dict[str, Path],
+    ) -> None:
+        csv_path = bid_ask_csv_path("BTC", "1s", workspace["data_root"], source="historical")
+        _write_1s_csv_with_large_session_field(csv_path)
+
+        result = tracker._analyze_csv(csv_path, interval="1s")
+
+        assert result["row_count"] == 1
+        assert result["first_timestamp_ms"] == BASE_MS
+        assert result["latest_timestamp_ms"] == BASE_MS
+
+    def test_analyze_csv_does_not_swallow_csv_field_size_error(
+        self,
+        workspace: dict[str, Path],
+    ) -> None:
+        import csv as csv_module
+
+        csv_path = bid_ask_csv_path("BTC", "1s", workspace["data_root"], source="historical")
+        _write_1s_csv_with_large_session_field(csv_path)
+        csv_module.field_size_limit(131_072)
+
+        result = tracker._analyze_csv(csv_path, interval="1s")
+        assert result["row_count"] == 1
+
+        original = tracker.configure_csv_field_size_limit
+        def _force_default_limit() -> int:
+            csv_module.field_size_limit(131_072)
+            return 131_072
+
+        tracker.configure_csv_field_size_limit = _force_default_limit
+        try:
+            with pytest.raises(csv_module.Error, match="field larger than field limit"):
+                tracker._analyze_csv(csv_path, interval="1s")
+        finally:
+            tracker.configure_csv_field_size_limit = original

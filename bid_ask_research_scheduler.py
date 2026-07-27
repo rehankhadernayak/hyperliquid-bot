@@ -22,7 +22,7 @@ import bid_ask_candidate_validator as candidate_validator
 import bid_ask_daily_summary
 import bid_ask_research_orchestrator as orchestrator
 from bid_ask_resampler import normalize_source, resampled_csv_path
-from bid_ask_schema import SAFETY_STATEMENT, TIMESTAMP_MS
+from bid_ask_schema import SAFETY_STATEMENT, TIMESTAMP_MS, configure_csv_field_size_limit
 from historical_l2_backfill_planner import validate_date_yyyymmdd
 from historical_l2_importer import default_historical_output_path, summarize_historical_coverage
 
@@ -1162,6 +1162,7 @@ def _summarize_historical_1s_csv_path(csv_path: Path) -> dict[str, Any]:
     rows_scanned = 0
 
     try:
+        configure_csv_field_size_limit()
         with csv_path.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             for row in reader:
@@ -1467,6 +1468,7 @@ def _resampled_coverage_entry(
 
     start_values: list[int] = []
     end_values: list[int] = []
+    configure_csv_field_size_limit()
     with csv_path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
@@ -2667,6 +2669,7 @@ def _chunk_selection_report_fields(selection: dict[str, Any]) -> dict[str, Any]:
 
 def _count_rows_in_timestamp_range(csv_path: Path, start_ms: int, end_ms: int) -> int:
     count = 0
+    configure_csv_field_size_limit()
     with csv_path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:

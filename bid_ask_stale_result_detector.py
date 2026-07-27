@@ -15,7 +15,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT
+from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT, configure_csv_field_size_limit
 from bid_ask_validator import bid_ask_csv_path
 
 DEFAULT_REPORTS_ROOT = Path("reports")
@@ -133,6 +133,7 @@ def _csv_timestamp_bounds(path: Path, *, interval: str) -> tuple[int | None, int
     first_ts: int | None = None
     last_ts: int | None = None
     try:
+        configure_csv_field_size_limit()
         with path.open(encoding="utf-8", newline="") as handle:
             reader = csv.DictReader(handle)
             for row in reader:

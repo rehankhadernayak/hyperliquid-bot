@@ -2039,6 +2039,74 @@ class TestImportProgressHelpers:
         assert coverage["last_row_timestamp_ms"] == last_row_ms
         assert coverage["csv_summary_method"] == scheduler.CSV_SUMMARY_METHOD
 
+    def test_summarize_historical_1s_csv_reads_field_larger_than_default_limit(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        data_root = tmp_path / "data"
+        timestamp_ms = 1_700_000_000_000
+        _write_historical_csv_with_large_session_field(
+            data_root,
+            "BTC",
+            timestamp_ms=timestamp_ms,
+        )
+
+        summary = scheduler._summarize_historical_1s_csv(data_root, "BTC")
+
+        assert summary["rows_scanned"] == 1
+        assert summary["max_timestamp_ms"] == timestamp_ms
+        assert summary["first_row_timestamp_ms"] == timestamp_ms
+        assert summary["last_row_timestamp_ms"] == timestamp_ms
+
+    def test_summarize_historical_1s_csv_reports_missing_timestamps_normally(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        data_root = tmp_path / "data"
+        csv_path = data_root / "historical_1s" / "BTC_1s.csv"
+        csv_path.parent.mkdir(parents=True, exist_ok=True)
+        csv_path.write_text(
+            "timestamp_ms,timestamp_iso,coin,best_bid,best_ask,mid_price,spread,spread_bps,"
+            "bid_size,ask_size,bbo_imbalance,source_session_id,source_channel\n"
+            "1700000000000,2023-11-14T22:13:20Z,BTC,100.0,100.5,100.25,0.5,49.9,"
+            "2.0,1.0,0.0,session,bbo\n"
+            ",2023-11-14T22:13:21Z,BTC,100.0,100.5,100.25,0.5,49.9,"
+            "2.0,1.0,0.0,session,bbo\n",
+            encoding="utf-8",
+        )
+
+        summary = scheduler._summarize_historical_1s_csv_path(csv_path)
+
+        assert summary["rows_scanned"] == 2
+        assert summary["missing_timestamp_ms_count"] == 1
+        assert summary["max_timestamp_ms"] == 1_700_000_000_000
+
+    def test_summarize_historical_1s_csv_does_not_swallow_csv_field_size_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        import csv as csv_module
+
+        data_root = tmp_path / "data"
+        _write_historical_csv_with_large_session_field(data_root, "BTC")
+        csv_path = data_root / "historical_1s" / "BTC_1s.csv"
+        csv_module.field_size_limit(131_072)
+
+        summary = scheduler._summarize_historical_1s_csv_path(csv_path)
+        assert summary["rows_scanned"] == 1
+
+        original = scheduler.configure_csv_field_size_limit
+        def _force_default_limit() -> int:
+            csv_module.field_size_limit(131_072)
+            return 131_072
+
+        scheduler.configure_csv_field_size_limit = _force_default_limit
+        try:
+            with pytest.raises(csv_module.Error, match="field larger than field limit"):
+                scheduler._summarize_historical_1s_csv_path(csv_path)
+        finally:
+            scheduler.configure_csv_field_size_limit = original
+
     def test_get_coin_latest_timestamp_ms_uses_numeric_max(
         self,
         tmp_path: Path,
@@ -2469,6 +2537,29 @@ def _write_historical_rows_at_timestamps(
                     "source_channel": "historical_l2Book",
                 }
             )
+    return csv_path
+
+
+def _write_historical_csv_with_large_session_field(
+    data_root: Path,
+    coin: str,
+    *,
+    field_size: int = 140_000,
+    timestamp_ms: int = 1_700_000_000_000,
+) -> Path:
+    from bid_ask_schema import timestamp_ms_to_iso
+
+    csv_dir = data_root / "historical_1s"
+    csv_dir.mkdir(parents=True, exist_ok=True)
+    csv_path = csv_dir / f"{coin}_1s.csv"
+    large_session = "x" * field_size
+    iso = timestamp_ms_to_iso(timestamp_ms)
+    csv_path.write_text(
+        "timestamp_ms,timestamp_iso,coin,best_bid,best_ask,mid_price,spread,spread_bps,"
+        "bid_size,ask_size,bbo_imbalance,source_session_id,source_channel\n"
+        f'{timestamp_ms},{iso},{coin},100.0,100.5,100.25,0.5,49.9,2.0,1.0,0.0,"{large_session}",bbo\n',
+        encoding="utf-8",
+    )
     return csv_path
 
 

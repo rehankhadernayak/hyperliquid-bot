@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import ast
+import csv
+import sys
 from pathlib import Path
+from unittest import mock
 
 import pytest
 
@@ -15,6 +18,7 @@ from bid_ask_schema import (
     compute_mid_price,
     compute_spread,
     compute_spread_bps,
+    configure_csv_field_size_limit,
     timestamp_ms_to_iso,
     validate_bid_ask,
 )
@@ -135,3 +139,91 @@ class TestSafety:
 
         assert PAPER_ONLY is True
         assert EXECUTION_ENABLED is False
+
+
+class TestConfigureCsvFieldSizeLimit:
+    def test_returns_accepted_limit(self) -> None:
+        limit = configure_csv_field_size_limit()
+        assert isinstance(limit, int)
+        assert limit > 131_072
+        assert csv.field_size_limit() == limit
+
+    def test_retries_after_overflow_error(self) -> None:
+        side_effect = [OverflowError, None]
+
+        with mock.patch("bid_ask_schema.csv.field_size_limit", side_effect=side_effect) as patched:
+            limit = configure_csv_field_size_limit()
+
+        assert limit == sys.maxsize // 10
+        assert patched.call_count == 2
+        assert patched.call_args_list[0].args[0] == sys.maxsize
+        assert patched.call_args_list[1].args[0] == sys.maxsize // 10
+
+    def test_large_valid_quoted_field_parses_successfully(self, tmp_path: Path) -> None:
+        csv_path = tmp_path / "large_field.csv"
+        large_value = "x" * 140_000
+        csv_path.write_text(
+            "col_a,col_b\n"
+            f"1,\"{large_value}\"\n",
+            encoding="utf-8",
+        )
+
+        configure_csv_field_size_limit()
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            row = next(csv.DictReader(handle))
+
+        assert row["col_a"] == "1"
+        assert row["col_b"] == large_value
+
+    def test_large_field_without_configure_raises_csv_error(self, tmp_path: Path) -> None:
+        csv_path = tmp_path / "large_field.csv"
+        large_value = "x" * 140_000
+        csv_path.write_text(
+            "col_a,col_b\n"
+            f"1,\"{large_value}\"\n",
+            encoding="utf-8",
+        )
+
+        csv.field_size_limit(131_072)
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            reader = csv.DictReader(handle)
+            with pytest.raises(csv.Error, match="field larger than field limit"):
+                next(reader)
+
+    def test_diagnostic_malformed_semantics_reported_without_csv_error(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        """Rows with missing required values parse; callers count/report them normally."""
+        csv_path = tmp_path / "missing_timestamp.csv"
+        csv_path.write_text(
+            "timestamp_ms,coin\n"
+            "1700000000000,BTC\n"
+            ",ETH\n",
+            encoding="utf-8",
+        )
+
+        configure_csv_field_size_limit()
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+        assert len(rows) == 2
+        assert rows[0]["timestamp_ms"] == "1700000000000"
+        assert rows[1]["timestamp_ms"] == ""
+
+    def test_normal_csv_behavior_unchanged(self, tmp_path: Path) -> None:
+        csv_path = tmp_path / "normal.csv"
+        csv_path.write_text(
+            "timestamp_ms,coin,value\n"
+            "1700000000000,BTC,100.0\n"
+            "1700000001000,ETH,200.0\n",
+            encoding="utf-8",
+        )
+
+        configure_csv_field_size_limit()
+        with csv_path.open(encoding="utf-8", newline="") as handle:
+            rows = list(csv.DictReader(handle))
+
+        assert len(rows) == 2
+        assert rows[0]["coin"] == "BTC"
+        assert rows[1]["value"] == "200.0"

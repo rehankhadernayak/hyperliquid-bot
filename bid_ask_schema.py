@@ -2,8 +2,21 @@
 
 from __future__ import annotations
 
+import csv
+import sys
 from datetime import datetime, timezone
 from typing import Any
+
+
+def configure_csv_field_size_limit() -> int:
+    """Raise csv.field_size_limit safely, reducing on platform overflow."""
+    limit = sys.maxsize
+    while True:
+        try:
+            csv.field_size_limit(limit)
+            return limit
+        except OverflowError:
+            limit //= 10
 
 PAPER_ONLY = True
 EXECUTION_ENABLED = False

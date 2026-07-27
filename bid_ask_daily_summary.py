@@ -9,7 +9,12 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-from bid_ask_schema import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT
+from bid_ask_schema import (
+    EXECUTION_ENABLED,
+    PAPER_ONLY,
+    SAFETY_STATEMENT,
+    configure_csv_field_size_limit,
+)
 from bid_ask_validator import SUPPORTED_INTERVALS, bid_ask_csv_path, reports_dir
 
 DEFAULT_DATA_ROOT = Path("data/bid_ask_csv")
@@ -61,6 +66,7 @@ def summarize_csv_file(path: Path) -> dict[str, Any]:
     last_timestamp: int | None = None
     timestamp_column: str | None = None
 
+    configure_csv_field_size_limit()
     with path.open(newline="", encoding="utf-8") as handle:
         reader = csv.DictReader(handle)
         columns = list(reader.fieldnames or [])
