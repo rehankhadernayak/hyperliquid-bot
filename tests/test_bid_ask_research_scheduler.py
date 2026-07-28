@@ -1335,6 +1335,8 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            data_root=tmp_path / "data",
+            orchestrator_report_dir=tmp_path / "orchestrator_reports",
             today_override="20230916",
         )
         state = scheduler.load_state(state_path)
