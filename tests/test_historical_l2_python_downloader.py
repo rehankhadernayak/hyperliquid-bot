@@ -11,6 +11,8 @@ from unittest.mock import MagicMock, patch
 import lz4.frame
 import pytest
 
+from tests.test_historical_l2_importer import _l2_archive_line
+
 from bid_ask_schema import EXECUTION_ENABLED, FORBIDDEN_MODULE_NAMES, FORBIDDEN_SOURCE_PATTERNS, PAPER_ONLY
 from historical_l2_python_downloader import (
     DEFAULT_MAX_FILES,
@@ -501,8 +503,13 @@ class TestDownloadOneFile:
     def test_download_skip_existing(self, tmp_path: Path) -> None:
         entry = _sample_plan()["files"][0]
         entry = dict(entry)
-        entry["local_lz4_path"] = str(tmp_path / "BTC.lz4")
-        (tmp_path / "BTC.lz4").write_bytes(b"existing")
+        lz4_path = tmp_path / "BTC.lz4"
+        jsonl_path = tmp_path / "BTC.jsonl"
+        entry["local_lz4_path"] = str(lz4_path)
+        entry["local_jsonl_path"] = str(jsonl_path)
+        payload = (_l2_archive_line(coin="BTC") + "\n").encode("utf-8")
+        lz4_path.write_bytes(_make_fake_lz4(payload))
+        jsonl_path.write_bytes(payload)
 
         mock_client = MagicMock()
         result = download_one_file(mock_client, entry, overwrite=False)
@@ -590,7 +597,9 @@ class TestDecompressOneFile:
         entry = dict(entry)
         entry["local_lz4_path"] = str(tmp_path / "BTC.lz4")
         entry["local_jsonl_path"] = str(tmp_path / "BTC.jsonl")
-        (tmp_path / "BTC.jsonl").write_text('{"existing": true}\n')
+        payload = (_l2_archive_line(coin="BTC") + "\n").encode("utf-8")
+        (tmp_path / "BTC.lz4").write_bytes(_make_fake_lz4(payload))
+        (tmp_path / "BTC.jsonl").write_bytes(payload)
 
         result = decompress_one_file(entry, overwrite=False)
         assert result["decompress_status"] == "skipped_existing"

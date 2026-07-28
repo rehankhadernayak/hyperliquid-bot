@@ -52,6 +52,7 @@ class ValidationReport:
     negative_spread_count: int
     extreme_spread_count: int
     warnings: list[str] = field(default_factory=list)
+    hard_fail: bool = False
     passed: bool = False
     input_path: str = ""
     report_path: str = ""
@@ -102,17 +103,80 @@ def load_bid_ask_csv_for_validation(
     if not path.is_file():
         raise FileNotFoundError(f"CSV not found: {path}")
 
-    df = pd.read_csv(path)
+    # Read without chunk-based dtype inference. Historical files may contain
+    # repeated header rows, blank values, or mixed numeric/string values.
+    df = pd.read_csv(path, low_memory=False)
+
     if interval == "1s":
         required = list(BID_ASK_CSV_COLUMNS)
+        critical_numeric = [
+            "timestamp_ms",
+            "best_bid",
+            "best_ask",
+            "mid_price",
+            "spread",
+            "spread_bps",
+        ]
+        timestamp_column = "timestamp_ms"
     else:
         required = list(REQUIRED_RESAMPLED_COLUMNS)
+        critical_numeric = [
+            "start_timestamp_ms",
+            "end_timestamp_ms",
+            "open_mid",
+            "high_mid",
+            "low_mid",
+            "close_mid",
+            "avg_spread",
+            "avg_spread_bps",
+            "row_count",
+            "missing_seconds",
+        ]
+        timestamp_column = "start_timestamp_ms"
 
     missing = [column for column in required if column not in df.columns]
     if missing:
         raise ValueError(f"Missing required columns in {path}: {missing}")
 
-    return df
+    # Convert known numeric columns explicitly. errors="coerce" converts
+    # malformed values and repeated CSV header rows to NaN.
+    numeric_columns = [
+        column for column in critical_numeric if column in df.columns
+    ]
+    for column in numeric_columns:
+        df[column] = pd.to_numeric(df[column], errors="coerce")
+
+    # Treat positive/negative infinity as invalid input.
+    if numeric_columns:
+        df[numeric_columns] = df[numeric_columns].replace(
+            [float("inf"), float("-inf")],
+            pd.NA,
+        )
+
+    original_row_count = len(df)
+
+    # A row cannot be validated meaningfully if a critical numeric value is
+    # missing. Remove only those malformed rows and report the count.
+    if numeric_columns:
+        df = df.dropna(subset=numeric_columns)
+
+    # Unix millisecond timestamps must be positive. This also removes rows
+    # that incorrectly appear as 1970-01-01.
+    if timestamp_column in df.columns:
+        df = df.loc[df[timestamp_column] > 0]
+
+    removed_row_count = original_row_count - len(df)
+    if removed_row_count:
+        import warnings
+
+        warnings.warn(
+            f"{path}: removed {removed_row_count} malformed row(s) "
+            "with non-numeric, non-finite, missing, or non-positive values",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+
+    return df.reset_index(drop=True)
 
 
 def _duplicate_timestamp_count(df: pd.DataFrame, column: str) -> int:
@@ -187,6 +251,7 @@ def validate_bid_ask_dataframe(
             negative_spread_count=0,
             extreme_spread_count=0,
             warnings=warnings,
+            hard_fail=True,
             passed=False,
         )
 
@@ -266,6 +331,7 @@ def _validate_1s_dataframe(
         negative_spread_count=negative_spread_count + negative_spread_bps_count,
         extreme_spread_count=extreme_spread_count,
         warnings=warnings,
+        hard_fail=hard_fail,
         passed=not hard_fail,
     )
 
@@ -345,6 +411,7 @@ def _validate_resampled_dataframe(
         negative_spread_count=negative_avg_spread + negative_avg_spread_bps,
         extreme_spread_count=0,
         warnings=warnings,
+        hard_fail=hard_fail,
         passed=not hard_fail,
     )
 

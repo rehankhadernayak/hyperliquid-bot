@@ -11,9 +11,14 @@ import pytest
 
 from bid_ask_schema import (
     BID_ASK_CSV_COLUMNS,
+    BEST_ASK,
+    BEST_BID,
+    BID_SIZE,
+    ASK_SIZE,
     FORBIDDEN_MODULE_NAMES,
     FORBIDDEN_SOURCE_PATTERNS,
     TIMESTAMP_ISO,
+    TIMESTAMP_MS,
     timestamp_ms_to_iso,
 )
 from historical_l2_importer import (
@@ -220,6 +225,40 @@ class TestLocalImport:
         assert len(rows) == 1
         assert float(rows[0]["best_bid"]) == pytest.approx(160.0)
         assert float(rows[0]["best_ask"]) == pytest.approx(160.5)
+
+    def test_corrupt_existing_csv_rows_dropped_on_merge(self, tmp_path: Path) -> None:
+        output_root = tmp_path / "bid_ask_csv"
+        output_path = output_root / "historical_1s" / "SOL_1s.csv"
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+
+        import csv
+
+        with output_path.open("w", encoding="utf-8", newline="") as handle:
+            writer = csv.DictWriter(handle, fieldnames=list(BID_ASK_CSV_COLUMNS))
+            writer.writeheader()
+            writer.writerow(
+                {
+                    TIMESTAMP_MS: "0.40000000000009095",
+                    BEST_BID: "150.0",
+                    BEST_ASK: "150.5",
+                    BID_SIZE: "1.0",
+                    ASK_SIZE: "1.0",
+                    "coin": "SOL",
+                    "source_session_id": "historical_archive",
+                    "source_channel": "historical_l2Book",
+                }
+            )
+
+        archive = tmp_path / "hour.jsonl"
+        archive.write_text(_l2_archive_line(time_ms=BASE_TS) + "\n", encoding="utf-8")
+        _, stats = import_decompressed_l2_file(
+            archive, "SOL", output_path, output_root=output_root
+        )
+        assert stats.corrupt_existing_rows_dropped == 1
+        assert stats.rows_after_merge == 1
+        rows = read_historical_bid_ask_csv(output_path)
+        assert len(rows) == 1
+        assert int(rows[0][TIMESTAMP_MS]) == BASE_TS
 
     def test_rows_sorted_ascending_after_merge(self, tmp_path: Path) -> None:
         output_root = tmp_path / "bid_ask_csv"

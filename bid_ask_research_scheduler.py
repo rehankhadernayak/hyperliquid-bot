@@ -2726,10 +2726,14 @@ def _cycle_succeeded(report: SchedulerReport) -> bool:
     if isinstance(validate_payload, dict):
         if validate_payload.get("failures"):
             return False
-        for warning in validate_payload.get("warnings") or []:
-            if "validation failed" in str(warning).lower():
-                return False
-    return not any("validation failed" in warning.lower() for warning in report.warnings)
+        hard_failures = validate_payload.get("hard_validation_failures")
+        if isinstance(hard_failures, list) and hard_failures:
+            return False
+        details = validate_payload.get("details") or {}
+        nested_hard = details.get("hard_validation_failures")
+        if isinstance(nested_hard, list) and nested_hard:
+            return False
+    return True
 
 
 def load_state(state_path: Path = DEFAULT_STATE_PATH) -> SchedulerState:
@@ -3768,7 +3772,9 @@ def cmd_auto_backfill_next(
     else:
         reason_parts = list(cycle_report.failures)
         reason_parts.extend(
-            w for w in cycle_report.warnings if "validation failed" in w.lower()
+            w
+            for w in cycle_report.warnings
+            if "validation failed" in w.lower()
         )
         reason = "; ".join(reason_parts) or "daily cycle did not pass validation"
         failed_entry = {

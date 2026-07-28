@@ -60,6 +60,7 @@ class ImportStats:
     rows_written: int = 0
     malformed_lines_skipped: int = 0
     invalid_rows_skipped: int = 0
+    corrupt_existing_rows_dropped: int = 0
     mode: str = "overwrite"
     existing_rows_before: int = 0
     new_rows_imported: int = 0
@@ -310,17 +311,35 @@ def _validate_historical_output_path(output_path: Path, output_root: Path) -> No
 
 def read_historical_bid_ask_csv(csv_path: Path | str) -> list[dict[str, Any]]:
     """Read historical bid/ask rows from an existing CSV."""
+    rows, _ = read_historical_bid_ask_csv_with_diagnostics(csv_path)
+    return rows
+
+
+def read_historical_bid_ask_csv_with_diagnostics(
+    csv_path: Path | str,
+    *,
+    coin: str | None = None,
+) -> tuple[list[dict[str, Any]], int]:
+    """Read historical bid/ask rows, dropping corrupt existing rows when coin is set."""
     path = Path(csv_path)
     if not path.is_file():
         raise FileNotFoundError(f"CSV file not found: {path}")
 
     rows: list[dict[str, Any]] = []
+    dropped = 0
     configure_csv_field_size_limit()
+    normalized_coin = _normalize_coin(coin) if coin else None
     with path.open(encoding="utf-8", newline="") as handle:
         reader = csv.DictReader(handle)
         for row in reader:
-            rows.append(dict(row))
-    return rows
+            row_dict = dict(row)
+            if normalized_coin is not None and not _row_passes_basic_filters(
+                row_dict, normalized_coin
+            ):
+                dropped += 1
+                continue
+            rows.append(row_dict)
+    return rows, dropped
 
 
 def merge_historical_bid_ask_rows(
@@ -415,7 +434,10 @@ def import_decompressed_l2_file(
         stats.duplicate_rows_removed = 0
     else:
         stats.mode = "append_merge"
-        existing_rows = read_historical_bid_ask_csv(output_file)
+        existing_rows, stats.corrupt_existing_rows_dropped = read_historical_bid_ask_csv_with_diagnostics(
+            output_file,
+            coin=normalized_coin,
+        )
         stats.existing_rows_before = len(existing_rows)
         final_rows, stats.duplicate_rows_removed = merge_historical_bid_ask_rows(
             existing_rows,

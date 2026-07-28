@@ -965,6 +965,7 @@ def _mock_auto_daily_cycle(
     *,
     failures: list[str] | None = None,
     validation_warning: str | None = None,
+    hard_validation_failures: list[str] | None = None,
     advance_csv: bool = True,
 ) -> list[dict[str, object]]:
     captured: list[dict[str, object]] = []
@@ -991,6 +992,7 @@ def _mock_auto_daily_cycle(
                     "workflows_run": ["resample-validate"],
                     "warnings": [validation_warning] if validation_warning else [],
                     "failures": [],
+                    "hard_validation_failures": list(hard_validation_failures or []),
                 },
                 "historical_backfill": {
                     "details": {
@@ -2439,7 +2441,10 @@ class TestAutoBackfillNext:
         state_path = _init_state(tmp_path, start_hour=9, end_hour=11)
         _mock_auto_daily_cycle(
             monkeypatch,
-            validation_warning="BTC 1s validation failed: gaps detected",
+            validation_warning="BTC 1s validation failed: duplicate timestamp_ms value(s) detected",
+            hard_validation_failures=[
+                "BTC 1s validation failed: duplicate timestamp_ms value(s) detected"
+            ],
         )
 
         scheduler.cmd_auto_backfill_next(
@@ -2454,6 +2459,53 @@ class TestAutoBackfillNext:
         assert state.completed_batches == []
         assert len(state.failed_batches) == 1
         assert state.failed_batches[0]["hours"] == ["9", "10", "11"]
+
+    def test_marks_complete_on_validation_notice_only(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        state_path = _init_state(tmp_path, start_hour=9, end_hour=11)
+        _mock_auto_daily_cycle(
+            monkeypatch,
+            validation_warning="BTC 1s validation notice: ['224524 missing second(s) in coverage range']",
+            hard_validation_failures=[],
+        )
+
+        scheduler.cmd_auto_backfill_next(
+            chunk_size_hours=3,
+            state_path=state_path,
+            runs_dir=tmp_path / "runs",
+            daily_summary_dir=tmp_path / "daily",
+            data_root=tmp_path / "data",
+        )
+
+        state = scheduler.load_state(state_path)
+        assert len(state.completed_batches) == 1
+        assert state.failed_batches == []
+
+    def test_cycle_succeeded_distinguishes_hard_validation_failures(self) -> None:
+        hard_report = scheduler.SchedulerReport(
+            details={
+                "resample_validate": {
+                    "warnings": ["BTC 1s validation failed: duplicate timestamp_ms value(s) detected"],
+                    "hard_validation_failures": [
+                        "BTC 1s validation failed: duplicate timestamp_ms value(s) detected"
+                    ],
+                }
+            }
+        )
+        soft_report = scheduler.SchedulerReport(
+            warnings=["BTC 1s validation notice: ['224524 missing second(s) in coverage range']"],
+            details={
+                "resample_validate": {
+                    "warnings": ["BTC 1s validation notice: ['224524 missing second(s) in coverage range']"],
+                    "hard_validation_failures": [],
+                }
+            },
+        )
+        assert scheduler._cycle_succeeded(hard_report) is False
+        assert scheduler._cycle_succeeded(soft_report) is True
 
     def test_records_failed_batch_on_cycle_failure(
         self,

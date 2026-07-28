@@ -95,7 +95,7 @@ class OrchestratorReport:
     details: dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
+        payload = {
             "generated_at": self.generated_at,
             "paper_only": self.paper_only,
             "execution_enabled": self.execution_enabled,
@@ -112,6 +112,10 @@ class OrchestratorReport:
             "next_recommended_actions": self.next_recommended_actions,
             "details": self.details,
         }
+        hard_failures = self.details.get("hard_validation_failures")
+        if hard_failures:
+            payload["hard_validation_failures"] = hard_failures
+        return payload
 
 
 def _normalize_coins(coins: list[str]) -> list[str]:
@@ -554,10 +558,13 @@ def cmd_resample_validate(
                 source=normalized_source,
             )
             report.row_counts[f"{coin}:1s"] = validation.row_count
-            if not validation.passed:
-                report.warnings.append(
-                    f"{coin} 1s validation failed: {validation.warnings}"
-                )
+            report.details.setdefault("validation_reports", {})[f"{coin}:1s"] = validation.to_dict()
+            if validation.hard_fail:
+                message = f"{coin} 1s validation failed: {validation.warnings}"
+                report.warnings.append(message)
+                report.details.setdefault("hard_validation_failures", []).append(message)
+            elif validation.warnings:
+                report.warnings.append(f"{coin} 1s validation notice: {validation.warnings}")
         except FileNotFoundError:
             report.warnings.append(f"{coin}: missing 1s CSV for source={normalized_source}")
             continue
@@ -587,9 +594,16 @@ def cmd_resample_validate(
                     source=normalized_source,
                 )
                 report.row_counts[f"{coin}:{interval}"] = validation.row_count
-                if not validation.passed:
+                report.details.setdefault("validation_reports", {})[
+                    f"{coin}:{interval}"
+                ] = validation.to_dict()
+                if validation.hard_fail:
+                    message = f"{coin} {interval} validation failed: {validation.warnings}"
+                    report.warnings.append(message)
+                    report.details.setdefault("hard_validation_failures", []).append(message)
+                elif validation.warnings:
                     report.warnings.append(
-                        f"{coin} {interval} validation failed: {validation.warnings}"
+                        f"{coin} {interval} validation notice: {validation.warnings}"
                     )
         except FileNotFoundError as exc:
             report.warnings.append(f"{coin}: resample skipped ({exc})")

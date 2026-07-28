@@ -21,6 +21,7 @@ from botocore.config import Config
 from botocore.exceptions import BotoCoreError, ClientError
 
 from historical_backfill_research import EXECUTION_ENABLED, PAPER_ONLY, SAFETY_STATEMENT
+from historical_l2_archive_integrity import ensure_local_archive_integrity
 
 DEFAULT_COMMAND_PLAN_DIR = Path("reports/historical_l2_download_commands")
 DEFAULT_BACKFILL_PLAN_DIR = Path("reports/historical_l2_backfill_plans")
@@ -261,6 +262,20 @@ def download_one_file(
         "download_error_type": None,
     }
 
+    quarantine_note = None
+    if local_path.is_file() and not overwrite:
+        integrity_result = ensure_local_archive_integrity(file_entry)
+        result["integrity"] = integrity_result.get("integrity")
+        quarantine = integrity_result.get("quarantine")
+        if quarantine:
+            result["quarantine"] = quarantine
+        if integrity_result.get("integrity_ok"):
+            result["download_status"] = "skipped_existing"
+            return result
+        quarantine_note = "; ".join(
+            (integrity_result.get("integrity") or {}).get("reasons") or ["corrupt local lz4/jsonl"]
+        )
+
     if local_path.is_file() and not overwrite:
         result["download_status"] = "skipped_existing"
         return result
@@ -279,11 +294,17 @@ def download_one_file(
                         handle.write(chunk)
         finally:
             body.close()
-        result["download_status"] = "downloaded"
+        if quarantine_note:
+            result["download_status"] = "downloaded_after_quarantine"
+            result["download_error"] = quarantine_note
+        else:
+            result["download_status"] = "downloaded"
     except Exception as exc:  # noqa: BLE001 - capture per-file failures in report
         result["download_status"] = "failed"
         result["download_error_type"] = classify_download_error(exc)
         result["download_error"] = str(exc)
+        if quarantine_note:
+            result["download_error"] = f"{quarantine_note}; download failed: {exc}"
 
     return result
 
@@ -306,6 +327,20 @@ def decompress_one_file(
         "decompress_error": None,
     }
 
+    quarantine_note = None
+    if jsonl_path.is_file() and not overwrite:
+        integrity_result = ensure_local_archive_integrity(file_entry)
+        result["integrity"] = integrity_result.get("integrity")
+        quarantine = integrity_result.get("quarantine")
+        if quarantine:
+            result["quarantine"] = quarantine
+        if integrity_result.get("integrity_ok"):
+            result["decompress_status"] = "skipped_existing"
+            return result
+        quarantine_note = "; ".join(
+            (integrity_result.get("integrity") or {}).get("reasons") or ["corrupt local lz4/jsonl"]
+        )
+
     if jsonl_path.is_file() and not overwrite:
         result["decompress_status"] = "skipped_existing"
         return result
@@ -320,7 +355,11 @@ def decompress_one_file(
         compressed = lz4_path.read_bytes()
         decompressed = lz4.frame.decompress(compressed)
         jsonl_path.write_bytes(decompressed)
-        result["decompress_status"] = "decompressed"
+        if quarantine_note:
+            result["decompress_status"] = "decompressed_after_quarantine"
+            result["decompress_error"] = quarantine_note
+        else:
+            result["decompress_status"] = "decompressed"
     except Exception as exc:  # noqa: BLE001 - capture per-file failures in report
         result["decompress_status"] = "failed"
         result["decompress_error"] = str(exc)
@@ -578,14 +617,14 @@ def run_sample_download(
         dc_status = decompress_result["decompress_status"]
         file_failed = False
 
-        if dl_status == "downloaded":
+        if dl_status in {"downloaded", "downloaded_after_quarantine"}:
             downloaded_count += 1
         elif dl_status == "skipped_existing":
             skipped_count += 1
         elif dl_status == "failed":
             file_failed = True
 
-        if dc_status == "decompressed":
+        if dc_status in {"decompressed", "decompressed_after_quarantine"}:
             decompressed_count += 1
             next_import_commands.append(_build_import_command(entry))
         elif dc_status == "skipped_existing":
