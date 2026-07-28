@@ -15,6 +15,8 @@ from bid_ask_schema import (
     BID_SIZE,
     FORBIDDEN_MODULE_NAMES,
     FORBIDDEN_SOURCE_PATTERNS,
+    SOURCE_CHANNEL,
+    SOURCE_SESSION_ID,
     TIMESTAMP_MS,
     build_bid_ask_row,
 )
@@ -27,6 +29,7 @@ from bid_ask_resampler import (
     resample_bid_ask,
     resample_coin,
     resampled_csv_path,
+    sanitize_1s_dataframe,
     write_resampled_csv,
     write_resampling_report,
 )
@@ -50,6 +53,7 @@ def _make_rows(
     bid_offset: float = 0.0,
     bid_size: float | None = 2.0,
     ask_size: float | None = 1.0,
+    source_session_id: str = "test-session",
 ) -> list[dict]:
     rows: list[dict] = []
     for index in range(count):
@@ -63,7 +67,7 @@ def _make_rows(
                 best_ask=best_ask,
                 bid_size=bid_size if bid_size is not None else None,
                 ask_size=ask_size if ask_size is not None else None,
-                source_session_id="test-session",
+                source_session_id=source_session_id,
                 source_channel="bbo",
             )
         )
@@ -287,6 +291,109 @@ class TestInvalidInterval:
             resample_bid_ask(df, "5s")
         with pytest.raises(ValueError, match="Unsupported interval"):
             resampled_csv_path("BTC", "5s", data_root)
+
+
+class TestSanitizeInput:
+    def test_historical_archive_metadata_preserved(self, data_root: Path) -> None:
+        path = bid_ask_1s_path("ETH", data_root)
+        rows = _make_rows(coin="ETH", count=15, source_session_id="historical_archive")
+        for row in rows:
+            row[SOURCE_CHANNEL] = "historical_l2Book"
+        _write_1s_csv(path, rows)
+
+        df = load_1s_csv("ETH", data_root)
+        assert (df[SOURCE_SESSION_ID] == "historical_archive").all()
+        assert (df[SOURCE_CHANNEL] == "historical_l2Book").all()
+        resampled = resample_bid_ask(df, "15s")
+        assert len(resampled) == 1
+
+    def test_mixed_numeric_strings_dropped(self, data_root: Path) -> None:
+        path = bid_ask_1s_path("BTC", data_root)
+        rows = _make_rows(count=5)
+        rows[2]["mid_price"] = "not-a-price"
+        rows[3]["spread"] = "bad"
+        _write_1s_csv(path, rows)
+
+        df = load_1s_csv("BTC", data_root)
+        assert len(df) == 3
+
+    def test_nan_and_infinity_dropped(self) -> None:
+        rows = _make_rows(count=4)
+        rows[1]["best_bid"] = float("nan")
+        rows[2]["best_ask"] = float("inf")
+        rows[3]["spread_bps"] = float("-inf")
+        df = pd.DataFrame(rows, columns=list(BID_ASK_CSV_COLUMNS))
+        cleaned, removed = sanitize_1s_dataframe(df)
+        assert removed == 3
+        assert len(cleaned) == 1
+
+    def test_non_positive_timestamp_dropped(self) -> None:
+        rows = _make_rows(count=3)
+        rows[1][TIMESTAMP_MS] = 0
+        rows[2][TIMESTAMP_MS] = -100
+        df = pd.DataFrame(rows, columns=list(BID_ASK_CSV_COLUMNS))
+        cleaned, removed = sanitize_1s_dataframe(df)
+        assert removed == 2
+        assert len(cleaned) == 1
+
+    def test_duplicate_timestamps_still_resample(self, data_root: Path) -> None:
+        path = bid_ask_1s_path("BTC", data_root)
+        rows = _make_rows(count=15)
+        rows[14][TIMESTAMP_MS] = rows[13][TIMESTAMP_MS]
+        _write_1s_csv(path, rows)
+
+        resampled = resample_bid_ask(load_1s_csv("BTC", data_root), "15s")
+        assert len(resampled) == 1
+        assert resampled.iloc[0]["row_count"] == 15
+
+    def test_shifted_row_with_historical_archive_in_price_column_dropped(self) -> None:
+        """Malformed CSV row must not crash resampling when metadata strings appear in price cols."""
+        good = build_bid_ask_row(
+            timestamp_ms=BASE_MS,
+            coin="ETH",
+            best_bid=100.0,
+            best_ask=101.0,
+            source_session_id="historical_archive",
+            source_channel="historical_l2Book",
+        )
+        bad = {column: None for column in BID_ASK_CSV_COLUMNS}
+        bad.update(
+            {
+                "timestamp_ms": 0.4,
+                "timestamp_iso": "2023-09-16T00:00:05.332000Z",
+                "coin": "ETH",
+                "best_bid": 8.9177,
+                "best_ask": 0.060568,
+                "mid_price": "historical_archive",
+                "spread": "historical_l2Book",
+                SOURCE_SESSION_ID: None,
+                SOURCE_CHANNEL: None,
+            }
+        )
+        df = pd.DataFrame([good, bad], columns=list(BID_ASK_CSV_COLUMNS))
+        cleaned, removed = sanitize_1s_dataframe(df)
+        assert removed == 1
+        resampled = resample_bid_ask(cleaned, "15s")
+        assert len(resampled) == 1
+
+    def test_metadata_not_numerically_coerced(self) -> None:
+        rows = _make_rows(count=2, source_session_id="historical_archive")
+        rows[0][SOURCE_CHANNEL] = "historical_l2Book"
+        df = pd.DataFrame(rows, columns=list(BID_ASK_CSV_COLUMNS))
+        cleaned, _ = sanitize_1s_dataframe(df)
+        assert cleaned[SOURCE_SESSION_ID].dtype == object or str(cleaned[SOURCE_SESSION_ID].dtype).startswith("str")
+        assert cleaned.iloc[0][SOURCE_SESSION_ID] == "historical_archive"
+
+    def test_historical_source_resample_end_to_end(self, data_root: Path) -> None:
+        path = bid_ask_1s_path("ETH", data_root, source="historical")
+        rows = _make_rows(coin="ETH", count=60, source_session_id="historical_archive")
+        for row in rows:
+            row[SOURCE_CHANNEL] = "historical_l2Book"
+        _write_1s_csv(path, rows)
+
+        results = resample_coin("ETH", intervals=("15s", "1m"), data_root=data_root, source="historical")
+        assert results["15s"]["output_path"].is_file()
+        assert results["1m"]["output_path"].is_file()
 
 
 class TestRawFileSafety:
