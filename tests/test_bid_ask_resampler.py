@@ -22,7 +22,9 @@ from bid_ask_schema import (
 )
 from bid_ask_resampler import (
     RESAMPLED_COLUMNS,
+    assert_resampled_aligned_with_source,
     bid_ask_1s_path,
+    last_resampled_bucket_start,
     load_1s_csv,
     reports_dir,
     resolve_bid_ask_data_dir,
@@ -224,6 +226,57 @@ class TestMissingSeconds:
         assert len(resampled) == 1
         assert resampled.iloc[0]["row_count"] == 10
         assert resampled.iloc[0]["missing_seconds"] == 5
+
+
+class TestSourceBoundsAndStaleTail:
+    def test_last_bucket_matches_final_1s_observation(self) -> None:
+        final_1s_ms = 1_696_085_999_604
+        assert last_resampled_bucket_start(final_1s_ms, "15s") == 1_696_085_985_000
+
+    def test_shortening_1s_removes_stale_resampled_tail(self, data_root: Path) -> None:
+        source_path = bid_ask_1s_path("ETH", data_root, source="historical")
+        resampled_path = resampled_csv_path("ETH", "15s", data_root, source="historical")
+
+        _write_1s_csv(source_path, _make_rows(coin="ETH", count=60))
+        resample_coin("ETH", intervals=("15s",), data_root=data_root, source="historical")
+        long_resampled = pd.read_csv(resampled_path)
+        long_rows = len(long_resampled)
+
+        _write_1s_csv(source_path, _make_rows(coin="ETH", count=20))
+        resample_coin("ETH", intervals=("15s",), data_root=data_root, source="historical")
+        short_resampled = pd.read_csv(resampled_path)
+
+        assert len(short_resampled) < long_rows
+        source_max_ms = int(load_1s_csv("ETH", data_root, source="historical")[TIMESTAMP_MS].max())
+        expected_last_start = last_resampled_bucket_start(source_max_ms, "15s")
+        assert int(short_resampled.iloc[-1]["start_timestamp_ms"]) == expected_last_start
+        assert_resampled_aligned_with_source(
+            short_resampled,
+            source_min_ms=int(
+                load_1s_csv("ETH", data_root, source="historical")[TIMESTAMP_MS].min()
+            ),
+            source_max_ms=source_max_ms,
+            interval="15s",
+        )
+
+    def test_atomic_write_replaces_longer_existing_file(self, data_root: Path) -> None:
+        path = resampled_csv_path("BTC", "15s", data_root)
+        long_df = resample_bid_ask(
+            pd.DataFrame(_make_rows(count=30), columns=list(BID_ASK_CSV_COLUMNS)),
+            "15s",
+        )
+        write_resampled_csv(long_df, "BTC", "15s", data_root)
+        long_line_count = len(path.read_text(encoding="utf-8").splitlines())
+
+        short_df = resample_bid_ask(
+            pd.DataFrame(_make_rows(count=10), columns=list(BID_ASK_CSV_COLUMNS)),
+            "15s",
+        )
+        write_resampled_csv(short_df, "BTC", "15s", data_root)
+        written = pd.read_csv(path)
+
+        assert len(written) == len(short_df)
+        assert len(path.read_text(encoding="utf-8").splitlines()) < long_line_count
 
 
 class TestOutputPaths:

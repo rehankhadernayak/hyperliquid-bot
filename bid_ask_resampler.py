@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 import warnings
 from datetime import datetime, timezone
@@ -267,6 +268,73 @@ def resample_bid_ask(df: pd.DataFrame, interval: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=list(RESAMPLED_COLUMNS))
 
 
+def source_1s_timestamp_bounds(df: pd.DataFrame) -> tuple[int | None, int | None]:
+    """Return min/max timestamp_ms from sanitized 1s input."""
+    if df.empty or TIMESTAMP_MS not in df.columns:
+        return None, None
+    work, _removed = sanitize_1s_dataframe(df, source_label="1s bounds")
+    if work.empty:
+        return None, None
+    timestamps = work[TIMESTAMP_MS].astype("int64")
+    return int(timestamps.min()), int(timestamps.max())
+
+
+def last_resampled_bucket_start(max_timestamp_ms: int, interval: str) -> int:
+    """Return the bucket start ms for the bar containing the final 1s observation."""
+    interval_ms = _validate_interval(interval) * 1000
+    return (int(max_timestamp_ms) // interval_ms) * interval_ms
+
+
+def trim_resampled_to_source_bounds(
+    df: pd.DataFrame,
+    max_timestamp_ms: int,
+    interval: str,
+) -> pd.DataFrame:
+    """Drop resampled bars that start after the bucket containing the final 1s tick."""
+    if df.empty:
+        return df
+    last_bucket_start = last_resampled_bucket_start(max_timestamp_ms, interval)
+    trimmed = df.loc[df["start_timestamp_ms"].astype("int64") <= last_bucket_start]
+    return trimmed.reset_index(drop=True)
+
+
+def assert_resampled_aligned_with_source(
+    resampled: pd.DataFrame,
+    *,
+    source_min_ms: int | None,
+    source_max_ms: int | None,
+    interval: str,
+) -> None:
+    """Raise when resampled output extends beyond the current 1s source bounds."""
+    if resampled.empty:
+        if source_max_ms is not None:
+            raise ValueError(
+                f"Resampled {interval} output is empty but 1s source has data "
+                f"(max_timestamp_ms={source_max_ms})"
+            )
+        return
+    if source_max_ms is None:
+        return
+
+    last_bucket_start = last_resampled_bucket_start(source_max_ms, interval)
+    output_last_start = int(resampled["start_timestamp_ms"].astype("int64").max())
+    if output_last_start > last_bucket_start:
+        raise ValueError(
+            f"Resampled {interval} last bar start {output_last_start} exceeds "
+            f"final 1s bucket start {last_bucket_start} "
+            f"(source_max_timestamp_ms={source_max_ms})"
+        )
+
+    if source_min_ms is not None:
+        output_first_start = int(resampled["start_timestamp_ms"].astype("int64").min())
+        first_bucket_start = last_resampled_bucket_start(source_min_ms, interval)
+        if output_first_start < first_bucket_start:
+            raise ValueError(
+                f"Resampled {interval} first bar start {output_first_start} precedes "
+                f"first 1s bucket start {first_bucket_start}"
+            )
+
+
 def write_resampled_csv(
     df: pd.DataFrame,
     coin: str,
@@ -277,7 +345,13 @@ def write_resampled_csv(
 ) -> Path:
     path = resampled_csv_path(coin, interval, data_root, source=source)
     path.parent.mkdir(parents=True, exist_ok=True)
-    df.to_csv(path, index=False)
+    tmp_path = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+    try:
+        df.to_csv(tmp_path, index=False)
+        os.replace(tmp_path, path)
+    finally:
+        if tmp_path.is_file():
+            tmp_path.unlink(missing_ok=True)
     return path
 
 
@@ -291,6 +365,9 @@ def write_resampling_report(
     output_rows: int,
     total_missing_seconds: int,
     discarded_malformed_rows: int = 0,
+    source_min_timestamp_ms: int | None = None,
+    source_max_timestamp_ms: int | None = None,
+    output_max_start_timestamp_ms: int | None = None,
     data_root: Path = DEFAULT_DATA_ROOT,
     source: str = "local",
     data_dir: Path | None = None,
@@ -313,6 +390,9 @@ def write_resampling_report(
         "output_rows": output_rows,
         "total_missing_seconds": total_missing_seconds,
         "discarded_malformed_rows": discarded_malformed_rows,
+        "source_min_timestamp_ms": source_min_timestamp_ms,
+        "source_max_timestamp_ms": source_max_timestamp_ms,
+        "output_max_start_timestamp_ms": output_max_start_timestamp_ms,
         "generated_at": generated_at,
         "paper_only": PAPER_ONLY,
         "safety_statement": SAFETY_STATEMENT,
@@ -341,10 +421,19 @@ def resample_coin(
     )
     source_df = source_df.sort_values(TIMESTAMP_MS).reset_index(drop=True)
     source_path = bid_ask_1s_path(coin, data_root, source=source)
+    source_min_ms, source_max_ms = source_1s_timestamp_bounds(source_df)
 
     results: dict[str, dict[str, Path]] = {}
     for interval in intervals:
         resampled = resample_bid_ask(source_df, interval)
+        if source_max_ms is not None:
+            resampled = trim_resampled_to_source_bounds(resampled, source_max_ms, interval)
+        assert_resampled_aligned_with_source(
+            resampled,
+            source_min_ms=source_min_ms,
+            source_max_ms=source_max_ms,
+            interval=interval,
+        )
         output_path = write_resampled_csv(
             resampled,
             coin,
@@ -355,6 +444,11 @@ def resample_coin(
         total_missing = (
             int(resampled["missing_seconds"].sum()) if not resampled.empty else 0
         )
+        output_max_start = (
+            int(resampled["start_timestamp_ms"].astype("int64").max())
+            if not resampled.empty
+            else None
+        )
         report_path = write_resampling_report(
             coin=coin,
             interval=interval,
@@ -364,6 +458,9 @@ def resample_coin(
             output_rows=len(resampled),
             total_missing_seconds=total_missing,
             discarded_malformed_rows=discarded_rows,
+            source_min_timestamp_ms=source_min_ms,
+            source_max_timestamp_ms=source_max_ms,
+            output_max_start_timestamp_ms=output_max_start,
             data_root=data_root,
             source=source,
             data_dir=resolve_bid_ask_data_dir(interval, source, data_root),
