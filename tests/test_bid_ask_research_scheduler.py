@@ -1048,6 +1048,14 @@ def _enable_autopilot(
     )
 
 
+def _autopilot_tick_paths(tmp_path: Path) -> dict[str, Path]:
+    """Keep autopilot ticks off repo production CSVs (fast, deterministic tests)."""
+    return {
+        "data_root": tmp_path / "data",
+        "orchestrator_report_dir": tmp_path / "orchestrator_reports",
+    }
+
+
 def _append_historical_csv(
     data_root: Path,
     coin: str,
@@ -1301,6 +1309,7 @@ class TestAutopilotTick:
         report = scheduler.cmd_autopilot_tick(
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
         )
         assert report.action == "disabled"
         assert scheduler.AUTOPILOT_DISABLED_MESSAGE in report.warnings[0]
@@ -1312,6 +1321,7 @@ class TestAutopilotTick:
         report = scheduler.cmd_autopilot_tick(
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
         )
         assert report.action == "paused"
         assert "paused" in report.warnings[0].lower()
@@ -1335,8 +1345,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
-            data_root=tmp_path / "data",
-            orchestrator_report_dir=tmp_path / "orchestrator_reports",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         state = scheduler.load_state(state_path)
@@ -1357,12 +1366,14 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         report = scheduler.cmd_autopilot_tick(
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         assert report.action == "limit_skipped"
@@ -1380,12 +1391,14 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         report = scheduler.cmd_autopilot_tick(
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         assert report.action == "limit_skipped"
@@ -1403,12 +1416,14 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         second = scheduler.cmd_autopilot_tick(
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
 
@@ -1429,6 +1444,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         assert len(captured) == 1
@@ -1446,6 +1462,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         assert report.action == "chunk_completed"
@@ -1469,6 +1486,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         assert report.action == "failed"
@@ -1492,6 +1510,7 @@ class TestAutopilotTick:
                 chunk_size_hours=3,
                 state_path=state_path,
                 runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
                 today_override="20230916",
             )
 
@@ -1513,6 +1532,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         state = scheduler.load_state(state_path)
@@ -1523,6 +1543,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230917",
         )
         state = scheduler.load_state(state_path)
@@ -1552,6 +1573,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         state = scheduler.load_state(state_path)
@@ -1572,6 +1594,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=runs_dir,
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         assert report.paper_only is True
@@ -1599,6 +1622,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=9,
         )
@@ -1621,6 +1645,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=runs_dir,
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=9,
         )
@@ -1628,6 +1653,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=runs_dir,
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=9,
         )
@@ -1659,6 +1685,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
 
@@ -1682,6 +1709,7 @@ class TestAutopilotTick:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
 
@@ -1842,6 +1870,7 @@ class TestAutopilotImportProgress:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
 
@@ -1894,6 +1923,7 @@ class TestAutopilotImportProgress:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
 
@@ -1929,6 +1959,7 @@ class TestAutopilotImportProgress:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
 
@@ -1942,6 +1973,7 @@ class TestAutopilotImportProgress:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         assert second.action == "chunk_completed"
@@ -1988,6 +2020,7 @@ class TestAutopilotImportProgress:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
 
@@ -3287,6 +3320,7 @@ class TestConfigurePhaseBackfill:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
         assert captured == [["BTC", "ETH"]]
@@ -3345,6 +3379,7 @@ class TestConfigurePhaseBackfill:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230917",
         )
 
@@ -3422,6 +3457,7 @@ class TestConfigurePhaseBackfill:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230917",
         )
 
@@ -3457,6 +3493,7 @@ class TestConfigurePhaseBackfill:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
         )
 
@@ -5123,6 +5160,7 @@ class TestAutopilotTickBudget:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=4,
         )
@@ -5130,6 +5168,7 @@ class TestAutopilotTickBudget:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=4,
         )
@@ -5169,6 +5208,7 @@ class TestAutopilotTickBudget:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=1,
         )
@@ -5192,6 +5232,7 @@ class TestAutopilotTickBudget:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=6,
         )
@@ -5214,6 +5255,7 @@ class TestAutopilotTickBudget:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=4,
         )
@@ -5295,6 +5337,7 @@ class TestAutopilotTickBudget:
             chunk_size_hours=3,
             state_path=state_path,
             runs_dir=tmp_path / "runs",
+            **_autopilot_tick_paths(tmp_path),
             today_override="20230916",
             tick_max_files=4,
         )
