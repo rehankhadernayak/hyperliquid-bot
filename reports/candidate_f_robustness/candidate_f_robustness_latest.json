@@ -10,7 +10,7 @@
   "candidate_grid_source": "reports/candidate_grid/candidate_grid_20260717T080653.json",
   "config_analyses": [
     {
-      "accepted_trades_csv_path": "reports/bid_ask_walk_forward/accepted_trades_ETH_20260723T085350.csv",
+      "accepted_trades_csv_path": "reports/bid_ask_walk_forward/accepted_trades_ETH_20260729T100529.csv",
       "config_id": "ETH_UP_H20_C0.65_E2_M1.25_S8",
       "grid_metrics": {
         "accepted_trades_count": 17,
@@ -33,56 +33,131 @@
       "matching_status": "matched",
       "robust_candidate": false,
       "trade_analysis": {
-        "average_net_bps": 1.6911592413866594,
+        "average_net_bps": 3.0109979850792996,
         "best_trade": {
-          "net_return_bps": 3.6006600660077437,
+          "net_return_bps": 7.641960624747396,
           "predicted_class": "UP",
-          "timestamp_iso": "2023-09-23T14:27:45Z"
+          "timestamp_iso": "2023-09-27T20:24:45Z"
         },
         "by_day": {
           "2023-09-21": {
             "avg_net_bps": -2.683884428147218,
             "count": 1,
+            "cumulative_net_bps": -2.683884428147218,
             "sum_net_bps": -2.683884428147218
           },
           "2023-09-23": {
-            "avg_net_bps": 1.964599470732527,
-            "count": 16,
-            "sum_net_bps": 31.43359153172043
+            "avg_net_bps": 3.0928379676607163,
+            "count": 13,
+            "cumulative_net_bps": 40.20689357958931,
+            "sum_net_bps": 40.20689357958931
+          },
+          "2023-09-27": {
+            "avg_net_bps": 7.641960624747396,
+            "count": 1,
+            "cumulative_net_bps": 7.641960624747396,
+            "sum_net_bps": 7.641960624747396
           }
         },
-        "by_regime": {},
+        "by_regime": {
+          "high_volatility_regime": {
+            "avg_net_bps": 0.0,
+            "count": 0,
+            "cumulative_net_bps": 0.0,
+            "sum_net_bps": 0.0
+          },
+          "low_volatility_regime": {
+            "avg_net_bps": 3.59721219375593,
+            "count": 13,
+            "cumulative_net_bps": 46.76375851882709,
+            "sum_net_bps": 46.76375851882709
+          },
+          "tight_spread_regime": {
+            "avg_net_bps": 3.0109979850792996,
+            "count": 15,
+            "cumulative_net_bps": 45.164969776189494,
+            "sum_net_bps": 45.164969776189494
+          },
+          "wide_spread_regime": {
+            "avg_net_bps": 0.0,
+            "count": 0,
+            "cumulative_net_bps": 0.0,
+            "sum_net_bps": 0.0
+          }
+        },
+        "by_spread_regime": {
+          "tight_spread_regime": {
+            "avg_net_bps": 3.0109979850792996,
+            "count": 15,
+            "cumulative_net_bps": 45.164969776189494,
+            "sum_net_bps": 45.164969776189494
+          },
+          "wide_spread_regime": {
+            "avg_net_bps": 0.0,
+            "count": 0,
+            "cumulative_net_bps": 0.0,
+            "sum_net_bps": 0.0
+          }
+        },
         "by_utc_hour": {
           "14": {
-            "avg_net_bps": 1.964599470732527,
-            "count": 16,
-            "sum_net_bps": 31.43359153172043
+            "avg_net_bps": 3.0928379676607163,
+            "count": 13,
+            "cumulative_net_bps": 40.20689357958931,
+            "sum_net_bps": 40.20689357958931
           },
           "15": {
             "avg_net_bps": -2.683884428147218,
             "count": 1,
+            "cumulative_net_bps": -2.683884428147218,
             "sum_net_bps": -2.683884428147218
+          },
+          "20": {
+            "avg_net_bps": 7.641960624747396,
+            "count": 1,
+            "cumulative_net_bps": 7.641960624747396,
+            "sum_net_bps": 7.641960624747396
           }
         },
-        "cumulative_net_bps": 28.74970710357321,
+        "by_volatility_regime": {
+          "high_volatility_regime": {
+            "avg_net_bps": 0.0,
+            "count": 0,
+            "cumulative_net_bps": 0.0,
+            "sum_net_bps": 0.0
+          },
+          "low_volatility_regime": {
+            "avg_net_bps": 3.59721219375593,
+            "count": 13,
+            "cumulative_net_bps": 46.76375851882709,
+            "sum_net_bps": 46.76375851882709
+          }
+        },
+        "cumulative_net_bps": 45.164969776189494,
+        "dominant_regime": "tight_spread_regime",
+        "dominant_regime_trade_fraction": 1.0,
+        "dominant_spread_regime": "tight_spread_regime",
+        "dominant_spread_regime_trade_fraction": 1.0,
         "dominant_utc_hour": "14",
-        "dominant_utc_hour_trade_fraction": 0.9411764705882353,
-        "top_1_trade_contribution_pct": 0.09244646202823661,
-        "top_3_trades_contribution_pct": 0.2773393860847098,
-        "trade_count": 17,
-        "win_rate": 0.7647058823529411,
-        "worst_3_trades_loss_share_pct": 0.9747288528261457,
+        "dominant_utc_hour_trade_fraction": 0.8666666666666667,
+        "dominant_volatility_regime": "low_volatility_regime",
+        "dominant_volatility_regime_trade_fraction": 0.8666666666666667,
+        "top_1_trade_contribution_pct": 0.15971042048598894,
+        "top_3_trades_contribution_pct": 0.31021183273010505,
+        "trade_count": 15,
+        "win_rate": 0.9333333333333333,
+        "worst_3_trades_loss_share_pct": 1.0,
         "worst_trade": {
-          "net_return_bps": -3.628634292000057,
+          "net_return_bps": -2.683884428147218,
           "predicted_class": "UP",
-          "timestamp_iso": "2023-09-23T14:18:30Z"
+          "timestamp_iso": "2023-09-21T15:17:00Z"
         }
       },
       "verdict": "diagnostic_positive_sparse"
     }
   ],
   "execution_enabled": false,
-  "generated_at": "2026-07-23T08:53:55.280214Z",
+  "generated_at": "2026-07-29T10:05:34.308702Z",
   "next_recommended_action": "Continue paper-only data collection until at least 30 accepted trades exist for the leading Candidate F config.",
   "overall_verdict": "diagnostic_positive_sparse",
   "paper_only": true,

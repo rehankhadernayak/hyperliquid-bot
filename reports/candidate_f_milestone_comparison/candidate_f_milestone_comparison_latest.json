@@ -1,32 +1,32 @@
 {
   "comparison_table": [
     {
-      "accepted_trades_count": 17,
-      "average_net_bps": 1.6911592413866594,
-      "completed_windows": 646,
-      "cumulative_net_bps": 28.74970710357321,
-      "dataset_coverage_hours": 312.0,
+      "accepted_trades_count": 15,
+      "average_net_bps": 3.0109979850792996,
+      "completed_windows": 695,
+      "cumulative_net_bps": 45.164969776189494,
+      "dataset_coverage_hours": 351.0,
       "dataset_first_timestamp_iso": "2023-09-16T00:00:00Z",
-      "dataset_latest_timestamp_iso": "2023-09-28T23:59:45Z",
+      "dataset_latest_timestamp_iso": "2023-09-30T14:59:45Z",
       "dominant_day": "2023-09-23",
-      "dominant_day_trade_fraction": 0.9411764705882353,
+      "dominant_day_trade_fraction": 0.8666666666666667,
       "dominant_utc_hour": "14",
-      "dominant_utc_hour_trade_fraction": 0.9411764705882353,
-      "excluding_dominant_day_average_net_bps": -2.683884428147218,
-      "excluding_dominant_day_cumulative_net_bps": -2.683884428147218,
-      "excluding_dominant_day_trade_count": 1,
+      "dominant_utc_hour_trade_fraction": 0.8666666666666667,
+      "excluding_dominant_day_average_net_bps": 2.479038098300089,
+      "excluding_dominant_day_cumulative_net_bps": 4.958076196600178,
+      "excluding_dominant_day_trade_count": 2,
       "excluding_dominant_day_win_rate": null,
       "milestone_index": 1,
-      "report_stamp": "20260723T092114",
-      "robustness_report_path": "reports/candidate_f_robustness/candidate_f_robustness_20260723T092119Z.json",
+      "report_stamp": "20260729T100529",
+      "robustness_report_path": "reports/candidate_f_robustness/candidate_f_robustness_20260729T100534Z.json",
       "robustness_verdict": "diagnostic_positive_sparse",
-      "skipped_windows": 9,
+      "skipped_windows": 10,
       "spread_regime_summary": {
         "tight_spread_regime": {
-          "avg_net_bps": 1.6911592413866594,
-          "count": 17,
-          "cumulative_net_bps": 28.74970710357321,
-          "sum_net_bps": 28.74970710357321
+          "avg_net_bps": 3.0109979850792996,
+          "count": 15,
+          "cumulative_net_bps": 45.164969776189494,
+          "sum_net_bps": 45.164969776189494
         },
         "wide_spread_regime": {
           "avg_net_bps": 0.0,
@@ -37,44 +37,54 @@
       },
       "volatility_regime_summary": {
         "high_volatility_regime": {
-          "avg_net_bps": -3.628634292000057,
-          "count": 2,
-          "cumulative_net_bps": -7.257268584000114,
-          "sum_net_bps": -7.257268584000114
+          "avg_net_bps": 0.0,
+          "count": 0,
+          "cumulative_net_bps": 0.0,
+          "sum_net_bps": 0.0
         },
         "low_volatility_regime": {
-          "avg_net_bps": 3.3434914920066805,
-          "count": 11,
-          "cumulative_net_bps": 36.77840641207349,
-          "sum_net_bps": 36.77840641207349
+          "avg_net_bps": 3.59721219375593,
+          "count": 13,
+          "cumulative_net_bps": 46.76375851882709,
+          "sum_net_bps": 46.76375851882709
         }
       },
-      "walk_forward_report_path": "reports/bid_ask_walk_forward/walk_forward_ETH_20260723T092114.json",
-      "win_rate": 0.7647058823529411
+      "walk_forward_report_path": "reports/bid_ask_walk_forward/walk_forward_ETH_20260729T100529.json",
+      "win_rate": 0.9333333333333333
     }
   ],
-  "discovered_robustness_count": 4,
-  "discovered_walk_forward_count": 4,
+  "discovered_robustness_count": 5,
+  "discovered_walk_forward_count": 5,
   "duplicate_runs_superseded": [
     {
       "dataset_key": [
         "2023-09-16T00:00:00Z",
-        "2023-09-28T23:59:45Z",
-        312.0
+        "2023-09-30T14:59:45Z",
+        351.0
       ],
       "report_stamp": "20260723T085108",
-      "superseded_by_stamp": "20260723T092114",
+      "superseded_by_stamp": "20260729T100529",
       "walk_forward_report_path": "reports/bid_ask_walk_forward/walk_forward_ETH_20260723T085108.json"
     },
     {
       "dataset_key": [
         "2023-09-16T00:00:00Z",
-        "2023-09-28T23:59:45Z",
-        312.0
+        "2023-09-30T14:59:45Z",
+        351.0
       ],
       "report_stamp": "20260723T085350",
-      "superseded_by_stamp": "20260723T092114",
+      "superseded_by_stamp": "20260729T100529",
       "walk_forward_report_path": "reports/bid_ask_walk_forward/walk_forward_ETH_20260723T085350.json"
+    },
+    {
+      "dataset_key": [
+        "2023-09-16T00:00:00Z",
+        "2023-09-30T14:59:45Z",
+        351.0
+      ],
+      "report_stamp": "20260723T092114",
+      "superseded_by_stamp": "20260729T100529",
+      "walk_forward_report_path": "reports/bid_ask_walk_forward/walk_forward_ETH_20260723T092114.json"
     }
   ],
   "execution_enabled": false,
@@ -93,52 +103,52 @@
     "trade_class": "UP"
   },
   "frozen_config_id": "ETH_UP_H20_C0.65_E2_M1.25_S8",
-  "generated_at": "2026-07-23T13:53:49.720486Z",
+  "generated_at": "2026-07-29T10:05:36.292829Z",
   "milestone_count": 1,
   "milestones": [
     {
-      "accepted_trades_count": 17,
-      "average_net_bps": 1.6911592413866594,
-      "completed_windows": 646,
-      "cumulative_net_bps": 28.74970710357321,
+      "accepted_trades_count": 15,
+      "average_net_bps": 3.0109979850792996,
+      "completed_windows": 695,
+      "cumulative_net_bps": 45.164969776189494,
       "dataset_key": [
         "2023-09-16T00:00:00Z",
-        "2023-09-28T23:59:45Z",
-        312.0
+        "2023-09-30T14:59:45Z",
+        351.0
       ],
       "dataset_summary": {
-        "coverage_hours": 312.0,
+        "coverage_hours": 351.0,
         "csv_path": "data/bid_ask_csv/historical_15s/ETH_15s.csv",
         "first_timestamp_iso": "2023-09-16T00:00:00Z",
-        "latest_timestamp_iso": "2023-09-28T23:59:45Z",
-        "row_count": 66093
+        "latest_timestamp_iso": "2023-09-30T14:59:45Z",
+        "row_count": 71078
       },
       "dominant_day": "2023-09-23",
-      "dominant_day_trade_fraction": 0.9411764705882353,
+      "dominant_day_trade_fraction": 0.8666666666666667,
       "dominant_spread_regime": "tight_spread_regime",
       "dominant_spread_regime_trade_fraction": 1.0,
       "dominant_utc_hour": "14",
-      "dominant_utc_hour_trade_fraction": 0.9411764705882353,
+      "dominant_utc_hour_trade_fraction": 0.8666666666666667,
       "dominant_volatility_regime": "low_volatility_regime",
-      "dominant_volatility_regime_trade_fraction": 0.6470588235294118,
-      "duplicate_count": 2,
+      "dominant_volatility_regime_trade_fraction": 0.8666666666666667,
+      "duplicate_count": 3,
       "excluding_dominant_day": {
-        "average_net_bps": -2.683884428147218,
-        "cumulative_net_bps": -2.683884428147218,
-        "trade_count": 1,
+        "average_net_bps": 2.479038098300089,
+        "cumulative_net_bps": 4.958076196600178,
+        "trade_count": 2,
         "win_rate": null
       },
-      "report_stamp": "20260723T092114",
-      "robustness_report_path": "reports/candidate_f_robustness/candidate_f_robustness_20260723T092119Z.json",
-      "robustness_report_stamp": "20260723T092119Z",
+      "report_stamp": "20260729T100529",
+      "robustness_report_path": "reports/candidate_f_robustness/candidate_f_robustness_20260729T100534Z.json",
+      "robustness_report_stamp": "20260729T100534Z",
       "robustness_verdict": "diagnostic_positive_sparse",
-      "skipped_windows": 9,
+      "skipped_windows": 10,
       "spread_regime_summary": {
         "tight_spread_regime": {
-          "avg_net_bps": 1.6911592413866594,
-          "count": 17,
-          "cumulative_net_bps": 28.74970710357321,
-          "sum_net_bps": 28.74970710357321
+          "avg_net_bps": 3.0109979850792996,
+          "count": 15,
+          "cumulative_net_bps": 45.164969776189494,
+          "sum_net_bps": 45.164969776189494
         },
         "wide_spread_regime": {
           "avg_net_bps": 0.0,
@@ -150,20 +160,20 @@
       "valid": true,
       "volatility_regime_summary": {
         "high_volatility_regime": {
-          "avg_net_bps": -3.628634292000057,
-          "count": 2,
-          "cumulative_net_bps": -7.257268584000114,
-          "sum_net_bps": -7.257268584000114
+          "avg_net_bps": 0.0,
+          "count": 0,
+          "cumulative_net_bps": 0.0,
+          "sum_net_bps": 0.0
         },
         "low_volatility_regime": {
-          "avg_net_bps": 3.3434914920066805,
-          "count": 11,
-          "cumulative_net_bps": 36.77840641207349,
-          "sum_net_bps": 36.77840641207349
+          "avg_net_bps": 3.59721219375593,
+          "count": 13,
+          "cumulative_net_bps": 46.76375851882709,
+          "sum_net_bps": 46.76375851882709
         }
       },
-      "walk_forward_report_path": "reports/bid_ask_walk_forward/walk_forward_ETH_20260723T092114.json",
-      "win_rate": 0.7647058823529411
+      "walk_forward_report_path": "reports/bid_ask_walk_forward/walk_forward_ETH_20260729T100529.json",
+      "win_rate": 0.9333333333333333
     }
   ],
   "paper_only": true,
