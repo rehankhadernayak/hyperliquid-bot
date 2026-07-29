@@ -103,9 +103,14 @@ def _parse_timestamp_ms(raw: str | None) -> int | None:
         return None
     try:
         value = float(str(raw).strip())
-        if value != value:
+        if value != value or value in {float("inf"), float("-inf")}:
             return None
-        return int(value)
+
+        timestamp_ms = int(value)
+        if timestamp_ms <= 0:
+            return None
+
+        return timestamp_ms
     except (TypeError, ValueError, OverflowError):
         return None
 
