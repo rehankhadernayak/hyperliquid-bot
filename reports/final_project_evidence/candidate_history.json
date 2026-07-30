@@ -1,0 +1,305 @@
+{
+  "generated_at": "2026-07-30T00:00:00Z",
+  "research_only": true,
+  "execution_enabled": false,
+  "status_legend": {
+    "rejected": "Candidate family abandoned; not pursued further.",
+    "diagnostic_positive_sparse": "Positive after estimated costs on paper, but too few trades and/or unstable concentration; not robust.",
+    "frozen": "Configuration locked; no further tuning; retained as final diagnostic reference."
+  },
+  "candidates": {
+    "B": {
+      "candidate_id": "B",
+      "name": "BTC_DOWN_MICRO_H20_CANDIDATE_B",
+      "status_category": "rejected",
+      "objective": "Identify tradeable BTC downward moves using microstructure features with strict confidence, edge, and spread filters (DOWN class only, H20).",
+      "main_change": "Post-hoc trade filters on the microstructure feature set (confidence ≥ 0.65, min edge 2 bps, max spread 8 bps, cost multiplier 1.25) applied to direction labels.",
+      "feature_set": "microstructure",
+      "label_mode": "direction",
+      "dataset": {
+        "coin": "BTC",
+        "interval": "15s",
+        "source": "historical"
+      },
+      "evaluation_method": "Walk-forward paper evaluation with candidate validation and rolling data-slice robustness (recent_halves, recent_thirds, expanding).",
+      "metrics": {
+        "accepted_trades": 63,
+        "cumulative_net_bps": 11.77057927174674,
+        "average_net_bps": 0.18683459161502763,
+        "win_rate_after_costs": 0.3968253968253968,
+        "positive_after_costs": true,
+        "paper_candidate_pass": false
+      },
+      "robustness": {
+        "robustness_pass": false,
+        "robustness_summary": "7 slices tested; 0 slices with enough trades (min 20); unstable_sparse on full-sample validation (28 sparse buckets).",
+        "result": "not robust"
+      },
+      "final_decision": "rejected",
+      "reason": "Early strict-config positivity (~5 trades, +3.8 bps) did not survive data expansion and relaxed-filter runs were strongly negative. Threshold/regime tuning rejected 2026-07-09; latest validation remains not_market_ready with unstable_sparse despite marginal full-sample positivity.",
+      "source_artifacts": [
+        "reports/bid_ask_candidate_validation/candidate_validation_BTC_DOWN_MICRO_H20_CANDIDATE_B_20260730T034523.json",
+        "reports/bid_ask_candidate_validation/candidate_validation_BTC_DOWN_MICRO_H20_CANDIDATE_B_20260730T034523.md",
+        "reports/bid_ask_candidate_validation/robustness_BTC_DOWN_MICRO_H20_CANDIDATE_B_20260706T115055.json",
+        "reports/bid_ask_candidate_validation/robustness_BTC_DOWN_MICRO_H20_CANDIDATE_B_20260706T115055.md",
+        "reports/bid_ask_walk_forward/walk_forward_BTC_20260730T074926.json",
+        "reports/research_notes/hyperliquid_bid_ask_research_notes.md",
+        "reports/research_status/research_status_latest.json"
+      ],
+      "missing_evidence": null
+    },
+    "C": {
+      "candidate_id": "C",
+      "name": "candidate_c_core",
+      "status_category": "rejected",
+      "objective": "Improve post-cost paper performance by engineering richer microstructure features instead of post-hoc hour/threshold filters.",
+      "main_change": "candidate_c_core feature set (spread/cost regime, imbalance dynamics, short-horizon returns, time features) with direction labels on walk-forward grids.",
+      "feature_set": "candidate_c_core",
+      "label_mode": "direction",
+      "dataset": {
+        "coins": ["BTC", "ETH"],
+        "interval": "15s",
+        "source": "historical"
+      },
+      "evaluation_method": "16-config walk-forward candidate grids on BTC/ETH DOWN (20260709T124717) and ETH UP/DOWN (20260709T125740); supplementary per-coin walk-forward runs with binary_tradeable label modes.",
+      "metrics": {
+        "accepted_trades": 157,
+        "cumulative_net_bps": -437.98339024475223,
+        "average_net_bps": -2.7897031225780395,
+        "representative_config_id": "ETH_DOWN_H20_C0.55_E1_M1.25_S8",
+        "notes": "Best grid rank by paper_score; still negative after costs. BTC DOWN H20 best grid: 103 trades, avg −6.99 bps. ETH UP H20: 96 trades, avg −5.15 bps."
+      },
+      "robustness": {
+        "robustness_pass": null,
+        "result": "negative after costs across all grid configs; no positive post-cost configuration"
+      },
+      "final_decision": "rejected",
+      "reason": "Feature engineering alone did not overcome the cost problem under direction labels. All tested grid configs remained negative after costs; research moved to cost-aware labeling (Candidate D).",
+      "source_artifacts": [
+        "reports/candidate_grid/candidate_grid_20260709T124717.json",
+        "reports/candidate_grid/candidate_grid_20260709T124717.md",
+        "reports/candidate_grid/candidate_grid_20260709T125740.json",
+        "reports/candidate_grid/candidate_grid_20260709T125740.md",
+        "reports/bid_ask_walk_forward/walk_forward_BTC_20260709T153038.json",
+        "reports/bid_ask_walk_forward/walk_forward_ETH_20260709T152926.json",
+        "reports/research_notes/candidate_c_feature_engineering_plan.md",
+        "reports/research_notes/hyperliquid_bid_ask_research_notes.md",
+        "reports/research_status/research_status_latest.json"
+      ],
+      "missing_evidence": "Dedicated rolling-slice robustness report for candidate_c_core not located; grid and walk-forward negatives used as strongest evidence."
+    },
+    "D": {
+      "candidate_id": "D",
+      "name": "cost_aware_labels",
+      "status_category": "rejected",
+      "objective": "Reframe labels from direction-only to cost-aware abstention (UP_EDGE / DOWN_EDGE / NO_TRADE and binary tradeable modes) so models skip bars without sufficient edge after fees, slippage, and spread.",
+      "main_change": "Label modes cost_aware_3class, binary_tradeable_up, and binary_tradeable_down with per-row estimated_cost_bps = fee_bps + slippage_bps + spread_bps; diagnostics-only 3-class mode does not support walk-forward training.",
+      "feature_set": "not applicable (label methodology; initial diagnostics used basic features)",
+      "label_mode": "cost_aware_3class (diagnostics); binary_tradeable_up/down (training-enabled)",
+      "dataset": {
+        "coins": ["BTC", "ETH"],
+        "interval": "15s",
+        "source": "historical"
+      },
+      "evaluation_method": "Read-only label diagnostics embedded in walk-forward reports; cost_aware_3class runs marked diagnostics_only with zero accepted trades.",
+      "metrics": {
+        "accepted_trades": 0,
+        "cumulative_net_bps": 0.0,
+        "average_net_bps": 0.0,
+        "label_diagnostics": {
+          "no_trade_fraction": 0.6666,
+          "edge_fraction": 0.3334,
+          "walk_forward_training_supported": false
+        }
+      },
+      "robustness": {
+        "robustness_pass": null,
+        "result": "diagnostic only for 3-class mode; not predictive enough alone as a standalone candidate"
+      },
+      "final_decision": "rejected as standalone candidate; continued as infrastructure",
+      "reason": "Cost-aware labels clarified why direction models lose after costs (~67% NO_TRADE fraction) but did not produce tradeable positive configs on their own. Binary tradeable modes were adopted by Candidates E and F rather than continuing D as an independent model family.",
+      "source_artifacts": [
+        "reports/bid_ask_walk_forward/walk_forward_BTC_ETH_20260709T150853.json",
+        "reports/bid_ask_walk_forward/walk_forward_BTC_ETH_20260709T150853.md",
+        "reports/research_notes/candidate_d_cost_aware_labeling_plan.md",
+        "reports/research_status/research_status_latest.json",
+        "reports/candidate_ledger/candidate_ledger.json"
+      ],
+      "missing_evidence": "No positive post-cost walk-forward run attributed solely to Candidate D label modes without later feature sets (E/F)."
+    },
+    "E": {
+      "candidate_id": "E",
+      "name": "candidate_e_depth_aware",
+      "status_category": "diagnostic_positive_sparse",
+      "objective": "Restore a sparse positive ETH UP H20 signal by adding depth-aware features (bid/ask size, microprice, size imbalance) on top of candidate_c_core.",
+      "main_change": "candidate_e_depth_aware feature set extending candidate_c_core with top-of-book size and microprice features; binary_tradeable_up labels (Candidate D heritage).",
+      "feature_set": "candidate_e_depth_aware",
+      "label_mode": "binary_tradeable_up",
+      "dataset": {
+        "coin": "ETH",
+        "interval": "15s",
+        "source": "historical",
+        "horizon": 20
+      },
+      "evaluation_method": "Walk-forward paper evaluation and 80-config candidate grid (20260714T071013) with min_trades_after_regime_filter=5.",
+      "metrics": {
+        "accepted_trades": 14,
+        "cumulative_net_bps": 31.27830758624964,
+        "average_net_bps": 2.23416482758926,
+        "win_rate_after_costs": 0.6428571428571429,
+        "positive_after_costs": true,
+        "grid_best_trades": 3,
+        "grid_best_average_net_bps": 6.9649
+      },
+      "robustness": {
+        "robustness_pass": false,
+        "min_robust_trades_threshold": 10,
+        "result": "failed minimum-trade robustness check; grid best configs had only 3 trades"
+      },
+      "final_decision": "not continued (superseded by Candidate F)",
+      "reason": "Depth-aware features produced a sparse positive ETH UP H20 signal (14 trades, +31.3 bps cumulative) but failed the minimum-trade robustness bar and were too concentrated to promote. Research status recommends rerunning only after more out-of-sample data.",
+      "source_artifacts": [
+        "reports/bid_ask_walk_forward/walk_forward_ETH_20260714T070309.json",
+        "reports/bid_ask_walk_forward/walk_forward_ETH_20260714T070309.md",
+        "reports/candidate_grid/candidate_grid_20260714T071013.json",
+        "reports/candidate_grid/candidate_grid_20260714T071013.md",
+        "reports/research_status/research_status_latest.json",
+        "reports/candidate_ledger/candidate_ledger.json"
+      ],
+      "missing_evidence": "Dedicated Candidate E robustness analyzer report (analogous to candidate_f_robustness) not located."
+    },
+    "F": {
+      "candidate_id": "F",
+      "name": "ETH_UP_H20_C0.65_E2_M1.25_S8",
+      "status_category": "frozen",
+      "objective": "Identify tradeable upward ETH movements using volatility-, spread-, and depth-regime feature interactions.",
+      "main_change": "candidate_f_regime_depth feature set (34 features: candidate_e_depth_aware plus realized volatility, spread/volatility regimes, and interaction terms) with binary_tradeable_up labels and frozen filter thresholds.",
+      "feature_set": "candidate_f_regime_depth",
+      "label_mode": "binary_tradeable_up",
+      "dataset": {
+        "coin": "ETH",
+        "interval": "15s",
+        "source": "historical",
+        "horizon": 20,
+        "csv_path": "data/bid_ask_csv/historical_15s/ETH_15s.csv",
+        "coverage": "2023-09-16T00:00:00Z to 2023-09-30T14:59:45Z (351 hours)"
+      },
+      "evaluation_method": "Frozen-config walk-forward paper evaluation; Candidate F robustness analyzer; milestone comparison across dataset milestones.",
+      "metrics": {
+        "config_id": "ETH_UP_H20_C0.65_E2_M1.25_S8",
+        "total_windows": 705,
+        "completed_windows": 695,
+        "skipped_windows": 10,
+        "accepted_trades": 15,
+        "cumulative_net_bps": 45.164969776189494,
+        "average_net_bps": 3.0109979850792996,
+        "win_rate": 0.9333333333333333,
+        "verdict": "diagnostic_positive_sparse",
+        "robust_candidate": false
+      },
+      "robustness": {
+        "robustness_pass": false,
+        "robust_candidate": false,
+        "overall_verdict": "diagnostic_positive_sparse",
+        "result": "positive after estimated costs but sparse, non-robust, no demonstrated improvement over baseline"
+      },
+      "final_decision": "frozen",
+      "reason": "Candidate F was positive after estimated costs, but trade evidence was sparse, non-robust, and did not demonstrate improvement over the baseline. Configuration frozen for final report reference; no further tuning.",
+      "source_artifacts": [
+        "reports/final_project_evidence/candidate_f_final_summary.json",
+        "reports/bid_ask_walk_forward/walk_forward_ETH_20260729T101645.json",
+        "reports/bid_ask_walk_forward/walk_forward_ETH_20260729T101645.md",
+        "reports/bid_ask_walk_forward/accepted_trades_ETH_20260729T101645.csv",
+        "reports/candidate_f_robustness/candidate_f_robustness_latest.json",
+        "reports/candidate_f_robustness/candidate_f_robustness_latest.md",
+        "reports/candidate_f_milestone_comparison/candidate_f_milestone_comparison_latest.json",
+        "reports/candidate_f_milestone_comparison/candidate_f_milestone_comparison_latest.md",
+        "reports/research_log/2026-07-29.md"
+      ],
+      "missing_evidence": null
+    }
+  },
+  "comparison_table": [
+    {
+      "candidate": "B",
+      "status": "rejected",
+      "feature_or_method": "microstructure + direction filters",
+      "coin_interval": "BTC / 15s",
+      "accepted_trades": 63,
+      "cumulative_net_bps": 11.77,
+      "average_net_bps": 0.19,
+      "robust": false,
+      "outcome": "Rejected — unstable/sparse; early signal did not scale"
+    },
+    {
+      "candidate": "C",
+      "status": "rejected",
+      "feature_or_method": "candidate_c_core features + direction labels",
+      "coin_interval": "BTC, ETH / 15s",
+      "accepted_trades": 157,
+      "cumulative_net_bps": -437.98,
+      "average_net_bps": -2.79,
+      "robust": false,
+      "outcome": "Rejected — all grid configs negative after costs"
+    },
+    {
+      "candidate": "D",
+      "status": "rejected",
+      "feature_or_method": "cost-aware / binary tradeable labels",
+      "coin_interval": "BTC, ETH / 15s",
+      "accepted_trades": 0,
+      "cumulative_net_bps": 0.0,
+      "average_net_bps": 0.0,
+      "robust": null,
+      "outcome": "Rejected standalone — diagnostic labels only; adopted by E/F"
+    },
+    {
+      "candidate": "E",
+      "status": "diagnostic_positive_sparse",
+      "feature_or_method": "candidate_e_depth_aware + binary_tradeable_up",
+      "coin_interval": "ETH / 15s H20",
+      "accepted_trades": 14,
+      "cumulative_net_bps": 31.28,
+      "average_net_bps": 2.23,
+      "robust": false,
+      "outcome": "Not continued — positive but below min-trade robustness"
+    },
+    {
+      "candidate": "F",
+      "status": "frozen",
+      "feature_or_method": "candidate_f_regime_depth + binary_tradeable_up",
+      "coin_interval": "ETH / 15s H20",
+      "accepted_trades": 15,
+      "cumulative_net_bps": 45.16,
+      "average_net_bps": 3.01,
+      "robust": false,
+      "outcome": "Frozen — diagnostic_positive_sparse; no baseline improvement"
+    }
+  ],
+  "source_artifacts_index": [
+    "reports/bid_ask_candidate_validation/candidate_validation_BTC_DOWN_MICRO_H20_CANDIDATE_B_20260730T034523.json",
+    "reports/bid_ask_candidate_validation/robustness_BTC_DOWN_MICRO_H20_CANDIDATE_B_20260706T115055.json",
+    "reports/bid_ask_walk_forward/walk_forward_BTC_20260730T074926.json",
+    "reports/candidate_grid/candidate_grid_20260709T124717.json",
+    "reports/candidate_grid/candidate_grid_20260709T125740.json",
+    "reports/bid_ask_walk_forward/walk_forward_BTC_ETH_20260709T150853.json",
+    "reports/bid_ask_walk_forward/walk_forward_ETH_20260714T070309.json",
+    "reports/candidate_grid/candidate_grid_20260714T071013.json",
+    "reports/candidate_grid/candidate_grid_20260717T080653.json",
+    "reports/final_project_evidence/candidate_f_final_summary.json",
+    "reports/bid_ask_walk_forward/walk_forward_ETH_20260729T101645.json",
+    "reports/candidate_f_robustness/candidate_f_robustness_latest.json",
+    "reports/candidate_f_milestone_comparison/candidate_f_milestone_comparison_latest.json",
+    "reports/research_notes/hyperliquid_bid_ask_research_notes.md",
+    "reports/research_notes/candidate_c_feature_engineering_plan.md",
+    "reports/research_notes/candidate_d_cost_aware_labeling_plan.md",
+    "reports/research_status/research_status_latest.json",
+    "reports/research_log/2026-07-29.md",
+    "reports/candidate_ledger/candidate_ledger.json"
+  ],
+  "missing_evidence_summary": [
+    "Candidate C: no dedicated rolling-slice robustness report; grid negatives used.",
+    "Candidate D: no positive standalone trading run; label infrastructure evidence only.",
+    "Candidate E: no candidate_e_robustness report analogous to Candidate F."
+  ]
+}
