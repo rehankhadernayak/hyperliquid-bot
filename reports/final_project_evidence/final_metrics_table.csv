@@ -1,0 +1,2 @@
+config_id,feature_set,total_windows,completed_windows,skipped_windows,accepted_trades,cumulative_net_bps,average_net_bps,robustness_verdict,robust_candidate,milestone_count,baseline_improvement_conclusion,paper_only,execution_enabled
+ETH_UP_H20_C0.65_E2_M1.25_S8,candidate_f_regime_depth,705,695,10,15,45.164969776189494,3.0109979850792996,diagnostic_positive_sparse,false,1,"No demonstrated improvement over baseline (beats_baseline_accuracy: false; accuracy_edge_vs_baseline: -0.0106)",true,false
