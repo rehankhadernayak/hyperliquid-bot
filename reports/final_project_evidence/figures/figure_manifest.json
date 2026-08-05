@@ -1,0 +1,166 @@
+{
+  "generated_at": "2026-08-05",
+  "research_only": true,
+  "execution_enabled": false,
+  "config_id": "ETH_UP_H20_C0.65_E2_M1.25_S8",
+  "figures": [
+    {
+      "filename": "candidate_f_cumulative_net_bps.png",
+      "title": "Candidate F \u2014 Cumulative Net Return (bps)",
+      "sources": [
+        {
+          "path": "reports/bid_ask_walk_forward/accepted_trades_ETH_20260729T101645.csv",
+          "fields": [
+            "net_return_bps",
+            "timestamp_iso",
+            "window_index",
+            "row_index"
+          ]
+        },
+        {
+          "path": "reports/final_project_evidence/candidate_f_final_summary.json",
+          "fields": [
+            "config_id",
+            "cumulative_net_bps",
+            "accepted_trades"
+          ]
+        }
+      ],
+      "computed_fields": [
+        "cumulative_net_bps (running sum in CSV row order)"
+      ],
+      "trade_count_plotted": 15,
+      "final_cumulative_net_bps": 45.16496977618949,
+      "ordering": "CSV row order (not re-sorted by timestamp)"
+    },
+    {
+      "filename": "candidate_f_return_distribution.png",
+      "title": "Candidate F \u2014 Accepted-Trade Net Return Distribution",
+      "sources": [
+        {
+          "path": "reports/bid_ask_walk_forward/accepted_trades_ETH_20260729T101645.csv",
+          "fields": [
+            "net_return_bps",
+            "timestamp_iso",
+            "confidence"
+          ]
+        },
+        {
+          "path": "reports/final_project_evidence/candidate_f_final_summary.json",
+          "fields": [
+            "config_id",
+            "average_net_bps",
+            "accepted_trades"
+          ]
+        }
+      ],
+      "computed_fields": [
+        "histogram bin counts",
+        "mean net bps",
+        "win rate"
+      ],
+      "trade_count_plotted": 15,
+      "net_return_bps_values": [
+        -2.683884428147218,
+        1.0850956855096223,
+        2.3433914820062016,
+        2.9720257740062577,
+        3.2863429200062857,
+        3.2863429200062857,
+        3.2863429200062857,
+        3.2863429200062857,
+        3.2863429200062857,
+        3.2863429200062857,
+        3.2863429200062857,
+        3.6006600660077437,
+        3.6006600660077437,
+        3.6006600660077437,
+        7.641960624747396
+      ]
+    },
+    {
+      "filename": "candidate_development_timeline.png",
+      "title": "Candidate Development Timeline (B \u2192 F)",
+      "sources": [
+        {
+          "path": "reports/final_project_evidence/candidate_history.json",
+          "fields": [
+            "candidates.B.status_category",
+            "candidates.C.status_category",
+            "candidates.D.status_category",
+            "candidates.E.status_category",
+            "candidates.F.status_category",
+            "comparison_table",
+            "status_legend"
+          ]
+        },
+        {
+          "path": "reports/final_project_evidence/project_timeline.md",
+          "fields": [
+            "Model Research Timeline",
+            "dates",
+            "outcomes"
+          ]
+        }
+      ],
+      "status_categories_used": [
+        "rejected",
+        "diagnostic_positive_sparse",
+        "frozen"
+      ],
+      "missing_evidence": [
+        "Candidate C: no dedicated rolling-slice robustness report; grid negatives used.",
+        "Candidate D: no positive standalone trading run; label infrastructure evidence only.",
+        "Candidate E: no candidate_e_robustness report analogous to Candidate F."
+      ]
+    },
+    {
+      "filename": "data_pipeline_workflow.png",
+      "title": "Bid/Ask Research Pipeline \u2014 Paper-Only Workflow",
+      "sources": [
+        {
+          "path": "reports/final_project_evidence/project_timeline.md",
+          "fields": [
+            "Pipeline Engineering Timeline"
+          ]
+        },
+        {
+          "path": "reports/research_log/2026-07-29.md",
+          "fields": [
+            "atomic resampled-file writes",
+            "source-bound trimming",
+            "alignment assertions",
+            "in-memory cleaning",
+            "soft vs hard validation"
+          ]
+        },
+        {
+          "path": "reports/research_log/2026-08-05.md",
+          "fields": [
+            "execution_enabled",
+            "paper-only research"
+          ]
+        },
+        {
+          "path": "reports/final_project_evidence/candidate_f_final_summary.json",
+          "fields": [
+            "config_id",
+            "total_windows",
+            "accepted_trades"
+          ]
+        },
+        {
+          "path": "reports/final_project_evidence/table_figure_plan.md",
+          "fields": [
+            "Figure 5 \u2014 Data-Pipeline Workflow Diagram"
+          ]
+        }
+      ]
+    }
+  ],
+  "unsupported_fields": [
+    "Statistical confidence bands \u2014 not present in artifacts",
+    "Formal incident ticket IDs \u2014 not in artifact set",
+    "Live scheduler wiring details beyond research notes"
+  ]
+}
